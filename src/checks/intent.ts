@@ -83,7 +83,8 @@ export const intent: Check = {
     })
 
     await run.step('the sign-in CTA carries no intent', () => {
-      const href = links?.[signinCta]
+      if (!links) throw new Error('not checked: links.ts could not be read')
+      const href = links[signinCta]
       if (href === undefined) throw new Error(`${signinCta}: missing from links.ts`)
       if (href !== consoleLogin) throw new Error(`${signinCta}: ${href}, wanted ${consoleLogin}`)
       return `${signinCta}: ${href}`
