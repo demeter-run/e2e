@@ -1,0 +1,167 @@
+name: contracts
+
+# The contract checks (pricing, intent, apex, endpoint-parity). Report-only:
+# nothing here is a required status.
+#
+# - In this repository, on pull requests and pushes to main: every check
+#   against production, no alert.
+# - Daily at 05:00 UTC and on dispatch: the same, alerting IRM on a failure.
+#   Only runs of main hold the webhook, so a dispatch on a branch logs that
+#   its alert was skipped.
+# - From website2, webui and fabric, on workflow_call: the named static checks
+#   against the caller's pull-request head. The README states the interface.
+#
+# Convention for jobs that sign in as the standing test user (e2e@txpipe.io):
+# they set
+#
+#     concurrency:
+#       group: production-test-user
+#       cancel-in-progress: false
+#
+# so no two runs use the user at once. No job here signs in yet; the J2
+# journey and the agent probe are the first that will.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: Fail the run on purpose, to prove the alert path
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      repo:
+        description: The repository under test, checked out at the caller's pull-request head (website2, webui or fabric)
+        type: string
+        required: true
+      checks:
+        description: Comma-separated checks to run (pricing, intent, endpoint-parity)
+        type: string
+        required: true
+    # Callers pass `secrets: inherit`. The one secret a call reads is
+    # E2E_SOURCES_TOKEN, read access to demeter-run/webui and
+    # demeter-run/website2, which are private.
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    # Under workflow_call, github.event_name is the caller's event, so the
+    # inputs are what tell a call from this repository's own runs.
+    if: ${{ !inputs.repo }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps --only-shell chromium
+
+      - name: Run the checks against production
+        env:
+          E2E_SOURCES_TOKEN: ${{ secrets.E2E_SOURCES_TOKEN }}
+          IRM_E2E_WEBHOOK_URL: ${{ github.ref == 'refs/heads/main' && secrets.IRM_E2E_WEBHOOK_URL || '' }}
+          ALERT: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          FORCE_FAIL: ${{ inputs.force_fail == true }}
+        run: |
+          args=(all --env production)
+          if [[ "$ALERT" == true ]]; then args+=(--alert); fi
+          if [[ "$FORCE_FAIL" == true ]]; then args+=(--force-fail); fi
+          pnpm check "${args[@]}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: contracts-results
+          path: results/
+          if-no-files-found: ignore
+
+  pull-request:
+    # A call from website2, webui or fabric. It never alerts: no --alert and
+    # no webhook.
+    if: ${{ inputs.repo }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check the inputs
+        env:
+          REPO: ${{ inputs.repo }}
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          case "$REPO" in
+            website2 | webui | fabric) ;;
+            *) echo "::error::repo must be website2, webui or fabric, not '$REPO'"; exit 1 ;;
+          esac
+          IFS=, read -ra names <<<"${CHECKS// /}"
+          if [[ ${#names[@]} -eq 0 ]]; then echo "::error::checks names no check"; exit 1; fi
+          for name in "${names[@]}"; do
+            case "$name" in
+              pricing | intent | endpoint-parity) ;;
+              *) echo "::error::checks may name pricing, intent and endpoint-parity, not '$name'"; exit 1 ;;
+            esac
+          done
+
+      - name: Check out the harness
+        uses: actions/checkout@v4
+        with:
+          repository: demeter-run/e2e
+          ref: main
+          path: e2e
+          persist-credentials: false
+
+      - name: Check out the pull request's head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: under-test
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: e2e/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: e2e/.nvmrc
+          cache: pnpm
+          cache-dependency-path: e2e/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+        working-directory: e2e
+
+      # The other two repositories are fresh shallow clones of main, which the
+      # harness makes itself. intent runs its static half: no --env.
+      - name: Run the checks against the pull request
+        working-directory: e2e
+        env:
+          REPO: ${{ inputs.repo }}
+          CHECKS: ${{ inputs.checks }}
+          E2E_SOURCES_TOKEN: ${{ secrets.E2E_SOURCES_TOKEN }}
+        run: pnpm check "${CHECKS// /}" "--$REPO" ../under-test
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: contracts-results-${{ inputs.repo }}
+          path: e2e/results/
+          if-no-files-found: ignore
