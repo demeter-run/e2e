@@ -218,7 +218,12 @@ against stand-in checks, so no unit test reaches production.
   `pnpm check all --env production --alert`. The dispatch takes a boolean
   `force_fail` input that makes the run fail on purpose. Only runs of `main`
   receive the webhook, so a dispatch on another branch logs that its alert was
-  skipped.
+  skipped;
+- when one of those alerting runs fails before the checks start (checkout,
+  install, typecheck, unit tests or the Chromium install), one IRM alert with
+  `alert_uid` `e2e-setup`, naming the step that failed: the checks did not
+  run, so none of them alerts. It is posted with `curl` and `jq`, since the
+  failed step may be the one that installs Node.
 
 Any job that signs in as the standing test user sets the concurrency group
 `production-test-user` (`cancel-in-progress: false`), so no two runs use the
