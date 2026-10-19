@@ -74,10 +74,12 @@ export const apex: Check = {
     )
 
     // cutover.sh:278. The install line in every README; a 302 because the
-    // target is whatever the latest release is.
-    const installer = 'https://github.com/demeter-run/cli/releases/latest/download/dmtrctl-installer.sh'
+    // target is whatever the latest release is. Origin and path, as for every
+    // Location here: the step prints it without its query, so a query alone
+    // must not be what fails it.
+    const installer = new URL('https://github.com/demeter-run/cli/releases/latest/download/dmtrctl-installer.sh')
     await run.step(`${site}/install/dmtrctl.sh redirects 302 to the latest dmtrctl installer`, async () =>
-      expect(await probe(`${site}/install/dmtrctl.sh`), 302, (l) => l.toString() === installer, installer),
+      expect(await probe(`${site}/install/dmtrctl.sh`), 302, at(installer.origin, installer.pathname), installer.toString()),
     )
 
     // cutover.sh:279. A legacy page: website2 forwards it, path intact, to the

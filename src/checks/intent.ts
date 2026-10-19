@@ -1,4 +1,4 @@
-import { chromium } from '@playwright/test'
+import { chromium, type Page } from '@playwright/test'
 import { type Anchor, anchors } from '../html.ts'
 import { describeAnswer, probe, readPage, safeUrl } from '../http.ts'
 import type { Check } from './check.ts'
@@ -35,10 +35,11 @@ export interface PageLinks {
   anchors: Anchor[]
 }
 
-const show = (page: string, a: Anchor) => `${page}: "${a.text}" → ${a.href}`
+const show = (page: string, a: Anchor) => `${page}: "${a.text}" → ${a.broken ? `"${a.href}", which is not a URL` : a.href}`
 
-const atLogin = (href: string, login: string): URL | null => {
-  const url = new URL(href)
+const atLogin = (a: Anchor, login: string): URL | null => {
+  if (a.broken) return null
+  const url = new URL(a.href)
   return `${url.origin}${url.pathname}` === login ? url : null
 }
 
@@ -56,7 +57,7 @@ export function loginLinks(pages: PageLinks[], consoleUrl: string) {
   let signins = 0
   for (const { page, anchors } of pages) {
     for (const a of anchors) {
-      const url = atLogin(a.href, login)
+      const url = atLogin(a, login)
       const intent = url?.searchParams.get('intent') ?? null
       // The Console recognises signup and nothing else (src/app/routes/login.tsx).
       if (url && intent !== null && intent !== 'signup') intents.push(`${show(page, a)} sends intent=${intent}, which the Console ignores`)
@@ -71,6 +72,36 @@ export function loginLinks(pages: PageLinks[], consoleUrl: string) {
   }
   if (signups === 0) signup.push(`no sign-up CTA on ${pages.map((p) => p.page).join(' or ')}: the page or this reader changed`)
   return { intents, signup, signin, signups, signins }
+}
+
+/** The part of a Playwright page `authScreen` drives, so a test can stand in for the browser. */
+export type ScreenPage = Pick<Page, 'goto' | 'locator' | 'title' | 'url'>
+
+/** A Playwright error as a step reports it: its first line, without terminal colours. */
+const plain = (error: unknown): string =>
+  (error instanceof Error ? error.message : String(error)).split('\n')[0]!.replace(/\x1b\[[0-9;]*m/g, '')
+
+/**
+ * The screen `url` lands on in the browser: its path, title and first heading.
+ * A page with no heading (an Auth0 error or rate-limit page) fails saying
+ * where the browser was, the status that page answered and its title, not
+ * only that a wait ran out.
+ */
+export async function authScreen(page: ScreenPage, url: string, timeoutMs = 30_000) {
+  let status: number | null
+  try {
+    status = (await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }))?.status() ?? null
+  } catch (error) {
+    throw new Error(`${safeUrl(url)}: ${plain(error)}`)
+  }
+  const heading = page.locator('h1').first()
+  try {
+    await heading.waitFor({ timeout: timeoutMs })
+  } catch {
+    const answered = status === null ? 'gave no response' : `answered ${status}`
+    throw new Error(`${safeUrl(page.url())} ${answered}, title "${await page.title()}", and shows no heading after ${timeoutMs / 1000} s`)
+  }
+  return { path: new URL(page.url()).pathname, title: await page.title(), heading: (await heading.innerText()).trim() }
 }
 
 export const intent: Check = {
@@ -136,14 +167,7 @@ export const intent: Check = {
           browser ??= await chromium.launch()
           const page = await browser.newPage()
           try {
-            await page.goto(`${env.console}/login${query}`, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-            const heading = page.locator('h1').first()
-            await heading.waitFor({ timeout: 30_000 })
-            const seen = {
-              path: new URL(page.url()).pathname,
-              title: await page.title(),
-              heading: (await heading.innerText()).trim(),
-            }
+            const seen = await authScreen(page, `${env.console}/login${query}`)
             const want = auth0Screens[screen]
             const off = (Object.keys(want) as (keyof typeof want)[]).filter((k) => seen[k] !== want[k])
             const shown = `${safeUrl(page.url())}, title "${seen.title}", heading "${seen.heading}"`

@@ -36,25 +36,31 @@ export function textTokens(html: string): string[] {
 }
 
 export interface Anchor {
-  /** The link target, resolved against the page's URL. */
+  /** The link target, resolved against the page's URL; as written when it is not a URL. */
   href: string
   /** What a visitor reads on the link. */
   text: string
+  /** Set when `href` is not a URL, which a browser cannot follow either. */
+  broken?: true
 }
 
-/** Every `<a href>` on the page with its visible text. */
+/**
+ * Every `<a href>` on the page with its visible text. A link whose target is
+ * not a URL is kept, marked `broken`: dropped, a broken sign-up CTA would
+ * leave the rules nothing to fail on.
+ */
 export function anchors(html: string, pageUrl: string): Anchor[] {
   const found: Anchor[] = []
   for (const m of strip(html).matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
     const href = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(m[1]!)
     if (!href) continue
-    let target: string
+    const written = decodeEntities(href[1] ?? href[2]!)
+    const text = squash(m[2]!.replace(/<[^>]*>/g, ' '))
     try {
-      target = new URL(decodeEntities(href[1] ?? href[2]!), pageUrl).toString()
+      found.push({ href: new URL(written, pageUrl).toString(), text })
     } catch {
-      continue
+      found.push({ href: written, text, broken: true })
     }
-    found.push({ href: target, text: squash(m[2]!.replace(/<[^>]*>/g, ' ')) })
   }
   return found
 }

@@ -86,14 +86,23 @@ tier and each surface's value, when:
   `/pricing` table or the landing cards, or is priced with no minimum fee;
 - a minimum fee or usage rate differs between any surfaces that state it.
   fabric stores rates to four significant digits, so values within 0.1% are the
-  same.
+  same;
+- one surface states a port and tier more than once (two `/pricing` sections
+  for Blockfrost, say), which would otherwise be compared on its last price
+  only.
 
 A port name, plan column, unit, price row or minimum-fee wording the readers
 cannot place (`src/surfaces/ports.ts`, `src/surfaces/website2.ts`) also fails
 it: each port in the table needs exactly one `MINIMUM FEE` row and one `PER …`
 row, and each landing card a note reading "No minimum fee" or "Minimum fee
 $…". A relabelled row read as no price would let the comparison skip it. A
-failure that production causes is not suppressed: it stays red and alerts.
+table cell the reader cannot read (`1.7M`, `Free`) fails naming its port, row
+and column. A failure that production causes is not suppressed: it stays red
+and alerts.
+
+A reader that fails fails its own step, and the `compare` step still compares
+the surfaces that were read, naming the ones it could not: a reworded landing
+card does not hide a divergence between fabric and the `/pricing` table.
 
 **fabric does not publish its prices yet.** A live `FetchMetadata` record
 carries only `options` (field 1) and `crd` (field 2); the per-tier `plan` that
@@ -131,6 +140,9 @@ From `https://demeter.run/` and `/pricing`, read as text:
   one;
 - every sign-in link (sign in, log in) goes to `/login` with no query.
 
+A link whose target is not a URL, which a browser cannot follow either, fails
+the rule its text puts it under rather than being skipped.
+
 From the Console:
 
 - `GET /login?intent=signup` redirects to Auth0's `/authorize` with
@@ -139,7 +151,9 @@ From the Console:
 - in Chromium, the first lands on Auth0's signup form and the second on its
   login form, told apart by the screen's path, page title and heading (recorded
   in `src/checks/intent.ts`). This is the login-versus-signup edge case:
-  Classic Universal Login drops `screen_hint` silently.
+  Classic Universal Login drops `screen_hint` silently. A page with no heading
+  (an Auth0 error or rate-limit page) fails naming where the browser landed,
+  the status it answered and its title.
 
 ### `apex`
 
@@ -149,8 +163,11 @@ connection, as one curl per probe, no redirect followed, 15 s to answer (20 s
 for the page body). As curl prints the status it received even when the body
 then stalls, a status is kept once it arrives; only a read that needs the body
 fails when the body does not finish, and says so. A `Location` that is not a
-URL fails the probe that received it. Every check's requests go through the
-same `probe` (`src/http.ts`).
+URL fails the probe that received it. A `Location` is compared by origin and
+path, as it is printed. Every page and redirect any check requests goes
+through the same `probe` (`src/http.ts`); fabric's `FetchMetadata`, which
+needs HTTP/2, is the one request that does not, and it reports a stalled body
+or a refused connection the same way (`src/surfaces/fabric.ts`).
 
 | # | Request | Expected |
 | --- | --- | --- |
@@ -205,25 +222,30 @@ The readers are tested on responses and pages captured from production, and
 the comparator on the pre-rollout numbers; `test/fixtures/README.md` says
 where each came from. A variant is a copy of a captured page with one edit.
 Requests, alerts and the `pricing` check end to end run against local servers
-serving those captures (an HTTP/2 one for fabric), and `pnpm check` itself
-against stand-in checks, so no unit test reaches production.
+serving those captures (an HTTP/2 one for fabric), `apex` against a local apex
+answering as production does, intent's browser steps against a stand-in page,
+and `pnpm check` itself against stand-in checks, so no unit test reaches
+production.
 
 ## Workflows
 
 `.github/workflows/contracts.yml` runs:
 
-- on `pull_request` and on `push` to `main`: install, typecheck, unit tests,
-  then `pnpm check all --env production`, no alert;
+- on `pull_request` and on `push` to `main`: install, typecheck and unit tests
+  in the `unit` job, then `pnpm check all --env production`, no alert, in the
+  `checks` job that needs it. The checks fail on every run while fabric
+  publishes no prices, so a broken unit test fails a job of its own;
 - daily at 05:00 UTC and on `workflow_dispatch`:
   `pnpm check all --env production --alert`. The dispatch takes a boolean
   `force_fail` input that makes the run fail on purpose. Only runs of `main`
   receive the webhook, so a dispatch on another branch logs that its alert was
   skipped;
-- when one of those alerting runs fails before the checks start (checkout,
-  install, typecheck, unit tests or the Chromium install), one IRM alert with
-  `alert_uid` `e2e-setup`, naming the step that failed: the checks did not
-  run, so none of them alerts. It is posted with `curl` and `jq`, since the
-  failed step may be the one that installs Node.
+- when one of those alerting runs fails before the checks start (anywhere in
+  the `unit` job, or the `checks` job's checkout, install or Chromium
+  install), one IRM alert with `alert_uid` `e2e-setup`, naming the step that
+  failed: the checks did not run, so none of them alerts. The `setup-alert`
+  job posts it with `curl` and `jq`, needing no checkout or Node, which may be
+  what failed.
 
 Any job that signs in as the standing test user sets the concurrency group
 `production-test-user` (`cancel-in-progress: false`), so no two runs use the

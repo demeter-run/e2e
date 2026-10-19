@@ -2,22 +2,28 @@ import { once } from 'node:events'
 import { readFileSync } from 'node:fs'
 import { createServer, type RequestListener } from 'node:http'
 import { createServer as createH2cServer, type Http2ServerRequest, type Http2ServerResponse } from 'node:http2'
-import type { AddressInfo } from 'node:net'
+import { type AddressInfo, createServer as createNetServer } from 'node:net'
 import { join } from 'node:path'
 import type { Card } from '../src/surfaces/card.ts'
 
-/** A local server for one test: its base URL, and `close` to stop it. */
+/** A local server for one test: its base URL, how many connections it has accepted, and `close` to stop it. */
 export interface Served {
   url: string
+  readonly connections: number
   close(): Promise<void>
 }
 
 async function listen(server: ReturnType<typeof createServer> | ReturnType<typeof createH2cServer>): Promise<Served> {
+  let connections = 0
+  server.on('connection', () => (connections += 1))
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
   const { port } = server.address() as AddressInfo
   return {
     url: `http://127.0.0.1:${port}`,
+    get connections() {
+      return connections
+    },
     close: () =>
       new Promise((resolve) => {
         if ('closeAllConnections' in server) server.closeAllConnections()
@@ -32,6 +38,36 @@ export const serve = (handler: RequestListener): Promise<Served> => listen(creat
 /** A cleartext HTTP/2 server on a free local port, as fabric's API speaks only HTTP/2. */
 export const serveH2c = (handler: (request: Http2ServerRequest, response: Http2ServerResponse) => void): Promise<Served> =>
   listen(createH2cServer(handler))
+
+/** A local URL nothing listens on: a port that was free a moment ago. */
+export async function refusedUrl(): Promise<string> {
+  const server = createNetServer().listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const { port } = server.address() as AddressInfo
+  await new Promise((resolve) => server.close(resolve))
+  return `http://127.0.0.1:${port}`
+}
+
+/**
+ * Runs `fn` with the environment variables in `vars` set, or unset where the
+ * value is undefined, and puts them back after. In CI the real ones would send
+ * an alert or write into the job's own summary.
+ */
+export async function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T | Promise<T>): Promise<T> {
+  const set = (values: Record<string, string | undefined>) => {
+    for (const [name, value] of Object.entries(values)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  }
+  const saved = Object.fromEntries(Object.keys(vars).map((name) => [name, process.env[name]]))
+  set(vars)
+  try {
+    return await fn()
+  } finally {
+    set(saved)
+  }
+}
 
 /** A fixture captured from production (sources in `fixtures/README.md`). */
 export const live = (name: string): Buffer => readFileSync(join(import.meta.dirname, 'fixtures', 'live', name))

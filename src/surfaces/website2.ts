@@ -28,6 +28,12 @@ const rowUnits: Record<string, number> = {
 
 const isLabel = (t: string | undefined): boolean => t !== undefined && /[A-Z]/.test(t) && !/[a-z]/.test(t)
 const isValue = (t: string | undefined): boolean => t !== undefined && /^(?:\$\s?)?[\d,]+(?:\.\d+)?$|^[—–-]$/.test(t)
+/**
+ * A table cell, readable or not: a value, or one word (`1.7M`, `Free`). The
+ * headings and links after the table run to several words or carry no digit
+ * (`PRODUCT`, then `Products`, `Pricing`, `Status`), which tells them apart.
+ */
+const isCell = (t: string | undefined): boolean => isValue(t) || (t !== undefined && /^\S+$/.test(t))
 
 /**
  * The `/pricing` table. In text order it is the header (`PORT / METRIC`, then
@@ -35,6 +41,11 @@ const isValue = (t: string | undefined): boolean => t !== undefined && /^(?:\$\s
  * lines of description, and its rows: an upper-case label followed by one value
  * per column. Text that is not a row starts the next port; a "port" with no
  * rows (the footnotes after the table) is not one.
+ *
+ * A label followed by one word per column, one with a digit, is a row with a
+ * cell this reader cannot read (`1,700,000` shortened to `1.7M`, `$0` turned
+ * `Free`). It fails naming that row and cell: read as text, its label would
+ * start a port that is not there, or drop a price row from the port it is in.
  */
 export function readPricingTable(html: string): PricingTable {
   const tokens = textTokens(html)
@@ -59,6 +70,10 @@ export function readPricingTable(html: string): PricingTable {
       at += 1 + columns.length
       newPort = true
       continue
+    }
+    if (isLabel(tokens[at]) && row.length === columns.length && row.every(isCell) && row.some((t) => /\d/.test(t))) {
+      const cell = row.findIndex((t) => !isValue(t))
+      throw new Error(`/pricing ${current?.name ?? 'header'}, row "${tokens[at]}": cannot read "${row[cell]}" in the ${columns[cell]} column`)
     }
     if (newPort) {
       current = { name: tokens[at]!, rows: [] }

@@ -40,12 +40,12 @@ export interface FabricTier {
   cost: { minimum: number; delta: number } | null
 }
 
-export async function fetchMetadata(rpc: string): Promise<MetadataRecord[]> {
+export async function fetchMetadata(rpc: string, { timeoutMs = 15_000 } = {}): Promise<MetadataRecord[]> {
   const response = await postHttp2(`${rpc}${fetchMetadataPath}`, {
     headers: { 'content-type': 'application/grpc-web+proto', 'x-grpc-web': '1' },
     // One uncompressed frame holding the empty FetchMetadataRequest.
     body: new Uint8Array(5),
-    timeoutMs: 15_000,
+    timeoutMs,
   })
   if (response.status !== 200) throw new Error(`FetchMetadata answered HTTP ${response.status}`)
   const headerStatus = response.headers['grpc-status']
@@ -57,7 +57,10 @@ export async function fetchMetadata(rpc: string): Promise<MetadataRecord[]> {
 
 /**
  * One POST over HTTP/2. fabric's API refuses HTTP/1.1 at the TLS handshake
- * (it offers only `h2`), and Node 22's `fetch` speaks HTTP/1.1 only.
+ * (it offers only `h2`), and Node 22's `fetch` speaks HTTP/1.1 only, so this
+ * call does not go through `probe`. It reports a failure as `probe` does: a
+ * status is kept once it arrives, so a body that stalls or breaks after it is
+ * not "no answer".
  */
 function postHttp2(
   url: string,
@@ -65,17 +68,23 @@ function postHttp2(
 ): Promise<{ status: number; headers: Record<string, string>; body: Uint8Array }> {
   const { origin, pathname } = new URL(url)
   return new Promise((resolve, reject) => {
+    let status = 0
     const session = connect(origin)
-    const timer = setTimeout(() => fail(new Error(`no answer within ${timeoutMs / 1000} s`)), timeoutMs)
-    function fail(error: Error & { code?: string }) {
+    const broke = (why: string) => {
       clearTimeout(timer)
       session.destroy()
-      reject(new Error(`FetchMetadata: ${error.code ? `${error.code}: ` : ''}${error.message}`))
+      reject(new Error(`FetchMetadata: ${status ? `answered HTTP ${status}, but the body did not finish` : 'no answer'}${why}`))
     }
-    session.on('error', fail)
+    const timer = setTimeout(() => broke(` within ${timeoutMs / 1000} s`), timeoutMs)
+    // A refused connection reaches the request first, as a cancelled stream
+    // whose cause is the refusal: the cause is what went wrong.
+    const failed = (error: Error) => {
+      const root = (error.cause instanceof Error ? error.cause : error) as Error & { code?: string }
+      broke(`: ${root.code ?? root.name} (${root.message})`)
+    }
+    session.on('error', failed)
     const request = session.request({ ':method': 'POST', ':path': pathname, ...headers })
-    request.on('error', fail)
-    let status = 0
+    request.on('error', failed)
     const answered: Record<string, string> = {}
     request.on('response', (h) => {
       status = Number(h[':status'])

@@ -5,7 +5,7 @@ import { environments } from '../src/env.ts'
 import { Run } from '../src/report.ts'
 import { fetchMetadataPath } from '../src/surfaces/fabric.ts'
 import { pricingCards, readPricingTable } from '../src/surfaces/website2.ts'
-import { fetchMetadataBody, live, type Served, serve, serveH2c } from './helpers.ts'
+import { edit, fetchMetadataBody, live, type Served, serve, serveH2c } from './helpers.ts'
 
 const pricingPage = live('pricing.html')
 const homePage = live('home.html')
@@ -26,10 +26,11 @@ describe('the pricing check, against local surfaces', () => {
   let website: Served
   let fabric: Served
   let metadata: Uint8Array
+  let home = homePage
 
   before(async () => {
     website = await serve((request, response) => {
-      const page = { '/pricing': pricingPage, '/': homePage }[request.url ?? '']
+      const page = { '/pricing': pricingPage, '/': home }[request.url ?? '']
       if (page) response.writeHead(200, { 'content-type': 'text/html' }).end(page)
       else response.writeHead(404).end()
     })
@@ -70,6 +71,24 @@ describe('the pricing check, against local surfaces', () => {
     assert.equal(result.ok, false)
     assert.deepEqual(result.steps.map((s) => s.ok), [false, true, true, true])
     assert.match(result.steps[0]!.detail, /^fabric's live metadata publishes no prices/)
-    assert.match(result.steps[3]!.detail, /fabric not compared/)
+    assert.equal(result.steps[3]!.detail, 'website2 and website2 landing agree; fabric not compared, could not be read')
+  })
+
+  it('still compares fabric with /pricing when the landing cards cannot be read', async () => {
+    home = Buffer.from(edit(homePage.toString('utf8'), 'Minimum fee $50', 'Minimum fee: $50', '>PRO I<'))
+    try {
+      metadata = billing({ port: 'blockfrost', tier: '1', delta: 0.0000006 })
+      const diverged = await check()
+      assert.deepEqual(diverged.steps.map((s) => s.ok), [true, true, false, false])
+      assert.match(diverged.steps[2]!.detail, /^landing card PRO I: cannot read a minimum fee/)
+      assert.equal(diverged.steps[3]!.detail, '1 divergence:\nBlockfrost Flexible per 100k: fabric $0.06 · website2 $0.30')
+
+      metadata = billing()
+      const agreed = (await check()).steps[3]!
+      assert.equal(agreed.ok, true)
+      assert.equal(agreed.detail, 'fabric and website2 agree; website2 landing not compared, could not be read')
+    } finally {
+      home = homePage
+    }
   })
 })

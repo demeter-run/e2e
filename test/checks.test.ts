@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { loginLinks, type PageLinks } from '../src/checks/intent.ts'
+import { authScreen, loginLinks, type PageLinks, type ScreenPage } from '../src/checks/intent.ts'
 import { environments } from '../src/env.ts'
 import { anchors } from '../src/html.ts'
 import { type Card, compare } from '../src/surfaces/card.ts'
@@ -101,6 +101,20 @@ describe('pricing comparison', () => {
     ])
   })
 
+  it('flags a port a surface prices twice, rather than compare its last price only', () => {
+    // Blockfrost at $0.35, then the pre-rate-card name at fabric's $0.30: the last alone agrees.
+    const billed = website2().website2
+    const table = readPricingTable(pricingPage)
+    const blockfrost = table.ports.find((p) => p.name === 'Blockfrost')!
+    const raised = { ...blockfrost, rows: blockfrost.rows.map((r) => (r.label.startsWith('PER ') ? { ...r, values: ['$0.35', ...r.values.slice(1)] } : r)) }
+    const quoted = pricingCards({ ...table, ports: [...table.ports.map((p) => (p === blockfrost ? raised : p)), { ...blockfrost, name: 'Blockfrost RYO' }] })
+    assert.deepEqual(compare(billed, { website2: quoted }), [
+      'Blockfrost Flexible: website2 states it 2 times, $0 minimum and $0.35 per 100k · $0 minimum and $0.30 per 100k',
+      'Blockfrost Pro I: website2 states it 2 times, $50 minimum and $0.26 per 100k · $50 minimum and $0.26 per 100k',
+      'Blockfrost Pro II: website2 states it 2 times, $150 minimum and $0.23 per 100k · $150 minimum and $0.23 per 100k',
+    ])
+  })
+
   it('compares the quoting surfaces with each other when fabric cannot be read', () => {
     assert.deepEqual(compare(null, website2()), [])
     const lines = compare(null, website2(pricingPage, edit(homePage, '>$0.26<', '>$0.25<', '>PRO I<')))
@@ -140,5 +154,76 @@ describe('intent links on the live pages', () => {
   it('fail when no sign-up CTA can be found', () => {
     const links = loginLinks([{ page: '/', anchors: [] }], consoleUrl)
     assert.deepEqual(links.signup, ['no sign-up CTA on /: the page or this reader changed'])
+  })
+
+  it('fail a CTA whose link is not a URL, rather than skip it', () => {
+    const home = edit(homePage, 'https://console.demeter.run/login', 'https://console.demeter.run /login', 'Open console')
+    const links = loginLinks(pages(home), consoleUrl)
+    assert.equal(links.signups, 8)
+    assert.deepEqual(links.signup, [
+      '/: "Start building" → "https://console.demeter.run /login?intent=signup", which is not a URL, wanted https://console.demeter.run/login?intent=signup',
+    ])
+  })
+
+  it('fail every Console link that is not a URL, the sign-in link included', () => {
+    const broken = (page: string) => page.replaceAll('https://console.demeter.run/', 'https://console.demeter.run /')
+    const links = loginLinks(pages(broken(homePage), broken(pricingPage)), consoleUrl)
+    assert.deepEqual([links.signups, links.signup.length], [8, 8])
+    assert.deepEqual(links.signin, ['/pricing: "Sign in" → "https://console.demeter.run /login", which is not a URL, wanted https://console.demeter.run/login'])
+  })
+
+  it('fail a sign-up or sign-in link that goes anywhere but the Console\'s /login', () => {
+    const offSite: PageLinks = {
+      page: '/',
+      anchors: [
+        { href: 'https://console.demeter.run/signup', text: 'Start building' },
+        { href: 'https://demeter.run/auth', text: 'Sign in' },
+      ],
+    }
+    const links = loginLinks([offSite], consoleUrl)
+    assert.deepEqual(links.signup, ['/: "Start building" → https://console.demeter.run/signup, wanted https://console.demeter.run/login?intent=signup'])
+    assert.deepEqual(links.signin, ['/: "Sign in" → https://demeter.run/auth, wanted https://console.demeter.run/login'])
+  })
+})
+
+describe("intent's browser steps", () => {
+  /** A stand-in for a Playwright page: what it answered, where it ended up, and its heading, if any. */
+  const page = ({ status = 200, url = '', title = '', heading = null as string | null, goto = null as Error | null }) =>
+    ({
+      goto: async () => {
+        if (goto) throw goto
+        return { status: () => status }
+      },
+      url: () => url,
+      title: async () => title,
+      locator: () => ({
+        first: () => ({
+          waitFor: async () => {
+            if (heading === null) throw new Error('\x1b[2mlocator.waitFor: Timeout 10ms exceeded.\x1b[22m\nCall log:\n  - waiting for locator(\'h1\').first() to be visible')
+          },
+          innerText: async () => ` ${heading} `,
+        }),
+      }),
+    }) as unknown as ScreenPage
+
+  const login = 'https://console.demeter.run/login?intent=signup'
+
+  it("read the screen's path, title and heading", async () => {
+    const signup = page({ url: 'https://txpipe.us.auth0.com/u/signup?state=s3cr3t', title: 'Sign up | Demeter.run', heading: 'Welcome' })
+    assert.deepEqual(await authScreen(signup, login, 10), { path: '/u/signup', title: 'Sign up | Demeter.run', heading: 'Welcome' })
+  })
+
+  it('say where they landed, its status and title, when the page has no heading', async () => {
+    const limited = page({ status: 429, url: 'https://txpipe.us.auth0.com/u/signup?state=s3cr3t', title: 'Too Many Requests' })
+    await assert.rejects(authScreen(limited, login, 10), {
+      message: 'https://txpipe.us.auth0.com/u/signup answered 429, title "Too Many Requests", and shows no heading after 0.01 s',
+    })
+  })
+
+  it('report a failed navigation on one line, without terminal colours', async () => {
+    const refused = page({ goto: new Error('\x1b[31mpage.goto: net::ERR_CONNECTION_REFUSED at https://console.demeter.run/login\x1b[39m\nCall log:\n  - navigating to …') })
+    await assert.rejects(authScreen(refused, login, 10), {
+      message: 'https://console.demeter.run/login: page.goto: net::ERR_CONNECTION_REFUSED at https://console.demeter.run/login',
+    })
   })
 })

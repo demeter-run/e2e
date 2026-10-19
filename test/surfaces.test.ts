@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { anchors, textTokens } from '../src/html.ts'
 import { formatUsd, parseUsd } from '../src/surfaces/card.ts'
-import { decodeFetchMetadata, fabricCards, fabricTiers } from '../src/surfaces/fabric.ts'
+import { decodeFetchMetadata, fabricCards, fabricTiers, fetchMetadata } from '../src/surfaces/fabric.ts'
 import { landingCards, pricingCards, readPricingTable } from '../src/surfaces/website2.ts'
-import { edit, fetchMetadataBody, live } from './helpers.ts'
+import { edit, fetchMetadataBody, live, refusedUrl, serveH2c } from './helpers.ts'
 
 const near = (actual: number | null | undefined, expected: number) =>
   assert.ok(actual !== null && actual !== undefined && Math.abs(actual - expected) < 1e-9, `${actual} ≉ ${expected}`)
@@ -52,6 +52,12 @@ describe('server-rendered pages as text', () => {
   it('reads every link with its visible text, resolved against the page', () => {
     assert.deepEqual(anchors('<a class="x" href="/pricing?a=1&amp;b=2"><span>Full</span> list →</a><a>none</a>', 'https://demeter.run/'), [
       { href: 'https://demeter.run/pricing?a=1&b=2', text: 'Full list →' },
+    ])
+  })
+
+  it('keeps a link whose target is not a URL, marked broken', () => {
+    assert.deepEqual(anchors('<a href="https://console.demeter.run /login">Sign in</a>', 'https://demeter.run/'), [
+      { href: 'https://console.demeter.run /login', text: 'Sign in', broken: true },
     ])
   })
 })
@@ -102,6 +108,38 @@ describe('fabric', () => {
   })
 })
 
+// A test that outlives its own timeout fails rather than hang the suite: a
+// timer scaled wrong would otherwise outlive the CI job.
+describe("fabric's transport", { timeout: 5_000 }, () => {
+  it('says why nothing answered when fabric is unreachable', async () => {
+    await assert.rejects(fetchMetadata(await refusedUrl(), { timeoutMs: 2_000 }), /^Error: FetchMetadata: no answer: ECONNREFUSED/)
+  })
+
+  it('says nothing answered in time when fabric never answers', async () => {
+    const fabric = await serveH2c(() => {})
+    try {
+      await assert.rejects(fetchMetadata(fabric.url, { timeoutMs: 300 }), { message: 'FetchMetadata: no answer within 0.3 s' })
+    } finally {
+      await fabric.close()
+    }
+  })
+
+  it('keeps the status when the body stalls after it', async () => {
+    const fabric = await serveH2c((_, response) => {
+      response.writeHead(200, { 'content-type': 'application/grpc-web+proto' })
+      // A frame header promising ten bytes, then nothing.
+      response.write(Buffer.from([0, 0, 0, 0, 10]))
+    })
+    try {
+      await assert.rejects(fetchMetadata(fabric.url, { timeoutMs: 300 }), {
+        message: 'FetchMetadata: answered HTTP 200, but the body did not finish within 0.3 s',
+      })
+    } finally {
+      await fabric.close()
+    }
+  })
+})
+
 describe('website2', () => {
   it('reads the live /pricing table per column', () => {
     const table = readPricingTable(pricingPage)
@@ -149,6 +187,32 @@ describe('website2', () => {
     assert.throws(() => pricingCards(readPricingTable(noUsage)), /^Error: Kupo: wanted one usage row \("PER …"\), found MINIMUM FEE, USAGE PER 100K REQUESTS,/)
   })
 
+  it('refuses a second minimum fee or usage row, rather than read the first', () => {
+    const port = (name: string, rows: { label: string; values: string[] }[]) => () =>
+      pricingCards({ columns: ['Flexible', 'Pro I', 'Pro II'], ports: [{ name, rows }] })
+    const minimum = { label: 'MINIMUM FEE', values: ['$0', '$50', '$150'] }
+    const requests = { label: 'PER 100K REQUESTS', values: ['$0.30', '$0.26', '$0.23'] }
+    assert.throws(
+      port('Kupo', [minimum, { label: 'MINIMUM FEE / MONTH', values: ['$0', '$60', '$150'] }, requests]),
+      /^Error: Kupo: wanted one "MINIMUM FEE" row, found MINIMUM FEE, MINIMUM FEE \/ MONTH, PER 100K REQUESTS$/,
+    )
+    assert.throws(
+      port('Ogmios', [minimum, { label: 'PER 100K MESSAGES', values: ['$0.30', '$0.26', '$0.23'] }, { label: 'PER 24H OF CONNECTION', values: ['$0.23', '$0.20', '$0.17'] }]),
+      /^Error: Ogmios: wanted one usage row \("PER …"\), found MINIMUM FEE, PER 100K MESSAGES, PER 24H OF CONNECTION$/,
+    )
+  })
+
+  it('names a row and the cell it cannot read, wherever the row is', () => {
+    // Read as text, the first would be a port named "APPROX. DAILY REQUESTS",
+    // the second an Ogmios with no minimum fee row, and the third dropped.
+    const daily = edit(pricingPage, '>1,700,000<', '>1.7M<', '>Kupo<')
+    assert.throws(() => readPricingTable(daily), { message: '/pricing Kupo, row "APPROX. DAILY REQUESTS": cannot read "1.7M" in the Flexible column' })
+    const free = edit(pricingPage, '>$0<', '>Free<', '>Ogmios<')
+    assert.throws(() => readPricingTable(free), { message: '/pricing Ogmios, row "MINIMUM FEE": cannot read "Free" in the Flexible column' })
+    const last = edit(pricingPage, '>300<', '>300+<', '>UTxO RPC<')
+    assert.throws(() => readPricingTable(last), { message: '/pricing UTxO RPC, row "MAX REQUESTS / SECOND": cannot read "300+" in the Pro II column' })
+  })
+
   it('refuses a port, a column or a unit it cannot place', () => {
     assert.throws(() => pricingCards(readPricingTable(edit(pricingPage, '>Kupo<', '>Dolos<'))), /website2 prices "Dolos"/)
     assert.throws(() => pricingCards(readPricingTable(edit(pricingPage, '>Pro II<', '>Scale<'))), /"Scale" column/)
@@ -166,8 +230,9 @@ describe('website2', () => {
     assert.equal(cards.find((c) => c.port === 'kupo' && c.tier === '3')!.minimum_usd, 150)
   })
 
-  it('refuses a landing page without its price cards', () => {
+  it('refuses a landing page without its price cards, or with two of one', () => {
     assert.throws(() => landingCards('<p>FLEXIBLE</p>', ['kupo']), /0 "FLEXIBLE" price cards/)
+    assert.throws(() => landingCards(homePage + homePage, ['kupo']), /^Error: the landing page has 2 "FLEXIBLE" price cards, wanted 1$/)
   })
 
   it('refuses a landing card whose minimum fee it cannot read, rather than read none', () => {

@@ -1,13 +1,11 @@
 import assert from 'node:assert/strict'
-import { once } from 'node:events'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
-import { type AddressInfo, createServer } from 'node:net'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it, mock } from 'node:test'
 import { describeAnswer, probe, readPage, safeUrl } from '../src/http.ts'
-import { alertFailures, alertPayload, formatMarkdown, type Result, Run, writeResult } from '../src/report.ts'
-import { serve } from './helpers.ts'
+import { alertFailures, alertPayload, formatMarkdown, formatText, type Result, Run, writeJobSummary, writeResult } from '../src/report.ts'
+import { refusedUrl, serve, withEnv } from './helpers.ts'
 
 async function sample() {
   const run = new Run('sample', 'production')
@@ -51,6 +49,42 @@ describe('results', () => {
   it('summarises as a Markdown table', async () => {
     assert.match(formatMarkdown([await sample()]), /\| `sample` \(production\) \| ❌ fail \| 1\/2 \|/)
   })
+
+  // A pricing failure is one line per divergence; each must reach the log and the summary.
+  const divergences: Result = {
+    name: 'pricing',
+    env: 'production',
+    started_at: '2026-10-19T00:00:00.000Z',
+    finished_at: '2026-10-19T00:00:01.000Z',
+    ok: false,
+    steps: [{ name: 'compare', ok: false, ms: 3, detail: '2 divergences:\nKupo Pro I minimum: fabric $50 · website2 $60\nOgmios Flexible: website2 publishes no price' }],
+  }
+
+  it('prints every line of a multi-line detail', () => {
+    assert.equal(
+      formatText([divergences]),
+      [
+        'FAIL  pricing (production): 0/1 steps',
+        '  FAIL  compare (3 ms): 2 divergences:',
+        '          Kupo Pro I minimum: fabric $50 · website2 $60',
+        '          Ogmios Flexible: website2 publishes no price',
+      ].join('\n'),
+    )
+    const lines = ['  ```', '  2 divergences:', '  Kupo Pro I minimum: fabric $50 · website2 $60', '  Ogmios Flexible: website2 publishes no price', '  ```']
+    assert.ok(formatMarkdown([divergences]).includes(lines.join('\n')), formatMarkdown([divergences]))
+  })
+
+  it('appends the run to the job summary GitHub names', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'e2e-summary-'))
+    const summary = join(dir, 'summary.md')
+    try {
+      await writeFile(summary, 'an earlier step\n')
+      await withEnv({ GITHUB_STEP_SUMMARY: summary }, () => writeJobSummary([divergences], 'Contract checks against production'))
+      assert.equal(await readFile(summary, 'utf8'), `an earlier step\n## Contract checks against production\n\n${formatMarkdown([divergences])}\n`)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('alerts', () => {
@@ -60,6 +94,15 @@ describe('alerts', () => {
     assert.equal(payload.state, 'alerting')
     assert.equal(payload.message, 'fails: wrong answer')
     assert.deepEqual(Object.keys(payload), ['alert_uid', 'title', 'message', 'state', 'link_to_upstream_details'])
+  })
+
+  it('links the alert to the Actions run, by its id', async () => {
+    const result = await sample()
+    const actions = { GITHUB_SERVER_URL: 'https://github.com', GITHUB_REPOSITORY: 'demeter-run/e2e', GITHUB_RUN_ID: '39316092200', GITHUB_RUN_NUMBER: '42' }
+    const link = await withEnv(actions, () => alertPayload(result).link_to_upstream_details)
+    assert.equal(link, 'https://github.com/demeter-run/e2e/actions/runs/39316092200')
+    const local = await withEnv({ GITHUB_SERVER_URL: undefined, GITHUB_REPOSITORY: undefined, GITHUB_RUN_ID: undefined }, () => alertPayload(result))
+    assert.equal(local.link_to_upstream_details, '')
   })
 
   it('logs that it skipped the alert when no webhook is set', async () => {
@@ -116,15 +159,27 @@ describe('alerts', () => {
 })
 
 describe('requests', () => {
-  it('say why nothing answered', async () => {
-    // A port that was free a moment ago, so nothing listens on it.
-    const server = createServer().listen(0, '127.0.0.1')
-    await once(server, 'listening')
-    const { port } = server.address() as AddressInfo
-    await new Promise((resolve) => server.close(resolve))
-    const answer = await probe(`http://127.0.0.1:${port}/`, { timeoutMs: 5_000 })
+  it('say why nothing answered, in the answer and in a page read', async () => {
+    const url = await refusedUrl()
+    const answer = await probe(`${url}/`, { timeoutMs: 5_000 })
     assert.equal(answer.status, null)
     assert.match(answer.error ?? '', /^no answer: ECONNREFUSED/)
+    assert.match(describeAnswer(answer), /^no answer: ECONNREFUSED/)
+    await assert.rejects(readPage(`${url}/pricing`, 5_000), /^Error: no answer: ECONNREFUSED .*, wanted 200$/)
+  })
+
+  it('open one connection per request, as one curl per probe', async () => {
+    // A keep-alive connection reused across probes was reset on a CI runner.
+    const server = await serve((_, response) => response.writeHead(200, { 'content-type': 'text/html' }).end('<p>ok</p>'))
+    try {
+      for (let i = 0; i < 4; i += 1) {
+        await probe(`${server.url}/`)
+        assert.equal((await probe(`${server.url}/`, { readBody: true })).body, '<p>ok</p>')
+      }
+      assert.equal(server.connections, 8)
+    } finally {
+      await server.close()
+    }
   })
 
   it('fail only the probe whose Location is not a URL, and keep its query out of the error', async () => {

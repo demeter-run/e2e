@@ -66,6 +66,22 @@ describe('pnpm check', () => {
     assert.equal((await result('fails')).ok, false)
   })
 
+  it('runs every check for all, as the scheduled run calls it', async () => {
+    assert.equal(await run('all', '--env', 'production'), 1)
+    assert.deepEqual((await readdir(dir)).sort(), ['fails.json', 'passes.json', 'throws.json'])
+  })
+
+  it('writes results/ in the working directory by default, which CI uploads', async () => {
+    const cwd = process.cwd()
+    process.chdir(dir)
+    try {
+      assert.equal(await main(['passes', '--env', 'production'], { checks }), 0)
+    } finally {
+      process.chdir(cwd)
+    }
+    assert.deepEqual(await readdir(join(dir, 'results')), ['passes.json'])
+  })
+
   it('records a check that throws outside a step as a failed run step', async () => {
     assert.equal(await run('throws', '--env', 'production'), 1)
     assert.deepEqual((await result('throws')).steps.map(({ name, ok, detail }) => ({ name, ok, detail })), [

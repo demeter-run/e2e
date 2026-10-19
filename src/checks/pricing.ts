@@ -42,12 +42,18 @@ export const pricing: Check = {
       return 'Flexible, Pro I and Pro II'
     })
 
+    // Whatever was read is compared: a reader that fails, which fails its own
+    // step, must not also hide a divergence between the surfaces that were read.
     await run.step('compare', () => {
-      if (!quotes.website2 || !quotes['website2 landing']) throw new Error('not compared: website2 could not be read')
+      if (Object.keys(quotes).length === 0) throw new Error('not compared: website2 could not be read')
       const divergences = compare(billed, quotes)
       const n = divergences.length
       if (n > 0) throw new Error(`${n} divergence${n === 1 ? '' : 's'}:\n${divergences.join('\n')}`)
-      return billed ? 'every surface agrees with fabric' : "website2's table and landing cards agree; fabric not compared, its prices could not be read"
+      const surfaces = ['fabric', 'website2', 'website2 landing']
+      const read = surfaces.filter((s) => (s === 'fabric' ? billed !== null : s in quotes))
+      const unread = surfaces.filter((s) => !read.includes(s))
+      if (unread.length === 0) return 'every surface agrees with fabric'
+      return `${read.join(' and ')} ${read.length === 1 ? 'prices every card port' : 'agree'}; ${unread.join(' and ')} not compared, could not be read`
     })
   },
 }

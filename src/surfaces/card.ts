@@ -60,7 +60,10 @@ const key = (c: { port: string; tier: string }): string => `${c.port}\u0000${c.t
  *   prices with no minimum fee. A surface owes the card ports (Ogmios, Kupo,
  *   Blockfrost, UTxO RPC) unless `owes` names its ports: J2's Console leg
  *   reads one resource's pricing page, so it owes that resource's port only;
- * - a minimum fee or usage rate that differs between any two that state it.
+ * - a minimum fee or usage rate that differs between any two that state it;
+ * - a port and tier one surface states more than once (`Blockfrost` and
+ *   `Blockfrost RYO` on one page, say): the rest compares its last statement
+ *   only, so the others would pass unread.
  *
  * With `billed` null (fabric's card could not be read) the quoting surfaces are
  * compared with each other only.
@@ -75,6 +78,17 @@ export function compare(
   const surfaces = Object.entries(quotes).map(([name, cards]) => [name, new Map(cards.map((c) => [key(c), c]))] as const)
   const lines: { order: string; line: string }[] = []
   const add = (port: string, tier: string, field: string, line: string) => lines.push({ order: `${port} ${tier} ${field}`, line })
+
+  for (const [surface, cards] of [['fabric', billed ?? []] as const, ...Object.entries(quotes)]) {
+    const stated = new Map<string, Card[]>()
+    for (const c of cards) stated.set(key(c), [...(stated.get(key(c)) ?? []), c])
+    for (const same of stated.values()) {
+      if (same.length === 1) continue
+      const { port, tier } = same[0]!
+      const prices = same.map((c) => `${formatUsd(c.minimum_usd)} minimum and ${formatUsd(c.per_100k_usd)} per 100k`)
+      add(port, tier, `0 ${surface}`, `${label(port, tier)}: ${surface} states it ${same.length} times, ${prices.join(' · ')}`)
+    }
+  }
 
   const keys = new Set<string>()
   for (const [, cards] of surfaces) for (const k of cards.keys()) keys.add(k)
