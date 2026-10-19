@@ -83,7 +83,7 @@ export const intent: Check = {
     await run.step(`read the links on ${env.website}/ and /pricing`, async () => {
       for (const page of ['/', '/pricing']) {
         const answer = await probe(`${env.website}${page}`, { timeoutMs: 20_000, readBody: true })
-        if (answer.status !== 200) throw new Error(`${page}: ${answer.status ?? 'no answer within 20 s'}, wanted 200`)
+        if (answer.status !== 200) throw new Error(`${page}: ${answer.status ?? answer.error}, wanted 200`)
         pages.push({ page, anchors: anchors(answer.body, `${env.website}${page}`) })
       }
       links = loginLinks(pages, env.console)
@@ -113,7 +113,7 @@ export const intent: Check = {
       await run.step(`${env.console}/login${query} redirects to Auth0 ${wantHint ? 'with' : 'without'} screen_hint=signup`, async () => {
         const answer = await probe(`${env.console}/login${query}`)
         const where = safeUrl(answer.location, ['screen_hint'])
-        if (answer.status === null) throw new Error('no answer within 15 s')
+        if (answer.status === null) throw new Error(`${answer.error}`)
         if (answer.status < 300 || answer.status > 399 || !answer.location) throw new Error(`${answer.status}, wanted a redirect to ${env.auth0}/authorize`)
         const location = new URL(answer.location)
         if (`${location.origin}${location.pathname}` !== `${env.auth0}/authorize`) throw new Error(`${answer.status} → ${where}, wanted ${env.auth0}/authorize`)

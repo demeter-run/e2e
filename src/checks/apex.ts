@@ -16,7 +16,7 @@ type Want = number | 'not404'
 
 function expect(answer: Answer, want: Want, location?: (l: URL) => boolean, locationWanted?: string): string {
   const where = answer.location ? ` → ${safeUrl(answer.location)}` : ''
-  if (answer.status === null) throw new Error(`no answer within 15 s, wanted ${want}`)
+  if (answer.status === null) throw new Error(`${answer.error}, wanted ${want}`)
   if (want === 'not404' ? answer.status === 404 : answer.status !== want) {
     throw new Error(`${answer.status}${where}, wanted ${want === 'not404' ? 'anything but 404' : want}`)
   }
@@ -40,7 +40,7 @@ export const apex: Check = {
     // answer with the same <title>. The SSR shell carries stray NUL bytes.
     await run.step(`${site}/ is served by website2`, async () => {
       const answer = await probe(`${site}/`, { timeoutMs: 20_000, readBody: true })
-      if (answer.status === null) throw new Error('no answer within 20 s')
+      if (answer.status === null) throw new Error(`${answer.error}`)
       if (!answer.body.replaceAll('\0', '').includes('modulepreload" href="/assets/')) {
         throw new Error(`${answer.status}, no website2 modulepreload (legacy shell or error)`)
       }

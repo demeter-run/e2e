@@ -31,7 +31,7 @@ export const pricing: Check = {
 
     await run.step(`read ${env.website}/pricing`, async () => {
       const answer = await probe(`${env.website}/pricing`, { timeoutMs: 20_000, readBody: true })
-      if (answer.status !== 200) throw new Error(`${answer.status ?? 'no answer within 20 s'}, wanted 200`)
+      if (answer.status !== 200) throw new Error(`${answer.status ?? answer.error}, wanted 200`)
       quotes.website2 = pricingCards(readPricingTable(answer.body))
       const ports = [...new Set(quotes.website2.map((c) => c.port))]
       return `${ports.length} ports (${ports.join(', ')})`
@@ -40,7 +40,7 @@ export const pricing: Check = {
     await run.step(`read the landing cards on ${env.website}/`, async () => {
       if (!quotes.website2) throw new Error('not read: the /pricing table names the ports the cards quote for')
       const answer = await probe(`${env.website}/`, { timeoutMs: 20_000, readBody: true })
-      if (answer.status !== 200) throw new Error(`${answer.status ?? 'no answer within 20 s'}, wanted 200`)
+      if (answer.status !== 200) throw new Error(`${answer.status ?? answer.error}, wanted 200`)
       quotes['website2 landing'] = landingCards(answer.body, [...new Set(quotes.website2.map((c) => c.port))])
       return 'Flexible, Pro I and Pro II'
     })

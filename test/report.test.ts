@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
+import { once } from 'node:events'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { type AddressInfo, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it, mock } from 'node:test'
-import { safeUrl } from '../src/http.ts'
+import { probe, safeUrl } from '../src/http.ts'
 import { alertFailures, alertPayload, formatMarkdown, Run, writeResult } from '../src/report.ts'
 
 async function sample() {
@@ -70,6 +72,19 @@ describe('alerts', () => {
       log.mock.restore()
       if (saved !== undefined) process.env.IRM_E2E_WEBHOOK_URL = saved
     }
+  })
+})
+
+describe('requests', () => {
+  it('say why nothing answered', async () => {
+    // A port that was free a moment ago, so nothing listens on it.
+    const server = createServer().listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const { port } = server.address() as AddressInfo
+    await new Promise((resolve) => server.close(resolve))
+    const answer = await probe(`http://127.0.0.1:${port}/`, { timeoutMs: 5_000 })
+    assert.equal(answer.status, null)
+    assert.match(answer.error ?? '', /^no answer: ECONNREFUSED/)
   })
 })
 
