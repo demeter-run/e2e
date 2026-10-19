@@ -1,0 +1,445 @@
+{
+  "sources": {
+    "fabric": "demeter-run/fabric a02e05848db4 (parent of fabric#272): bootstrap/rpc/crds/*.json plan.<tier>.cost",
+    "website2": "demeter-run/website2 08f1a267a555 (parent of website2#10): src/content/portPricing.ts, the /pricing table",
+    "website2 landing": "demeter-run/website2 08f1a267a555: src/content/plans.ts, the landing cards"
+  },
+  "fabric": [
+    {
+      "port": "balius",
+      "tier": "0",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "balius",
+      "tier": "1",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "balius",
+      "tier": "2",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "balius",
+      "tier": "3",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "blockfrost",
+      "tier": "0",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.0
+    },
+    {
+      "port": "blockfrost",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.06
+    },
+    {
+      "port": "blockfrost",
+      "tier": "2",
+      "minimum_usd": 30,
+      "per_100k_usd": 0.05
+    },
+    {
+      "port": "blockfrost",
+      "tier": "3",
+      "minimum_usd": 80,
+      "per_100k_usd": 0.04
+    },
+    {
+      "port": "node",
+      "tier": "0",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.0
+    },
+    {
+      "port": "node",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 1.3889
+    },
+    {
+      "port": "node",
+      "tier": "2",
+      "minimum_usd": 100,
+      "per_100k_usd": 0.463
+    },
+    {
+      "port": "node",
+      "tier": "3",
+      "minimum_usd": 200,
+      "per_100k_usd": 0.3472
+    },
+    {
+      "port": "dbsync",
+      "tier": "0",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.0
+    },
+    {
+      "port": "dbsync",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.7407
+    },
+    {
+      "port": "dbsync",
+      "tier": "2",
+      "minimum_usd": 100,
+      "per_100k_usd": 0.6713
+    },
+    {
+      "port": "dbsync",
+      "tier": "3",
+      "minimum_usd": 300,
+      "per_100k_usd": 0.5556
+    },
+    {
+      "port": "kupo",
+      "tier": "0",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.0
+    },
+    {
+      "port": "kupo",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.09
+    },
+    {
+      "port": "kupo",
+      "tier": "2",
+      "minimum_usd": 50,
+      "per_100k_usd": 0.08
+    },
+    {
+      "port": "kupo",
+      "tier": "3",
+      "minimum_usd": 150,
+      "per_100k_usd": 0.07
+    },
+    {
+      "port": "marlowe",
+      "tier": "0",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "marlowe",
+      "tier": "1",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "marlowe",
+      "tier": "2",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "marlowe",
+      "tier": "3",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "mumak",
+      "tier": "0",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "mumak",
+      "tier": "1",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "mumak",
+      "tier": "2",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "mumak",
+      "tier": "3",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "ogmios",
+      "tier": "0",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.0
+    },
+    {
+      "port": "ogmios",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.2662
+    },
+    {
+      "port": "ogmios",
+      "tier": "2",
+      "minimum_usd": 100,
+      "per_100k_usd": 0.2315
+    },
+    {
+      "port": "ogmios",
+      "tier": "3",
+      "minimum_usd": 200,
+      "per_100k_usd": 0.1968
+    },
+    {
+      "port": "scrolls",
+      "tier": "0",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "scrolls",
+      "tier": "1",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "scrolls",
+      "tier": "2",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "scrolls",
+      "tier": "3",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "submitapi",
+      "tier": "0",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.0
+    },
+    {
+      "port": "submitapi",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.4
+    },
+    {
+      "port": "submitapi",
+      "tier": "2",
+      "minimum_usd": 200,
+      "per_100k_usd": 0.36
+    },
+    {
+      "port": "submitapi",
+      "tier": "3",
+      "minimum_usd": 400,
+      "per_100k_usd": 0.3
+    },
+    {
+      "port": "trp",
+      "tier": "0",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "trp",
+      "tier": "1",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "trp",
+      "tier": "2",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "trp",
+      "tier": "3",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "utxorpc",
+      "tier": "0",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "utxorpc",
+      "tier": "1",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "utxorpc",
+      "tier": "2",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "utxorpc",
+      "tier": "3",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    }
+  ],
+  "website2": [
+    {
+      "port": "ogmios",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.266204
+    },
+    {
+      "port": "ogmios",
+      "tier": "2",
+      "minimum_usd": 100,
+      "per_100k_usd": 0.231481
+    },
+    {
+      "port": "ogmios",
+      "tier": "3",
+      "minimum_usd": 200,
+      "per_100k_usd": 0.196759
+    },
+    {
+      "port": "kupo",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.09
+    },
+    {
+      "port": "kupo",
+      "tier": "2",
+      "minimum_usd": 50,
+      "per_100k_usd": 0.08
+    },
+    {
+      "port": "kupo",
+      "tier": "3",
+      "minimum_usd": 150,
+      "per_100k_usd": 0.07
+    },
+    {
+      "port": "blockfrost",
+      "tier": "1",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "blockfrost",
+      "tier": "2",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "blockfrost",
+      "tier": "3",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "utxorpc",
+      "tier": "1",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "utxorpc",
+      "tier": "2",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    },
+    {
+      "port": "utxorpc",
+      "tier": "3",
+      "minimum_usd": null,
+      "per_100k_usd": null
+    }
+  ],
+  "website2 landing": [
+    {
+      "port": "ogmios",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.28
+    },
+    {
+      "port": "kupo",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.28
+    },
+    {
+      "port": "blockfrost",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.28
+    },
+    {
+      "port": "utxorpc",
+      "tier": "1",
+      "minimum_usd": 0,
+      "per_100k_usd": 0.28
+    },
+    {
+      "port": "ogmios",
+      "tier": "2",
+      "minimum_usd": 50,
+      "per_100k_usd": 0.25
+    },
+    {
+      "port": "kupo",
+      "tier": "2",
+      "minimum_usd": 50,
+      "per_100k_usd": 0.25
+    },
+    {
+      "port": "blockfrost",
+      "tier": "2",
+      "minimum_usd": 50,
+      "per_100k_usd": 0.25
+    },
+    {
+      "port": "utxorpc",
+      "tier": "2",
+      "minimum_usd": 50,
+      "per_100k_usd": 0.25
+    },
+    {
+      "port": "ogmios",
+      "tier": "3",
+      "minimum_usd": 150,
+      "per_100k_usd": 0.23
+    },
+    {
+      "port": "kupo",
+      "tier": "3",
+      "minimum_usd": 150,
+      "per_100k_usd": 0.23
+    },
+    {
+      "port": "blockfrost",
+      "tier": "3",
+      "minimum_usd": 150,
+      "per_100k_usd": 0.23
+    },
+    {
+      "port": "utxorpc",
+      "tier": "3",
+      "minimum_usd": 150,
+      "per_100k_usd": 0.23
+    }
+  ]
+}
