@@ -82,18 +82,22 @@ export function pricingCards(table: PricingTable): Card[] {
   for (const { name, rows } of table.ports) {
     const port = website2Names[name]
     if (!port) throw new Error(`website2 prices "${name}", a port this check cannot place: add it to src/surfaces/ports.ts`)
-    const minimum = rows.find((r) => r.label === 'MINIMUM FEE')
+    // A price row this reader cannot place fails it: a relabelled row read as
+    // no price would let the comparison skip what it states.
+    const labels = rows.map((r) => r.label).join(', ')
+    const minimums = rows.filter((r) => r.label.includes('MINIMUM'))
+    if (minimums.length !== 1 || minimums[0]!.label !== 'MINIMUM FEE') throw new Error(`${name}: wanted one "MINIMUM FEE" row, found ${labels}`)
     const usage = rows.filter((r) => r.label.startsWith('PER '))
-    if (usage.length > 1) throw new Error(`${name}: more than one usage row (${usage.map((r) => r.label).join(', ')})`)
-    const units = usage[0] ? rowUnits[usage[0].label] : undefined
-    if (usage[0] && !units) throw new Error(`${name}: cannot convert "${usage[0].label}" to units`)
+    if (usage.length !== 1) throw new Error(`${name}: wanted one usage row ("PER …"), found ${labels}`)
+    const units = rowUnits[usage[0]!.label]
+    if (!units) throw new Error(`${name}: cannot convert "${usage[0]!.label}" to units`)
     tiers.forEach((tier, column) => {
-      const perUnit = usage[0] && units ? parseUsd(usage[0].values[column]!) : null
+      const perUnit = parseUsd(usage[0]!.values[column]!)
       cards.push({
         port,
         tier,
-        minimum_usd: minimum ? parseUsd(minimum.values[column]!) : null,
-        per_100k_usd: perUnit === null || !units ? null : (perUnit / units) * 100_000,
+        minimum_usd: parseUsd(minimums[0]!.values[column]!),
+        per_100k_usd: perUnit === null ? null : (perUnit / units) * 100_000,
       })
     })
   }
@@ -122,10 +126,11 @@ export function landingCards(html: string, ports: string[]): Card[] {
     const [price, unit, note] = [tokens[at[0]! + 1]!, tokens[at[0]! + 2]!, tokens[at[0]! + 3] ?? '']
     const units = landingUnits[unit]
     if (!units) throw new Error(`landing card ${tag}: cannot convert "${unit}" to units`)
-    let minimum: number | null = null
-    if (/no minimum fee/i.test(note)) minimum = 0
+    // The two wordings the live cards use; any other fails the reader rather
+    // than read the card as stating no minimum.
     const fee = /minimum fee (?:from )?(\$[\d,.]*\d)/i.exec(note)
-    if (fee) minimum = parseUsd(fee[1]!)
+    const minimum = /no minimum fee/i.test(note) ? 0 : fee ? parseUsd(fee[1]!) : null
+    if (minimum === null) throw new Error(`landing card ${tag}: cannot read a minimum fee in "${note}"`)
     const perUnit = parseUsd(price)
     for (const port of ports) {
       cards.push({ port, tier, minimum_usd: minimum, per_100k_usd: perUnit === null ? null : (perUnit / units) * 100_000 })

@@ -1,6 +1,37 @@
+import { once } from 'node:events'
 import { readFileSync } from 'node:fs'
+import { createServer, type RequestListener } from 'node:http'
+import { createServer as createH2cServer, type Http2ServerRequest, type Http2ServerResponse } from 'node:http2'
+import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
 import type { Card } from '../src/surfaces/card.ts'
+
+/** A local server for one test: its base URL, and `close` to stop it. */
+export interface Served {
+  url: string
+  close(): Promise<void>
+}
+
+async function listen(server: ReturnType<typeof createServer> | ReturnType<typeof createH2cServer>): Promise<Served> {
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const { port } = server.address() as AddressInfo
+  return {
+    url: `http://127.0.0.1:${port}`,
+    close: () =>
+      new Promise((resolve) => {
+        if ('closeAllConnections' in server) server.closeAllConnections()
+        server.close(() => resolve())
+      }),
+  }
+}
+
+/** An HTTP/1.1 server on a free local port. */
+export const serve = (handler: RequestListener): Promise<Served> => listen(createServer(handler))
+
+/** A cleartext HTTP/2 server on a free local port, as fabric's API speaks only HTTP/2. */
+export const serveH2c = (handler: (request: Http2ServerRequest, response: Http2ServerResponse) => void): Promise<Served> =>
+  listen(createH2cServer(handler))
 
 /** A fixture captured from production (sources in `fixtures/README.md`). */
 export const live = (name: string): Buffer => readFileSync(join(import.meta.dirname, 'fixtures', 'live', name))

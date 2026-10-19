@@ -138,6 +138,17 @@ describe('website2', () => {
     near(cards[0]!.per_100k_usd, (0.23 / 86_400) * 100_000)
   })
 
+  it('refuses a minimum fee or usage row it cannot place, rather than read no price', () => {
+    // Read as no minimum, the relabelled row would let $60 against fabric's $50 pass.
+    const relabelled = edit(edit(pricingPage, '>MINIMUM FEE<', '>MINIMUM FEE / MONTH<', '>Kupo<'), '>$50<', '>$60<', '>Kupo<')
+    assert.throws(
+      () => pricingCards(readPricingTable(relabelled)),
+      /^Error: Kupo: wanted one "MINIMUM FEE" row, found MINIMUM FEE \/ MONTH, PER 100K REQUESTS, MAX REQUESTS \/ SECOND, APPROX\. DAILY REQUESTS$/,
+    )
+    const noUsage = edit(pricingPage, '>PER 100K REQUESTS<', '>USAGE PER 100K REQUESTS<', '>Kupo<')
+    assert.throws(() => pricingCards(readPricingTable(noUsage)), /^Error: Kupo: wanted one usage row \("PER …"\), found MINIMUM FEE, USAGE PER 100K REQUESTS,/)
+  })
+
   it('refuses a port, a column or a unit it cannot place', () => {
     assert.throws(() => pricingCards(readPricingTable(edit(pricingPage, '>Kupo<', '>Dolos<'))), /website2 prices "Dolos"/)
     assert.throws(() => pricingCards(readPricingTable(edit(pricingPage, '>Pro II<', '>Scale<'))), /"Scale" column/)
@@ -157,5 +168,10 @@ describe('website2', () => {
 
   it('refuses a landing page without its price cards', () => {
     assert.throws(() => landingCards('<p>FLEXIBLE</p>', ['kupo']), /0 "FLEXIBLE" price cards/)
+  })
+
+  it('refuses a landing card whose minimum fee it cannot read, rather than read none', () => {
+    const home = edit(homePage, 'Minimum fee $50', 'Minimum fee: $60', '>PRO I<')
+    assert.throws(() => landingCards(home, ['kupo']), /^Error: landing card PRO I: cannot read a minimum fee in "Minimum fee: \$60 once you reserve throughput"$/)
   })
 })

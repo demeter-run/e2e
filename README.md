@@ -61,7 +61,10 @@ The deployed surfaces that state a price agree:
 | website2's landing cards | `GET https://demeter.run/` | a tier card per plan: a price, `per 100k requests`, and a note stating the minimum fee |
 
 The Console's prices render only on signed-in pages, so its leg runs inside the
-J2 journey, with the same comparator (`compare` in `src/surfaces/card.ts`).
+J2 journey, with the same comparator (`compare` in `src/surfaces/card.ts`). A
+resource's pricing page quotes that resource's port only, so J2 names the
+ports its surface owes: `compare(billed, { console }, { owes: { console:
+['blockfrost'] } })`.
 
 Each surface is reduced to one card per port and tier,
 `{port, tier, minimum_usd, per_100k_usd}`, where `per_100k_usd` is USD per
@@ -80,14 +83,17 @@ tier and each surface's value, when:
   `cost` block, no such tier or no such port), which is how UTxO RPC was quoted
   and never billed;
 - Ogmios, Kupo, Blockfrost or UTxO RPC, on tiers 1–3, is not priced by the
-  `/pricing` table or the landing cards;
+  `/pricing` table or the landing cards, or is priced with no minimum fee;
 - a minimum fee or usage rate differs between any surfaces that state it.
   fabric stores rates to four significant digits, so values within 0.1% are the
   same.
 
-A port name, plan column or unit the readers cannot place
-(`src/surfaces/ports.ts`, `src/surfaces/website2.ts`) also fails it. A failure
-that production causes is not suppressed: it stays red and alerts.
+A port name, plan column, unit, price row or minimum-fee wording the readers
+cannot place (`src/surfaces/ports.ts`, `src/surfaces/website2.ts`) also fails
+it: each port in the table needs exactly one `MINIMUM FEE` row and one `PER …`
+row, and each landing card a note reading "No minimum fee" or "Minimum fee
+$…". A relabelled row read as no price would let the comparison skip it. A
+failure that production causes is not suppressed: it stays red and alerts.
 
 **fabric does not publish its prices yet.** A live `FetchMetadata` record
 carries only `options` (field 1) and `crd` (field 2); the per-tier `plan` that
@@ -140,8 +146,11 @@ From the Console:
 The apex contract from the cutover-apex skill's `cutover.sh verify`, one
 assertion per probe, with the same semantics: one request on its own
 connection, as one curl per probe, no redirect followed, 15 s to answer (20 s
-for the page body). Every check's page reads go through the same `probe`
-(`src/http.ts`).
+for the page body). As curl prints the status it received even when the body
+then stalls, a status is kept once it arrives; only a read that needs the body
+fails when the body does not finish, and says so. A `Location` that is not a
+URL fails the probe that received it. Every check's requests go through the
+same `probe` (`src/http.ts`).
 
 | # | Request | Expected |
 | --- | --- | --- |
@@ -195,6 +204,9 @@ pnpm typecheck
 The readers are tested on responses and pages captured from production, and
 the comparator on the pre-rollout numbers; `test/fixtures/README.md` says
 where each came from. A variant is a copy of a captured page with one edit.
+Requests, alerts and the `pricing` check end to end run against local servers
+serving those captures (an HTTP/2 one for fabric), and `pnpm check` itself
+against stand-in checks, so no unit test reaches production.
 
 ## Workflows
 

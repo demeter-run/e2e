@@ -1,6 +1,6 @@
 import { chromium } from '@playwright/test'
 import { type Anchor, anchors } from '../html.ts'
-import { probe, safeUrl } from '../http.ts'
+import { describeAnswer, probe, readPage, safeUrl } from '../http.ts'
 import type { Check } from './check.ts'
 
 /**
@@ -82,9 +82,13 @@ export const intent: Check = {
 
     await run.step(`read the links on ${env.website}/ and /pricing`, async () => {
       for (const page of ['/', '/pricing']) {
-        const answer = await probe(`${env.website}${page}`, { timeoutMs: 20_000, readBody: true })
-        if (answer.status !== 200) throw new Error(`${page}: ${answer.status ?? answer.error}, wanted 200`)
-        pages.push({ page, anchors: anchors(answer.body, `${env.website}${page}`) })
+        let body: string
+        try {
+          body = await readPage(`${env.website}${page}`)
+        } catch (error) {
+          throw new Error(`${page}: ${(error as Error).message}`)
+        }
+        pages.push({ page, anchors: anchors(body, `${env.website}${page}`) })
       }
       links = loginLinks(pages, env.console)
       return pages.map((p) => `${p.page}: ${p.anchors.length} links`).join(', ')
@@ -113,7 +117,7 @@ export const intent: Check = {
       await run.step(`${env.console}/login${query} redirects to Auth0 ${wantHint ? 'with' : 'without'} screen_hint=signup`, async () => {
         const answer = await probe(`${env.console}/login${query}`)
         const where = safeUrl(answer.location, ['screen_hint'])
-        if (answer.status === null) throw new Error(`${answer.error}`)
+        if (answer.status === null || answer.error) throw new Error(describeAnswer(answer))
         if (answer.status < 300 || answer.status > 399 || !answer.location) throw new Error(`${answer.status}, wanted a redirect to ${env.auth0}/authorize`)
         const location = new URL(answer.location)
         if (`${location.origin}${location.pathname}` !== `${env.auth0}/authorize`) throw new Error(`${answer.status} → ${where}, wanted ${env.auth0}/authorize`)

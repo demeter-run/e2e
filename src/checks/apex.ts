@@ -1,4 +1,4 @@
-import { type Answer, probe, safeUrl } from '../http.ts'
+import { type Answer, describeAnswer, probe } from '../http.ts'
 import type { Check } from './check.ts'
 
 /**
@@ -8,22 +8,25 @@ import type { Check } from './check.ts'
  * `/webhooks` on the apex, and its pages moved to `legacy.demeter.run`.
  *
  * Same semantics as the script: one request each, no redirect followed, 15 s
- * to answer (20 s for the page body). Where the script printed a `Location`
- * without checking it, it is asserted here.
+ * to answer (20 s for the page body), and the status that arrived is the
+ * answer even if the body then stalls. Where the script printed a `Location`
+ * without checking it, it is asserted here, and a `Location` that is not a
+ * URL fails the probe that received it.
  */
 
 type Want = number | 'not404'
 
 function expect(answer: Answer, want: Want, location?: (l: URL) => boolean, locationWanted?: string): string {
-  const where = answer.location ? ` → ${safeUrl(answer.location)}` : ''
-  if (answer.status === null) throw new Error(`${answer.error}, wanted ${want}`)
+  const seen = describeAnswer(answer)
+  if (answer.status === null) throw new Error(`${seen}, wanted ${want}`)
   if (want === 'not404' ? answer.status === 404 : answer.status !== want) {
-    throw new Error(`${answer.status}${where}, wanted ${want === 'not404' ? 'anything but 404' : want}`)
+    throw new Error(`${seen}, wanted ${want === 'not404' ? 'anything but 404' : want}`)
   }
+  if (answer.error) throw new Error(seen)
   if (location && !(answer.location && location(new URL(answer.location)))) {
-    throw new Error(`${answer.status}${where}, wanted Location ${locationWanted}`)
+    throw new Error(`${seen}, wanted Location ${locationWanted}`)
   }
-  return `${answer.status}${where}`
+  return seen
 }
 
 const at = (base: string, path: string) => (l: URL) => `${l.origin}${l.pathname}` === `${base}${path}`
@@ -40,7 +43,7 @@ export const apex: Check = {
     // answer with the same <title>. The SSR shell carries stray NUL bytes.
     await run.step(`${site}/ is served by website2`, async () => {
       const answer = await probe(`${site}/`, { timeoutMs: 20_000, readBody: true })
-      if (answer.status === null) throw new Error(`${answer.error}`)
+      if (answer.status === null || answer.error) throw new Error(describeAnswer(answer))
       if (!answer.body.replaceAll('\0', '').includes('modulepreload" href="/assets/')) {
         throw new Error(`${answer.status}, no website2 modulepreload (legacy shell or error)`)
       }

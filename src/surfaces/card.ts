@@ -56,14 +56,20 @@ const key = (c: { port: string; tier: string }): string => `${c.port}\u0000${c.t
  * - a surface charging for a port and tier fabric bills nothing for (no `cost`
  *   block, no such tier or no such port): the UTxO RPC incident, quoted and
  *   never billed;
- * - a card port (Ogmios, Kupo, Blockfrost, UTxO RPC) on tiers 1–3 that a
- *   surface does not price;
+ * - a port a surface must price, on tiers 1–3, that it does not price, or
+ *   prices with no minimum fee. A surface owes the card ports (Ogmios, Kupo,
+ *   Blockfrost, UTxO RPC) unless `owes` names its ports: J2's Console leg
+ *   reads one resource's pricing page, so it owes that resource's port only;
  * - a minimum fee or usage rate that differs between any two that state it.
  *
  * With `billed` null (fabric's card could not be read) the quoting surfaces are
  * compared with each other only.
  */
-export function compare(billed: Card[] | null, quotes: Record<string, Card[]>): string[] {
+export function compare(
+  billed: Card[] | null,
+  quotes: Record<string, Card[]>,
+  { owes = {} }: { owes?: Record<string, string[]> } = {},
+): string[] {
   const fabric = new Map((billed ?? []).map((c) => [key(c), c]))
   const fabricPorts = new Set((billed ?? []).map((c) => c.port))
   const surfaces = Object.entries(quotes).map(([name, cards]) => [name, new Map(cards.map((c) => [key(c), c]))] as const)
@@ -87,11 +93,12 @@ export function compare(billed: Card[] | null, quotes: Record<string, Card[]>): 
     }
   }
 
-  for (const port of cardPorts) {
-    for (const tier of ['1', '2', '3']) {
-      for (const [surface, cards] of surfaces) {
+  for (const [surface, cards] of surfaces) {
+    for (const port of owes[surface] ?? cardPorts) {
+      for (const tier of ['1', '2', '3']) {
         const quote = cards.get(key({ port, tier }))
         if (!quote || quote.per_100k_usd === null) add(port, tier, `1 ${surface}`, `${label(port, tier)}: ${surface} publishes no price`)
+        else if (quote.minimum_usd === null) add(port, tier, `1 ${surface}`, `${label(port, tier)}: ${surface} publishes no minimum fee`)
       }
     }
   }

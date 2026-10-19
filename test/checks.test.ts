@@ -3,7 +3,7 @@ import { describe, it } from 'node:test'
 import { loginLinks, type PageLinks } from '../src/checks/intent.ts'
 import { environments } from '../src/env.ts'
 import { anchors } from '../src/html.ts'
-import { compare } from '../src/surfaces/card.ts'
+import { type Card, compare } from '../src/surfaces/card.ts'
 import { landingCards, pricingCards, readPricingTable } from '../src/surfaces/website2.ts'
 import { edit, live, preRateCard } from './helpers.ts'
 
@@ -55,6 +55,50 @@ describe('pricing comparison', () => {
     const lines = compare([], { website2: [{ port: 'hydra', tier: '2', minimum_usd: 10, per_100k_usd: 1 }] })
     assert.ok(lines.includes('Kupo Flexible: website2 publishes no price'))
     assert.ok(lines.includes('hydra Pro I: website2 charges $10 minimum and $1 per 100k; fabric has no such port'))
+  })
+
+  it('flags a card port a surface leaves out on any tier 1–3, or prices with no minimum fee', () => {
+    const { website2: table } = website2()
+    const quoted = table
+      .filter((c) => !(c.port === 'kupo' && c.tier === '3') && !(c.port === 'blockfrost' && c.tier === '2'))
+      .map((c) => (c.port === 'ogmios' && c.tier === '1' ? { ...c, minimum_usd: null } : c))
+    assert.deepEqual(compare(table, { website2: quoted }), [
+      'Blockfrost Pro I: website2 publishes no price',
+      'Kupo Pro II: website2 publishes no price',
+      'Ogmios Flexible: website2 publishes no minimum fee',
+    ])
+  })
+
+  it('flags a minimum fee alone, for a tier fabric bills nothing', () => {
+    const lines = compare(
+      [{ port: 'marlowe', tier: '2', minimum_usd: null, per_100k_usd: null }],
+      { console: [{ port: 'marlowe', tier: '2', minimum_usd: 50, per_100k_usd: 0 }] },
+      { owes: { console: [] } },
+    )
+    assert.deepEqual(lines, ['Marlowe Pro I: console charges $50 minimum and $0 per 100k; fabric bills nothing (no cost block)'])
+  })
+
+  it("treats prices within 0.1% as the same, fabric's four significant digits, and nothing wider", () => {
+    const kupoProI = (minimum_usd: number, per_100k_usd: number): Card[] => [{ port: 'kupo', tier: '2', minimum_usd, per_100k_usd }]
+    const loose = { owes: { website2: [] } }
+    // $1.20 a day of connection, as fabric stores it: 0.000013889 per second.
+    assert.deepEqual(compare(kupoProI(50, 0.000013889 * 100_000), { website2: kupoProI(50, (1.2 / 86_400) * 100_000) }, loose), [])
+    assert.deepEqual(compare(kupoProI(50, 0.26), { website2: kupoProI(50, 0.2602) }, loose), [])
+    assert.deepEqual(compare(kupoProI(50, 0.26), { website2: kupoProI(50, 0.2606) }, loose), ['Kupo Pro I per 100k: fabric $0.26 · website2 $0.2606'])
+    assert.deepEqual(compare(kupoProI(150, 0.26), { website2: kupoProI(146, 0.26) }, loose), ['Kupo Pro I minimum: fabric $150 · website2 $146'])
+  })
+
+  it("serves J2's Console leg, which owes its one resource's port on tiers 1–3", () => {
+    const { website2: billed } = website2()
+    const blockfrost = billed.filter((c) => c.port === 'blockfrost')
+    const owes = { owes: { console: ['blockfrost'] } }
+    assert.equal(compare(billed, { console: blockfrost }).length, 9, 'by default a surface owes every card port')
+    assert.deepEqual(compare(billed, { console: blockfrost }, owes), [])
+    const drifted = blockfrost.filter((c) => c.tier !== '3').map((c) => (c.tier === '1' ? { ...c, per_100k_usd: 0.28 } : c))
+    assert.deepEqual(compare(billed, { console: drifted }, owes), [
+      'Blockfrost Flexible per 100k: fabric $0.30 · console $0.28',
+      'Blockfrost Pro II: console publishes no price',
+    ])
   })
 
   it('compares the quoting surfaces with each other when fabric cannot be read', () => {

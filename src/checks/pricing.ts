@@ -1,4 +1,4 @@
-import { probe } from '../http.ts'
+import { readPage } from '../http.ts'
 import { type Card, compare } from '../surfaces/card.ts'
 import { fabricCards, fabricTiers, fetchMetadata } from '../surfaces/fabric.ts'
 import { landingCards, pricingCards, readPricingTable } from '../surfaces/website2.ts'
@@ -30,25 +30,23 @@ export const pricing: Check = {
     })
 
     await run.step(`read ${env.website}/pricing`, async () => {
-      const answer = await probe(`${env.website}/pricing`, { timeoutMs: 20_000, readBody: true })
-      if (answer.status !== 200) throw new Error(`${answer.status ?? answer.error}, wanted 200`)
-      quotes.website2 = pricingCards(readPricingTable(answer.body))
+      quotes.website2 = pricingCards(readPricingTable(await readPage(`${env.website}/pricing`)))
       const ports = [...new Set(quotes.website2.map((c) => c.port))]
       return `${ports.length} ports (${ports.join(', ')})`
     })
 
     await run.step(`read the landing cards on ${env.website}/`, async () => {
       if (!quotes.website2) throw new Error('not read: the /pricing table names the ports the cards quote for')
-      const answer = await probe(`${env.website}/`, { timeoutMs: 20_000, readBody: true })
-      if (answer.status !== 200) throw new Error(`${answer.status ?? answer.error}, wanted 200`)
-      quotes['website2 landing'] = landingCards(answer.body, [...new Set(quotes.website2.map((c) => c.port))])
+      const ports = [...new Set(quotes.website2.map((c) => c.port))]
+      quotes['website2 landing'] = landingCards(await readPage(`${env.website}/`), ports)
       return 'Flexible, Pro I and Pro II'
     })
 
     await run.step('compare', () => {
       if (!quotes.website2 || !quotes['website2 landing']) throw new Error('not compared: website2 could not be read')
       const divergences = compare(billed, quotes)
-      if (divergences.length > 0) throw new Error(`${divergences.length} divergences:\n${divergences.join('\n')}`)
+      const n = divergences.length
+      if (n > 0) throw new Error(`${n} divergence${n === 1 ? '' : 's'}:\n${divergences.join('\n')}`)
       return billed ? 'every surface agrees with fabric' : "website2's table and landing cards agree; fabric not compared, its prices could not be read"
     })
   },
