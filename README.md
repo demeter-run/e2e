@@ -1,75 +1,77 @@
 # e2e
 
 Developer journey end-to-end tests for Demeter, run against production, and the
-contract checks that fail when the seams between website2, the Console and
-fabric drift.
+contract checks that fail when website2, the Console and fabric drift apart in
+production.
 
-Today this repository holds the harness and four browserless contract checks.
-The journeys (a person's path from `demeter.run` to a first request, and an
-agent's) build on the same harness.
+**This repository tests live surfaces only.** It reads what is deployed, over
+HTTP and in a browser, and nothing else: it clones, vendors and reads no
+product repository, and it gates no other repository's pull requests. Each
+product repository keeps its own static checks. Drift between surfaces is
+caught here, afterwards, against production.
 
-Every check is **report-only**: a failure shows on the pull request or alerts
-from a scheduled run, but nothing here is a required status.
+Today it holds the harness and three contract checks. The journeys (a person's
+path from `demeter.run` to a first request, and an agent's) build on the same
+harness.
+
+Every check is **report-only**: a failure shows on this repository's pull
+requests or alerts from a scheduled run, but nothing here is a required status.
 
 ## Setup
 
-- Node 22 (`.nvmrc`) and pnpm (the version in `package.json`'s
-  `packageManager`; `corepack enable` provides it).
-- Read access to `demeter-run/webui` and `demeter-run/website2`, which are
-  private. Locally, your git credentials provide it. In CI, the
-  `E2E_SOURCES_TOKEN` secret does (see [Secrets](#secrets)).
+Node 22 (`.nvmrc`) and pnpm (the version in `package.json`'s
+`packageManager`; `corepack enable` provides it). No credentials: every
+surface the checks read is public.
 
 ```sh
 pnpm install
-pnpm exec playwright install chromium   # for intent's live steps
+pnpm exec playwright install chromium   # for intent's last two steps
 ```
 
 ## Running a check
 
 ```sh
-pnpm check <name>                     # one check
-pnpm check pricing,endpoint-parity    # several
-pnpm check all --env production       # every check, live steps included
+pnpm check pricing --env production         # one check
+pnpm check intent,apex --env production     # several
+pnpm check all --env production             # every check
 ```
 
 | Option | Effect |
 | --- | --- |
-| `--env <name>` | Run live steps against a named environment. Without it, only static steps run, and a live-only check is skipped (`all`) or refused (by name). |
-| `--fabric <dir>`, `--webui <dir>`, `--website2 <dir>` | Read that repository from a directory instead of a fresh shallow clone of its `main`. |
+| `--env <name>` | The environment to check. Required. |
 | `--alert` | Post one IRM alert per failed check, when `IRM_E2E_WEBHOOK_URL` is set; otherwise log that the alert was skipped. |
 | `--force-fail` | Add a check named `force-fail` that fails on purpose, to prove the alert path. |
 | `--results <dir>` | Where result files go (default `results/`). |
 
 Environments are named in `src/env.ts`. `production` is the only one:
 `https://demeter.run` (website2), `https://console.demeter.run`,
-`https://legacy.demeter.run` and the Auth0 tenant
-`https://txpipe.us.auth0.com`.
-
-Each repository source defaults to a fresh shallow clone of `main`, made in a
-temporary directory for the run and removed after it. To check a local branch,
-point at it: `pnpm check pricing --webui ../webui`.
+`https://legacy.demeter.run`, `https://rpc.demeter.run` (fabric's gRPC-web
+API) and the Auth0 tenant `https://txpipe.us.auth0.com`.
 
 ## The checks
 
-### `pricing` (static)
+### `pricing`
 
-The three surfaces that state a price agree:
+The deployed surfaces that state a price agree:
 
 | Surface | Read from | Shape |
 | --- | --- | --- |
-| fabric (what is billed) | `bootstrap/rpc/crds/<kind>.json` | `plan.<tier>.cost.{minimum, delta}`: USD per month, USD per metered unit |
-| the Console (what a customer confirms) | `src/app/utils/pricing/values.ts` | `PRICING[<slug>].tiers[…].plans[<plan>].cost.{fixed, usageBased, usageBasedLabel}` |
-| website2 (what a visitor reads) | `src/content/portPricing.ts` (the `/pricing` table) and `src/content/plans.ts` (the landing cards) | display strings such as `'$0.30'` |
+| fabric (what is billed) | `MetadataService/FetchMetadata` on `https://rpc.demeter.run`, gRPC-web, no auth | per kind, `plan.<tier>.cost.{minimum, delta}`: USD per month, USD per metered unit |
+| website2's table (what a visitor reads) | `GET https://demeter.run/pricing` | one section per port; rows `MINIMUM FEE` and `PER 100K REQUESTS` / `PER 100K MESSAGES`, one display string (`$0.30`) per plan column |
+| website2's landing cards | `GET https://demeter.run/` | a tier card per plan: a price, `per 100k requests`, and a note stating the minimum fee |
+
+The Console's prices render only on signed-in pages, so its leg runs inside the
+J2 journey, with the same comparator (`compare` in `src/surfaces/card.ts`).
 
 Each surface is reduced to one card per port and tier,
 `{port, tier, minimum_usd, per_100k_usd}`, where `per_100k_usd` is USD per
 100,000 of the port's metered unit (requests, messages, submits, or seconds of
-open connection: the Console's "24hs of open connection" is 86,400 units).
-Tiers are fabric's: `0` Free, `1` Flexible, `2` Pro I, `3` Pro II. Ogmios's
-tier `4` is off the card (decision 0024) and compared with nothing. The landing
-cards price "all APIs, one rate", so they are read as a quote for every port
-the `/pricing` table lists. The website2 TypeScript modules are loaded with
-`tsx`; plain `node` cannot import them.
+open connection: a day of connection is 86,400 units). Tiers are fabric's:
+`0` Free, `1` Flexible, `2` Pro I, `3` Pro II. Ogmios's tier `4` is off the card
+(decision 0024) and compared with nothing. The landing cards price "all APIs,
+one rate", so they are read as a quote for every port the `/pricing` table
+lists. The pages are read as text: their server-rendered HTML carries NUL
+bytes, and no browser is needed.
 
 The check fails, printing one line per divergence that names the port, the
 tier and each surface's value, when:
@@ -78,42 +80,52 @@ tier and each surface's value, when:
   `cost` block, no such tier or no such port), which is how UTxO RPC was quoted
   and never billed;
 - Ogmios, Kupo, Blockfrost or UTxO RPC, on tiers 1–3, is not priced by the
-  Console, the `/pricing` table or the landing cards;
-- a minimum fee or usage rate differs between any surfaces that state it, for
-  every port fabric and the Console both name. fabric stores rates to four
-  significant digits, so values within 0.1% are the same.
+  `/pricing` table or the landing cards;
+- a minimum fee or usage rate differs between any surfaces that state it.
+  fabric stores rates to four significant digits, so values within 0.1% are the
+  same.
 
-A Console slug or website2 port name the check cannot place
-(`src/surfaces/ports.ts`) also fails it.
+A port name, plan column or unit the readers cannot place
+(`src/surfaces/ports.ts`, `src/surfaces/website2.ts`) also fails it. A failure
+that production causes is not suppressed: it stays red and alerts.
 
-```sh
-pnpm check pricing
-pnpm check pricing --fabric ../fabric --webui ../webui --website2 ../website2
-```
-
-Pointed at the commits before the rate-card rollout (the parents of
-fabric#272, webui#137 and website2#10), it fails and names the 4.7× Blockfrost
-divergence:
+**fabric does not publish its prices yet.** A live `FetchMetadata` record
+carries only `options` (field 1) and `crd` (field 2); the per-tier `plan` that
+fabric bills from is not serialised. Until fabric serves it, `pricing` fails
+its first step with:
 
 ```
-Blockfrost Flexible per 100k: fabric $0.06 · console $0.28 · website2 landing $0.28
+fabric's live metadata publishes no prices: none of its 12 FetchMetadata records carries a plan, only options and crd
 ```
 
-### `intent` (static, plus live steps with `--env`)
+and still compares website2's table with its landing cards. The reader takes
+the plan from field 3 of each record, a JSON string of the same
+`{"<tier>": {"dns", "cost": {"minimum", "delta"}}}` map fabric keeps per kind.
 
-`intent=signup` is a string shared by two repositories: website2 builds it into
+On the numbers before the rate-card rollout (the parents of fabric#272 and
+website2#10, normalised in `test/fixtures/cards/`), the comparator fails with
+22 divergences, among them the 4.7× Blockfrost one:
+
+```
+Blockfrost Flexible per 100k: fabric $0.06 · website2 landing $0.28
+```
+
+### `intent`
+
+`intent=signup` is a string shared by two deployables: website2 builds it into
 its sign-up CTAs, and the Console's login route turns it into Auth0's
 `screen_hint=signup`. Neither side fails when the other changes.
 
-Static, from website2's `src/content/links.ts` and the Console's
-`src/app/routes/login.tsx`:
+From `https://demeter.run/` and `/pricing`, read as text:
 
-- every `?intent=` value website2 sends is one `login.tsx` recognises;
-- the sign-up CTAs (`signUp`, `startBuilding`, `getStarted`) go to
-  `https://console.demeter.run/login?intent=signup`;
-- the sign-in CTA (`signIn`) goes to `/login` with no intent.
+- every link to `https://console.demeter.run/login` sends no `intent` or
+  `intent=signup`, the one value the Console honours;
+- every sign-up CTA, by its visible text (sign up, start building, get
+  started, start free), goes to `/login?intent=signup`, and there is at least
+  one;
+- every sign-in link (sign in, log in) goes to `/login` with no query.
 
-Live, with `--env production`:
+From the Console:
 
 - `GET /login?intent=signup` redirects to Auth0's `/authorize` with
   `screen_hint=signup`, and `GET /login` without it (the redirect is read, not
@@ -123,12 +135,7 @@ Live, with `--env production`:
   in `src/checks/intent.ts`). This is the login-versus-signup edge case:
   Classic Universal Login drops `screen_hint` silently.
 
-```sh
-pnpm check intent                    # static
-pnpm check intent --env production   # static and live
-```
-
-### `apex` (live only)
+### `apex`
 
 The apex contract from the cutover-apex skill's `cutover.sh verify`, one
 assertion per probe, with the same semantics: one request, no redirect
@@ -147,21 +154,6 @@ followed, 15 s to answer (20 s for the page body).
 | 9 | `/assets/logos/favicon.ico` | 200 |
 | 10 | `https://legacy.demeter.run/faq` | 200 |
 
-```sh
-pnpm check apex --env production
-```
-
-### `endpoint-parity` (static)
-
-website2 promises "Switching plan or port never changes your endpoints". In
-fabric, an endpoint host is rendered from the tier's `plan.<tier>.dns` and an
-`authToken` fixed at creation, so the promise holds exactly when every tier of
-every `bootstrap/rpc/crds/*.json` carries the same `dns`. One step per kind.
-
-```sh
-pnpm check endpoint-parity
-```
-
 ## Results and alerts
 
 Every check and journey writes `results/<name>.json`:
@@ -177,19 +169,19 @@ Every check and journey writes `results/<name>.json`:
 }
 ```
 
-`env` is null for a static run. The run is printed to the terminal and, in
-GitHub Actions, appended to the job summary. With `--alert` and
-`IRM_E2E_WEBHOOK_URL` set, each failed result posts one IRM alert,
-`{alert_uid: "e2e-<name>", title, message, state: "alerting",
+The run is printed to the terminal and, in GitHub Actions, appended to the job
+summary. With `--alert` and `IRM_E2E_WEBHOOK_URL` set, each failed result posts
+one IRM alert, `{alert_uid: "e2e-<name>", title, message, state: "alerting",
 link_to_upstream_details}`, the shape fabric's `send_irm_alert` uses.
 
 Nothing secret goes in a result, a summary or an alert: URLs are reduced to
 origin and path (`src/http.ts`), and the webhook URL is never printed.
 
 The harness for later pieces is `src/env.ts` (environments), `src/report.ts`
-(`Run`, result files, the summary, alerts) and `src/sources.ts` (repository
-sources). Browser journeys go under `journeys/`, run by
-`playwright.config.ts`.
+(`Run`, result files, the summary, alerts), `src/http.ts` (requests that never
+follow a redirect), `src/html.ts` (server-rendered pages as text) and
+`src/surfaces/` (the card, its comparator and each surface's reader). Browser
+journeys go under `journeys/`, run by `playwright.config.ts`.
 
 ## Unit tests
 
@@ -198,58 +190,29 @@ pnpm test
 pnpm typecheck
 ```
 
-The extractors and the comparison are tested against verbatim copies of the
-three repositories' files in `test/fixtures/main/` (sources and commits in
-`test/fixtures/README.md`). A variant is a scratch copy with one edit.
+The readers are tested on responses and pages captured from production, and
+the comparator on the pre-rollout numbers; `test/fixtures/README.md` says
+where each came from. A variant is a copy of a captured page with one edit.
 
 ## Workflows
 
 `.github/workflows/contracts.yml` runs:
 
-- on `pull_request` and on `push` to `main`: `pnpm check all --env production`,
-  no alert;
+- on `pull_request` and on `push` to `main`: install, typecheck, unit tests,
+  then `pnpm check all --env production`, no alert;
 - daily at 05:00 UTC and on `workflow_dispatch`:
   `pnpm check all --env production --alert`. The dispatch takes a boolean
   `force_fail` input that makes the run fail on purpose. Only runs of `main`
   receive the webhook, so a dispatch on another branch logs that its alert was
-  skipped;
-- on `workflow_call`, for the repositories the checks guard (below).
+  skipped.
 
 Any job that signs in as the standing test user sets the concurrency group
 `production-test-user` (`cancel-in-progress: false`), so no two runs use the
 user at once. None does yet.
-
-### Calling the checks from another repository
-
-The reusable workflow `demeter-run/e2e/.github/workflows/contracts.yml@main`,
-called on `workflow_call` with two inputs: `repo` (one of `website2`, `webui`,
-`fabric`), the repository under test, and `checks` (a comma-separated subset
-of `pricing`, `intent`, `endpoint-parity`). It checks out the other two
-repositories at `main`, uses the caller's pull-request head for `repo`, and
-runs `pnpm check <name>` for each. It fails the job on a failed check and
-never alerts IRM. `intent` runs its static half only.
-
-```yaml
-# .github/workflows/contracts.yml in demeter-run/webui
-name: contracts
-on:
-  pull_request:
-jobs:
-  contracts:
-    uses: demeter-run/e2e/.github/workflows/contracts.yml@main
-    with:
-      repo: webui
-      checks: pricing,intent
-    secrets: inherit
-```
-
-`secrets: inherit` passes `E2E_SOURCES_TOKEN`, without which the private
-repositories cannot be cloned.
 
 ### Secrets
 
 | Name | Used by | For |
 | --- | --- | --- |
 | `IRM_E2E_WEBHOOK_URL` | scheduled and dispatched runs of `main` | the IRM integration alerts post to |
-| `E2E_SOURCES_TOKEN` | every run that reads webui or website2 | read access to `demeter-run/webui` and `demeter-run/website2` |
 | `E2E_USER_PASSWORD`, `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET` | the journeys | signing in as the standing test user |

@@ -11,6 +11,8 @@ export interface Environment {
   console: string
   /** The pre-website2 site, moved off the apex at the cutover. */
   legacy: string
+  /** fabric's gRPC-web API. */
+  rpc: string
   /** The Auth0 tenant the Console and the legacy app sign in through. */
   auth0: string
 }
@@ -21,6 +23,7 @@ export const environments = {
     website: 'https://demeter.run',
     console: 'https://console.demeter.run',
     legacy: 'https://legacy.demeter.run',
+    rpc: 'https://rpc.demeter.run',
     auth0: 'https://txpipe.us.auth0.com',
   },
 } satisfies Record<string, Environment>

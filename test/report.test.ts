@@ -29,7 +29,7 @@ describe('results', () => {
   })
 
   it('does not pass a run with no steps', () => {
-    assert.equal(new Run('empty', null).finish().ok, false)
+    assert.equal(new Run('empty', 'production').finish().ok, false)
   })
 
   it('writes results/<name>.json in the agreed shape', async () => {

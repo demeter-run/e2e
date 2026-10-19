@@ -19,8 +19,8 @@ export interface Step {
 
 export interface Result {
   name: string
-  /** The environment a live run targeted; null for a static run. */
-  env: string | null
+  /** The environment the run targeted. */
+  env: string
   started_at: string
   finished_at: string
   ok: boolean
@@ -37,7 +37,7 @@ export class Run {
 
   constructor(
     readonly name: string,
-    readonly env: string | null,
+    readonly env: string,
   ) {}
 
   /**
@@ -83,7 +83,7 @@ export function formatText(results: Result[]): string {
   const lines: string[] = []
   for (const r of results) {
     const passed = r.steps.filter((s) => s.ok).length
-    lines.push(`${r.ok ? 'PASS' : 'FAIL'}  ${r.name}${r.env ? ` (${r.env})` : ''}: ${passed}/${r.steps.length} steps`)
+    lines.push(`${r.ok ? 'PASS' : 'FAIL'}  ${r.name} (${r.env}): ${passed}/${r.steps.length} steps`)
     for (const s of r.steps) {
       const [first = '', ...rest] = s.detail.split('\n')
       lines.push(`  ${s.ok ? 'ok  ' : 'FAIL'}  ${s.name} (${s.ms} ms)${first ? `: ${first}` : ''}`)
@@ -98,7 +98,7 @@ export function formatMarkdown(results: Result[]): string {
   const lines = ['| Check | Result | Steps |', '| --- | --- | --- |']
   for (const r of results) {
     const passed = r.steps.filter((s) => s.ok).length
-    lines.push(`| \`${r.name}\`${r.env ? ` (${r.env})` : ''} | ${r.ok ? '✅ pass' : '❌ fail'} | ${passed}/${r.steps.length} |`)
+    lines.push(`| \`${r.name}\` (${r.env}) | ${r.ok ? '✅ pass' : '❌ fail'} | ${passed}/${r.steps.length} |`)
   }
   for (const r of results) {
     lines.push('', `### \`${r.name}\``, '')
@@ -131,7 +131,7 @@ export function alertPayload(result: Result) {
   const message = failed.map((s) => `${s.name}: ${s.detail}`).join('\n\n')
   return {
     alert_uid: `e2e-${result.name}`,
-    title: `e2e ${result.name} failed${result.env ? ` (${result.env})` : ''}`,
+    title: `e2e ${result.name} failed (${result.env})`,
     message: message.length > 4000 ? `${message.slice(0, 4000)}\n…` : message,
     state: 'alerting',
     link_to_upstream_details: runUrl(),

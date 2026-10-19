@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
 import { describe, it } from 'node:test'
+import { anchors, textTokens } from '../src/html.ts'
 import { formatUsd, parseUsd } from '../src/surfaces/card.ts'
-import { consoleCards, loadConsolePricing, recognisedIntents } from '../src/surfaces/console.ts'
-import { fabricCards, readFabricTiers } from '../src/surfaces/fabric.ts'
-import { landingCards, loadPlanTiers, loadPortPricing, portPricingCards } from '../src/surfaces/website2.ts'
-import { copyFixtures, edit, fixture } from './helpers.ts'
+import { decodeFetchMetadata, fabricCards, fabricTiers } from '../src/surfaces/fabric.ts'
+import { landingCards, pricingCards, readPricingTable } from '../src/surfaces/website2.ts'
+import { edit, fetchMetadataBody, live } from './helpers.ts'
 
 const near = (actual: number | null | undefined, expected: number) =>
   assert.ok(actual !== null && actual !== undefined && Math.abs(actual - expected) < 1e-9, `${actual} ≉ ${expected}`)
+
+const pricingPage = live('pricing.html').toString('utf8')
+const homePage = live('home.html').toString('utf8')
 
 describe('prices as website2 displays them', () => {
   it('reads dollars, cents and thousands separators', () => {
@@ -38,122 +39,123 @@ describe('prices as website2 displays them', () => {
   })
 })
 
-describe('fabric', () => {
-  it('reads every tier of every CRD with its dns and cost', async () => {
-    const tiers = await readFabricTiers(fixture('fabric'))
-    const blockfrost = tiers.filter((t) => t.kind === 'blockfrostport')
-    assert.deepEqual(blockfrost.map((t) => t.tier), ['0', '1', '2', '3'])
-    assert.deepEqual(blockfrost[2]!.cost, { minimum: 50, delta: 0.0000026 })
-    assert.equal(tiers.find((t) => t.kind === 'kupoport')!.dns, 'dmtr.host')
+describe('server-rendered pages as text', () => {
+  it('reads past the NUL bytes in the SSR HTML', () => {
+    assert.ok(pricingPage.includes('\0'), 'the captured page should carry the NULs production serves')
+    assert.ok(textTokens(pricingPage).includes('PORT / METRIC'))
   })
 
-  it('prices per 100k as delta × 100000', async () => {
-    const cards = fabricCards(await readFabricTiers(fixture('fabric')))
-    const card = cards.find((c) => c.port === 'blockfrost' && c.tier === '1')!
-    assert.equal(card.minimum_usd, 0)
-    near(card.per_100k_usd, 0.3)
+  it('drops scripts and comments, and decodes entities', () => {
+    assert.deepEqual(textTokens('<p>a &amp; b<!-- x --></p><script>var s = "<b>no</b>"</script><b> c&#39;d </b>'), ['a & b', "c'd"])
   })
 
-  it('reads a tier with no cost block as billing nothing', async () => {
-    const cards = fabricCards(await readFabricTiers(fixture('fabric')))
-    const trp = cards.filter((c) => c.port === 'trp')
-    assert.equal(trp.length, 4)
-    for (const c of trp) assert.deepEqual([c.minimum_usd, c.per_100k_usd], [null, null])
-    // Ogmios tier 4 is the off-card internal tier (decision 0024): no cost.
-    assert.equal(cards.find((c) => c.port === 'ogmios' && c.tier === '4')!.minimum_usd, null)
-  })
-
-  it('refuses a cost block without a delta', async () => {
-    const dir = await copyFixtures()
-    await edit(join(dir, 'fabric/bootstrap/rpc/crds/kupoport.json'), '"delta": 0.000003', '"rate": 0.000003')
-    await assert.rejects(readFabricTiers(join(dir, 'fabric')), /kupoport\.json: plan\.1\.cost needs numeric minimum and delta/)
+  it('reads every link with its visible text, resolved against the page', () => {
+    assert.deepEqual(anchors('<a class="x" href="/pricing?a=1&amp;b=2"><span>Full</span> list →</a><a>none</a>', 'https://demeter.run/'), [
+      { href: 'https://demeter.run/pricing?a=1&b=2', text: 'Full list →' },
+    ])
   })
 })
 
-describe('the Console', () => {
-  it('reads every port and plan from values.ts', async () => {
-    const cards = consoleCards(await loadConsolePricing(fixture('webui')))
-    assert.deepEqual(
-      [...new Set(cards.map((c) => c.port))].sort(),
-      ['blockfrost', 'dbsync', 'kupo', 'marlowe', 'node', 'ogmios', 'submitapi', 'utxorpc'],
-    )
-    const proI = cards.find((c) => c.port === 'blockfrost' && c.tier === '2')!
-    assert.equal(proI.minimum_usd, 50)
-    near(proI.per_100k_usd, 0.26)
+describe('fabric', () => {
+  it('reads the live FetchMetadata response: every kind, and no prices', () => {
+    const records = decodeFetchMetadata(new Uint8Array(live('fetch-metadata.bin')))
+    assert.deepEqual(records.map((r) => r.kind).sort(), [
+      'BaliusWorker',
+      'BlockfrostPort',
+      'CardanoNodePort',
+      'DbSyncPort',
+      'KupoPort',
+      'MarlowePort',
+      'MumakPort',
+      'OgmiosPort',
+      'ScrollsPort',
+      'SubmitApiPort',
+      'TrpPort',
+      'UtxoRpcPort',
+    ])
+    assert.ok(records.every((r) => r.plan === null))
+    assert.throws(() => fabricTiers(records), /^Error: fabric's live metadata publishes no prices: none of its 12 FetchMetadata records carries a plan/)
   })
 
-  it('converts each usage label to metered units', async () => {
-    const cards = consoleCards(await loadConsolePricing(fixture('webui')))
-    // $1.20 per 24 h of open connection, metered by the second.
-    near(cards.find((c) => c.port === 'node' && c.tier === '1')!.per_100k_usd, (1.2 / 86_400) * 100_000)
-    // $0.09 per 1000 submits.
-    near(cards.find((c) => c.port === 'submitapi' && c.tier === '1')!.per_100k_usd, 9)
-    // $0.30 per 100k messages.
-    near(cards.find((c) => c.port === 'ogmios' && c.tier === '1')!.per_100k_usd, 0.3)
+  it('reads a plan served in field 3, per 100k as delta × 100000', () => {
+    const plan = { '0': { dns: 'dmtr.host', cost: { minimum: 0, delta: 0 } }, '1': { dns: 'dmtr.host', cost: { minimum: 0, delta: 0.000003 } } }
+    const records = decodeFetchMetadata(fetchMetadataBody([{ kind: 'KupoPort', extra: { 3: JSON.stringify(plan) } }]))
+    const cards = fabricCards(fabricTiers(records))
+    assert.deepEqual(cards[0], { port: 'kupo', tier: '0', minimum_usd: 0, per_100k_usd: 0 })
+    near(cards[1]!.per_100k_usd, 0.3)
   })
 
-  it('refuses a slug it cannot place and a label it cannot convert', async () => {
-    const pricing = await loadConsolePricing(fixture('webui'))
-    assert.throws(() => consoleCards({ 'cardano-new-port': pricing['cardano-kupo-port']! }), /cardano-new-port/)
-    const dir = await copyFixtures()
-    await edit(join(dir, 'webui/src/app/utils/pricing/values.ts'), "'100k requests'", "'1M requests'", "'cardano-kupo-port'")
-    const edited = await loadConsolePricing(join(dir, 'webui'))
-    assert.throws(() => consoleCards(edited), /cardano-kupo-port FLEXIBLE: cannot convert "1M requests"/)
+  it('reads a tier with no cost as billing nothing', () => {
+    const plan = { '1': { dns: 'demeter.run' }, '2': { dns: 'demeter.run', cost: null } }
+    const records = decodeFetchMetadata(fetchMetadataBody([{ kind: 'UtxoRpcPort', extra: { 3: JSON.stringify(plan) } }]))
+    assert.deepEqual(fabricCards(fabricTiers(records)), [
+      { port: 'utxorpc', tier: '1', minimum_usd: null, per_100k_usd: null },
+      { port: 'utxorpc', tier: '2', minimum_usd: null, per_100k_usd: null },
+    ])
   })
 
-  it('reads the intents login.tsx recognises', async () => {
-    assert.deepEqual(recognisedIntents(await readFile(fixture('webui/src/app/routes/login.tsx'), 'utf8')), ['signup'])
-    assert.deepEqual(recognisedIntents(`if (intent === 'signup' || 'login' == intent) {}`), ['login', 'signup'])
-    assert.deepEqual(recognisedIntents(`switch (intent) {\n case 'a': break\n case B: break\n}\nconst B = 'b'`), ['a', 'b'])
-    assert.deepEqual(recognisedIntents('const x = 1'), [])
+  it('refuses a cost without a delta, and a failed call', () => {
+    const plan = { '1': { dns: 'dmtr.host', cost: { minimum: 0, rate: 0.000003 } } }
+    const records = decodeFetchMetadata(fetchMetadataBody([{ kind: 'KupoPort', extra: { 3: JSON.stringify(plan) } }]))
+    assert.throws(() => fabricTiers(records), /KupoPort: plan\.1\.cost needs numeric minimum and delta/)
+    assert.throws(() => decodeFetchMetadata(fetchMetadataBody([], 'grpc-status:14\r\ngrpc-message:unavailable\r\n')), /grpc-status 14 unavailable/)
   })
 })
 
 describe('website2', () => {
-  it('reads the /pricing table per column', async () => {
-    const cards = portPricingCards(await loadPortPricing(fixture('website2')))
-    assert.deepEqual([...new Set(cards.map((c) => c.port))], ['ogmios', 'kupo', 'blockfrost', 'utxorpc'])
+  it('reads the live /pricing table per column', () => {
+    const table = readPricingTable(pricingPage)
+    assert.deepEqual(table.columns, ['Flexible', 'Pro I', 'Pro II'])
+    assert.deepEqual(table.ports.map((p) => p.name), ['Ogmios', 'Kupo', 'Blockfrost', 'UTxO RPC'])
+    const cards = pricingCards(table)
     const proII = cards.find((c) => c.port === 'utxorpc' && c.tier === '3')!
     assert.equal(proII.minimum_usd, 150)
     near(proII.per_100k_usd, 0.23)
+    near(cards.find((c) => c.port === 'ogmios' && c.tier === '1')!.per_100k_usd, 0.3)
   })
 
-  it('reads a minimum fee with a thousands separator', async () => {
-    const dir = await copyFixtures()
-    await edit(join(dir, 'website2/src/content/portPricing.ts'), "pro2: '$150'", "pro2: '$1,500'", "name: 'Kupo'")
-    const cards = portPricingCards(await loadPortPricing(join(dir, 'website2')))
+  it('reads a minimum fee with a thousands separator', () => {
+    const page = edit(pricingPage, '>$150<', '>$1,500<', '>Kupo<')
+    const cards = pricingCards(readPricingTable(page))
     assert.equal(cards.find((c) => c.port === 'kupo' && c.tier === '3')!.minimum_usd, 1500)
+    assert.equal(cards.find((c) => c.port === 'ogmios' && c.tier === '3')!.minimum_usd, 150)
   })
 
   it('reads an unpublished cell as no price, and a per-connection row in seconds', () => {
-    const cards = portPricingCards([
-      {
-        name: 'Ogmios',
-        metrics: [
-          { label: 'MINIMUM FEE', flex: '$0', pro1: '—', pro2: '$200' },
-          { label: 'PER 24H OF CONNECTION', flex: '$0.23', pro1: '—', pro2: '$0.17' },
-        ],
-      },
-    ])
+    const cards = pricingCards({
+      columns: ['Flexible', 'Pro I', 'Pro II'],
+      ports: [
+        {
+          name: 'Ogmios',
+          rows: [
+            { label: 'MINIMUM FEE', values: ['$0', '—', '$200'] },
+            { label: 'PER 24H OF CONNECTION', values: ['$0.23', '—', '$0.17'] },
+          ],
+        },
+      ],
+    })
     assert.deepEqual(cards[1], { port: 'ogmios', tier: '2', minimum_usd: null, per_100k_usd: null })
     near(cards[0]!.per_100k_usd, (0.23 / 86_400) * 100_000)
   })
 
-  it('refuses a port it cannot place and a unit it cannot convert', () => {
-    assert.throws(() => portPricingCards([{ name: 'Dolos', metrics: [] }]), /Dolos/)
-    assert.throws(
-      () => portPricingCards([{ name: 'Kupo', metrics: [{ label: 'PER 1M REQUESTS', flex: '$1', pro1: '$1', pro2: '$1' }] }]),
-      /PER 1M REQUESTS/,
-    )
+  it('refuses a port, a column or a unit it cannot place', () => {
+    assert.throws(() => pricingCards(readPricingTable(edit(pricingPage, '>Kupo<', '>Dolos<'))), /website2 prices "Dolos"/)
+    assert.throws(() => pricingCards(readPricingTable(edit(pricingPage, '>Pro II<', '>Scale<'))), /"Scale" column/)
+    assert.throws(() => pricingCards(readPricingTable(edit(pricingPage, 'PER 100K REQUESTS', 'PER 1M REQUESTS', '>Kupo<'))), /PER 1M REQUESTS/)
+    assert.throws(() => readPricingTable('<p>Pricing</p>'), /no "PORT \/ METRIC" table header/)
   })
 
-  it('reads the landing cards as a quote for every listed port', async () => {
-    const cards = landingCards(await loadPlanTiers(fixture('website2')), ['kupo', 'ogmios'])
+  it('reads the live landing cards as a quote for every listed port', () => {
+    const cards = landingCards(homePage, ['kupo', 'ogmios'])
     assert.equal(cards.length, 6)
     const flexible = cards.find((c) => c.port === 'ogmios' && c.tier === '1')!
     assert.equal(flexible.minimum_usd, 0)
     near(flexible.per_100k_usd, 0.3)
     assert.equal(cards.find((c) => c.port === 'kupo' && c.tier === '2')!.minimum_usd, 50)
     assert.equal(cards.find((c) => c.port === 'kupo' && c.tier === '3')!.minimum_usd, 150)
+  })
+
+  it('refuses a landing page without its price cards', () => {
+    assert.throws(() => landingCards('<p>FLEXIBLE</p>', ['kupo']), /0 "FLEXIBLE" price cards/)
   })
 })

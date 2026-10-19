@@ -31,9 +31,7 @@ const at = (base: string, path: string) => (l: URL) => `${l.origin}${l.pathname}
 export const apex: Check = {
   name: 'apex',
   summary: 'demeter.run serves website2 and keeps the legacy endpoints the cutover left on it',
-  mode: 'live',
   async run({ env, run }) {
-    if (!env) throw new Error('apex only runs live: pass --env')
     const site = env.website
     const legacy = env.legacy
 

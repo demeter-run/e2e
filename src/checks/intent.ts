@@ -1,23 +1,22 @@
 import { chromium } from '@playwright/test'
-import { environments } from '../env.ts'
+import { type Anchor, anchors } from '../html.ts'
 import { probe, safeUrl } from '../http.ts'
-import { readLoginRoute, recognisedIntents } from '../surfaces/console.ts'
-import { loadLinks } from '../surfaces/website2.ts'
 import type { Check } from './check.ts'
 
 /**
- * `intent=signup` is a magic string shared by two repositories: website2
- * builds it into its sign-up CTAs, and the Console's login route turns it into
+ * `intent=signup` is a magic string shared by two deployables: website2 builds
+ * it into its sign-up CTAs, and the Console's login route turns it into
  * Auth0's `screen_hint=signup`. Neither side fails when the other changes: an
  * intent the Console does not recognise falls through to the login screen, and
  * Classic Universal Login ignores `screen_hint` without a word
- * (website2-console-auth-ctas, 2026-07-31). This check is what fails instead.
+ * (website2-console-auth-ctas, 2026-07-31). This check is what fails instead,
+ * reading only what is deployed.
  */
 
-/** The links.ts entries that are sign-up CTAs (`links.ts:35-39`). */
-const signupCtas = ['signUp', 'startBuilding', 'getStarted']
-/** The sign-in CTA, which must reach the login screen. */
-const signinCta = 'signIn'
+/** A sign-up CTA, by what a visitor reads on it. */
+const signupText = /\b(sign\s*up|start building|get started|start free)\b/i
+/** A sign-in link, by what a visitor reads on it. */
+const signinText = /\b(sign\s*in|log\s*in)\b/i
 
 /**
  * How Auth0's New Universal Login tells its two screens apart, read from the
@@ -30,67 +29,83 @@ export const auth0Screens = {
   login: { path: '/u/login', title: 'Log in | Demeter.run', heading: 'Welcome to Demeter.run' },
 }
 
-const intentOf = (href: string): string | null => {
-  try {
-    return new URL(href).searchParams.get('intent')
-  } catch {
-    return null
+export interface PageLinks {
+  /** The page's path, for messages. */
+  page: string
+  anchors: Anchor[]
+}
+
+const show = (page: string, a: Anchor) => `${page}: "${a.text}" → ${a.href}`
+
+const atLogin = (href: string, login: string): URL | null => {
+  const url = new URL(href)
+  return `${url.origin}${url.pathname}` === login ? url : null
+}
+
+/**
+ * What website2's pages send to the Console's `/login`. Each list is the
+ * problems found, empty when the rule holds; `signups` and `signins` count the
+ * links each rule looked at.
+ */
+export function loginLinks(pages: PageLinks[], consoleUrl: string) {
+  const login = `${consoleUrl}/login`
+  const intents: string[] = []
+  const signup: string[] = []
+  const signin: string[] = []
+  let signups = 0
+  let signins = 0
+  for (const { page, anchors } of pages) {
+    for (const a of anchors) {
+      const url = atLogin(a.href, login)
+      const intent = url?.searchParams.get('intent') ?? null
+      // The Console recognises signup and nothing else (src/app/routes/login.tsx).
+      if (url && intent !== null && intent !== 'signup') intents.push(`${show(page, a)} sends intent=${intent}, which the Console ignores`)
+      if (signupText.test(a.text)) {
+        signups += 1
+        if (!url || intent !== 'signup') signup.push(`${show(page, a)}, wanted ${login}?intent=signup`)
+      } else if (signinText.test(a.text)) {
+        signins += 1
+        if (!url || url.search !== '') signin.push(`${show(page, a)}, wanted ${login}`)
+      }
+    }
   }
+  if (signups === 0) signup.push(`no sign-up CTA on ${pages.map((p) => p.page).join(' or ')}: the page or this reader changed`)
+  return { intents, signup, signin, signups, signins }
 }
 
 export const intent: Check = {
   name: 'intent',
-  summary: "website2's sign-up CTAs send an intent the Console recognises, and it reaches Auth0's signup screen",
-  mode: 'mixed',
-  async run({ env, sources, run }) {
-    let recognised: string[] | undefined
-    let links: Record<string, string> | undefined
-    const consoleLogin = `${environments.production.console}/login`
+  summary: "website2's sign-up CTAs send an intent the Console honours, and it reaches Auth0's signup screen",
+  async run({ env, run }) {
+    const pages: PageLinks[] = []
+    let links: ReturnType<typeof loginLinks> | undefined
 
-    await run.step("read the Console's recognised intents", async () => {
-      recognised = recognisedIntents(await readLoginRoute(await sources.dir('webui')))
-      if (recognised.length === 0) throw new Error('login.tsx compares intent to no value: its handling moved, update this check')
-      return `${await sources.describe('webui')}: ${recognised.join(', ')}`
-    })
-
-    await run.step("read website2's links", async () => {
-      links = await loadLinks(await sources.dir('website2'))
-      return `${await sources.describe('website2')}: ${Object.keys(links).length} links`
-    })
-
-    await run.step('every intent website2 sends is one the Console recognises', () => {
-      if (!links || !recognised) throw new Error('not checked: a source could not be read')
-      const sent = Object.entries(links).flatMap(([name, href]) => {
-        const value = intentOf(href)
-        return value === null ? [] : [[name, value] as const]
-      })
-      const unknown = sent.filter(([, value]) => !recognised!.includes(value))
-      if (unknown.length) throw new Error(unknown.map(([name, value]) => `${name} sends intent=${value}, which the Console ignores`).join('\n'))
-      return sent.map(([name, value]) => `${name}: intent=${value}`).join(', ') || 'no link sends an intent'
-    })
-
-    await run.step('every sign-up CTA carries intent=signup', () => {
-      if (!links) throw new Error('not checked: links.ts could not be read')
-      const names = new Set([...signupCtas, ...Object.keys(links).filter((n) => /sign.?up/i.test(n))])
-      const problems: string[] = []
-      for (const name of names) {
-        const href = links[name]
-        if (href === undefined) problems.push(`${name}: missing from links.ts`)
-        else if (!href.startsWith(`${consoleLogin}?`) || intentOf(href) !== 'signup') problems.push(`${name}: ${href}, wanted ${consoleLogin}?intent=signup`)
+    await run.step(`read the links on ${env.website}/ and /pricing`, async () => {
+      for (const page of ['/', '/pricing']) {
+        const answer = await probe(`${env.website}${page}`, { timeoutMs: 20_000, readBody: true })
+        if (answer.status !== 200) throw new Error(`${page}: ${answer.status ?? 'no answer within 20 s'}, wanted 200`)
+        pages.push({ page, anchors: anchors(answer.body, `${env.website}${page}`) })
       }
-      if (problems.length) throw new Error(problems.join('\n'))
-      return [...names].join(', ')
+      links = loginLinks(pages, env.console)
+      return pages.map((p) => `${p.page}: ${p.anchors.length} links`).join(', ')
     })
 
-    await run.step('the sign-in CTA carries no intent', () => {
-      if (!links) throw new Error('not checked: links.ts could not be read')
-      const href = links[signinCta]
-      if (href === undefined) throw new Error(`${signinCta}: missing from links.ts`)
-      if (href !== consoleLogin) throw new Error(`${signinCta}: ${href}, wanted ${consoleLogin}`)
-      return `${signinCta}: ${href}`
+    await run.step("every link to the Console's /login sends no intent or intent=signup", () => {
+      if (!links) throw new Error('not checked: the pages could not be read')
+      if (links.intents.length) throw new Error(links.intents.join('\n'))
     })
 
-    if (!env) return
+    await run.step(`every sign-up CTA goes to ${env.console}/login?intent=signup`, () => {
+      if (!links) throw new Error('not checked: the pages could not be read')
+      if (links.signup.length) throw new Error(links.signup.join('\n'))
+      return `${links.signups} CTAs`
+    })
+
+    await run.step(`every sign-in link goes to ${env.console}/login with no intent`, () => {
+      if (!links) throw new Error('not checked: the pages could not be read')
+      if (links.signin.length) throw new Error(links.signin.join('\n'))
+      return links.signins ? `${links.signins} link${links.signins === 1 ? '' : 's'}` : 'no sign-in link on these pages'
+    })
 
     // The Console answers /login with a redirect to Auth0's /authorize. It is
     // read, not followed: the authorize URL is the Console's whole contribution.
