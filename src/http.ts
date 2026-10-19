@@ -1,3 +1,6 @@
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+
 /** What one request answered, without following a redirect. */
 export interface Answer {
   /** The HTTP status, or null when nothing answered (curl's `000`). */
@@ -9,30 +12,42 @@ export interface Answer {
 }
 
 /**
- * One request that never follows a redirect, as `curl -s` without `-L` does:
- * the answer is the first response, and its `Location` is reported, not
- * visited. A timeout or a connection error is an answer with no status, and
- * `error` says which.
+ * One GET that never follows a redirect, as `curl -s` without `-L` does: the
+ * answer is the first response, and its `Location` is reported, not visited.
+ * Like one curl per probe, each request opens its own connection and closes
+ * it: a CI runner had a reused keep-alive connection to the apex reset
+ * (ECONNRESET), which says nothing about the contract under test. A timeout
+ * or a connection error is an answer with no status, and `error` says which.
  */
-export async function probe(url: string, { timeoutMs = 15_000, readBody = false } = {}): Promise<Answer> {
-  try {
-    const response = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) })
-    const location = response.headers.get('location')
-    const body = readBody ? await response.text() : ''
-    if (!readBody) await response.body?.cancel()
-    return {
-      status: response.status,
-      location: location === null ? null : new URL(location, url).toString(),
-      body,
-    }
-  } catch (error) {
-    const cause = (error as { cause?: { code?: string; message?: string } }).cause
-    const why =
-      error instanceof Error && error.name === 'TimeoutError'
-        ? `no answer within ${timeoutMs / 1000} s`
-        : `no answer: ${cause?.code ?? (error as Error).name}${cause?.message ? ` (${cause.message})` : ''}`
-    return { status: null, location: null, body: '', error: why }
-  }
+export function probe(url: string, { timeoutMs = 15_000, readBody = false } = {}): Promise<Answer> {
+  const target = new URL(url)
+  const send = target.protocol === 'http:' ? httpRequest : httpsRequest
+  return new Promise((resolve) => {
+    const nothing = (error: string) => resolve({ status: null, location: null, body: '', error })
+    const request = send(target, { agent: false, headers: { connection: 'close', 'user-agent': 'demeter-run-e2e' } }, (response) => {
+      const chunks: Buffer[] = []
+      response.on('data', (chunk: Buffer) => readBody && chunks.push(chunk))
+      response.on('error', (error: NodeJS.ErrnoException) => nothing(`no answer: ${error.code ?? error.name} (${error.message})`))
+      response.on('end', () => {
+        clearTimeout(timer)
+        const location = response.headers.location
+        resolve({
+          status: response.statusCode ?? null,
+          location: location === undefined ? null : new URL(location, url).toString(),
+          body: Buffer.concat(chunks).toString('utf8'),
+        })
+      })
+    })
+    const timer = setTimeout(() => {
+      request.destroy()
+      nothing(`no answer within ${timeoutMs / 1000} s`)
+    }, timeoutMs)
+    request.on('error', (error: NodeJS.ErrnoException) => {
+      clearTimeout(timer)
+      nothing(`no answer: ${error.code ?? error.name} (${error.message})`)
+    })
+    request.end()
+  })
 }
 
 /**

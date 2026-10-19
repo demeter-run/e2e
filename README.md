@@ -138,8 +138,10 @@ From the Console:
 ### `apex`
 
 The apex contract from the cutover-apex skill's `cutover.sh verify`, one
-assertion per probe, with the same semantics: one request, no redirect
-followed, 15 s to answer (20 s for the page body).
+assertion per probe, with the same semantics: one request on its own
+connection, as one curl per probe, no redirect followed, 15 s to answer (20 s
+for the page body). Every check's page reads go through the same `probe`
+(`src/http.ts`).
 
 | # | Request | Expected |
 | --- | --- | --- |
