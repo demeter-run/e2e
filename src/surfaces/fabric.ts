@@ -1,3 +1,4 @@
+import { connect } from 'node:http2'
 import type { Card } from './card.ts'
 import { fabricKinds } from './ports.ts'
 
@@ -40,19 +41,55 @@ export interface FabricTier {
 }
 
 export async function fetchMetadata(rpc: string): Promise<MetadataRecord[]> {
-  const response = await fetch(`${rpc}${fetchMetadataPath}`, {
-    method: 'POST',
+  const response = await postHttp2(`${rpc}${fetchMetadataPath}`, {
     headers: { 'content-type': 'application/grpc-web+proto', 'x-grpc-web': '1' },
     // One uncompressed frame holding the empty FetchMetadataRequest.
     body: new Uint8Array(5),
-    signal: AbortSignal.timeout(15_000),
+    timeoutMs: 15_000,
   })
-  if (!response.ok) throw new Error(`FetchMetadata answered HTTP ${response.status}`)
-  const headerStatus = response.headers.get('grpc-status')
-  if (headerStatus !== null && headerStatus !== '0') {
-    throw new Error(`FetchMetadata failed: grpc-status ${headerStatus} ${response.headers.get('grpc-message') ?? ''}`.trim())
+  if (response.status !== 200) throw new Error(`FetchMetadata answered HTTP ${response.status}`)
+  const headerStatus = response.headers['grpc-status']
+  if (headerStatus !== undefined && headerStatus !== '0') {
+    throw new Error(`FetchMetadata failed: grpc-status ${headerStatus} ${response.headers['grpc-message'] ?? ''}`.trim())
   }
-  return decodeFetchMetadata(new Uint8Array(await response.arrayBuffer()))
+  return decodeFetchMetadata(response.body)
+}
+
+/**
+ * One POST over HTTP/2. fabric's API refuses HTTP/1.1 at the TLS handshake
+ * (it offers only `h2`), and Node 22's `fetch` speaks HTTP/1.1 only.
+ */
+function postHttp2(
+  url: string,
+  { headers, body, timeoutMs }: { headers: Record<string, string>; body: Uint8Array; timeoutMs: number },
+): Promise<{ status: number; headers: Record<string, string>; body: Uint8Array }> {
+  const { origin, pathname } = new URL(url)
+  return new Promise((resolve, reject) => {
+    const session = connect(origin)
+    const timer = setTimeout(() => fail(new Error(`no answer within ${timeoutMs / 1000} s`)), timeoutMs)
+    function fail(error: Error & { code?: string }) {
+      clearTimeout(timer)
+      session.destroy()
+      reject(new Error(`FetchMetadata: ${error.code ? `${error.code}: ` : ''}${error.message}`))
+    }
+    session.on('error', fail)
+    const request = session.request({ ':method': 'POST', ':path': pathname, ...headers })
+    request.on('error', fail)
+    let status = 0
+    const answered: Record<string, string> = {}
+    request.on('response', (h) => {
+      status = Number(h[':status'])
+      for (const [name, value] of Object.entries(h)) if (typeof value === 'string') answered[name] = value
+    })
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
+    request.on('end', () => {
+      clearTimeout(timer)
+      session.close()
+      resolve({ status, headers: answered, body: new Uint8Array(Buffer.concat(chunks)) })
+    })
+    request.end(body)
+  })
 }
 
 /** A gRPC-web response body: its message frames, then the trailer frame. */
