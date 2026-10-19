@@ -22,8 +22,8 @@ name: contracts
 #       group: production-test-user
 #       cancel-in-progress: false
 #
-# so no two runs use the user at once. No job here signs in; the J2 journey
-# and the agent probe are the first that will.
+# so no two runs use the user at once. No job here signs in; ports.yml's
+# does, and the J2 journey and the agent probe will.
 
 on:
   pull_request:
