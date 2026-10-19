@@ -4,14 +4,16 @@ name: contracts
 # They read no product repository, and gate no other repository's pull
 # requests. Report-only: nothing here is a required status.
 #
-# - On pull requests and pushes to main: every check against production, no
-#   alert.
+# - On pull requests and pushes to main: install, typecheck and unit tests in
+#   one job, then every check against production in a second, no alert. The
+#   checks fail on every run while fabric publishes no prices, so a broken
+#   unit test gets a job of its own rather than hide behind that failure.
 # - Daily at 05:00 UTC and on dispatch: the same, alerting IRM on a failure.
 #   Only runs of main hold the webhook, so a dispatch on a branch logs that
 #   its alert was skipped.
-# - When such a run fails before the checks start (checkout, install,
-#   typecheck, unit tests, Chromium), one `e2e-setup` alert says so: nothing
-#   was checked that day, and no check alert would fire.
+# - When such a run fails before the checks start (in the unit job, or the
+#   checks job's own checkout, install or Chromium), one `e2e-setup` alert
+#   says so: nothing was checked that day, and no check alert would fire.
 #
 # Convention for jobs that sign in as the standing test user (e2e@txpipe.io):
 # they set
@@ -40,9 +42,12 @@ permissions:
   contents: read
 
 jobs:
-  checks:
+  unit:
+    name: Typecheck and unit tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
+    outputs:
+      failed: ${{ steps.failed.outputs.step }}
     steps:
       - id: checkout
         uses: actions/checkout@v4
@@ -66,6 +71,43 @@ jobs:
         name: Unit tests
         run: pnpm test
 
+      # For the setup alert below: the first step that failed, by name.
+      - id: failed
+        name: Name the failed step
+        if: failure()
+        env:
+          OUTCOMES: |-
+            checkout ${{ steps.checkout.outcome }}
+            pnpm setup ${{ steps.pnpm.outcome }}
+            Node setup ${{ steps.node.outcome }}
+            install ${{ steps.install.outcome }}
+            typecheck ${{ steps.typecheck.outcome }}
+            unit tests ${{ steps.unit.outcome }}
+        run: awk '$NF == "failure" { sub(/ [^ ]+$/, ""); print "step=" $0; exit }' <<<"$OUTCOMES" >> "$GITHUB_OUTPUT"
+
+  checks:
+    name: Checks against production
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      failed: ${{ steps.failed.outputs.step }}
+    steps:
+      - id: checkout
+        uses: actions/checkout@v4
+
+      - id: pnpm
+        uses: pnpm/action-setup@v4
+
+      - id: node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - id: install
+        run: pnpm install --frozen-lockfile
+
       - id: chromium
         name: Install Chromium
         run: pnpm exec playwright install --with-deps --only-shell chromium
@@ -82,32 +124,51 @@ jobs:
           if [[ "$FORCE_FAIL" == true ]]; then args+=(--force-fail); fi
           pnpm check "${args[@]}"
 
-      # A failure before the checks skips them, so no check posts an alert.
-      # This posts one, in the shape src/report.ts sends, with curl and jq
-      # because the failed step may be the one that installs Node. The webhook
-      # URL goes to curl on stdin, never on a command line or in the log.
-      - name: Alert when setup failed
-        if: >-
-          failure() && steps.checks.outcome == 'skipped'
-          && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      # Only when the checks never started: a failed check has posted its own
+      # alert, so it names nothing here.
+      - id: failed
+        name: Name the failed setup step
+        if: failure() && steps.checks.outcome == 'skipped'
         env:
-          IRM_E2E_WEBHOOK_URL: ${{ github.ref == 'refs/heads/main' && secrets.IRM_E2E_WEBHOOK_URL || '' }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           OUTCOMES: |-
             checkout ${{ steps.checkout.outcome }}
             pnpm setup ${{ steps.pnpm.outcome }}
             Node setup ${{ steps.node.outcome }}
             install ${{ steps.install.outcome }}
-            typecheck ${{ steps.typecheck.outcome }}
-            unit tests ${{ steps.unit.outcome }}
             Chromium install ${{ steps.chromium.outcome }}
+        run: awk '$NF == "failure" { sub(/ [^ ]+$/, ""); print "step=" $0; exit }' <<<"$OUTCOMES" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: contracts-results
+          path: results/
+          if-no-files-found: ignore
+
+  # A failure before the checks skips them, so no check posts an alert. This
+  # posts one, in the shape src/report.ts sends, with curl and jq: it needs no
+  # checkout or Node, which may be what failed. The webhook URL goes to curl
+  # on stdin, never on a command line or in the log.
+  setup-alert:
+    name: Alert when setup failed
+    needs: [unit, checks]
+    if: >-
+      failure()
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && (needs.unit.result == 'failure' || needs.checks.outputs.failed != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          IRM_E2E_WEBHOOK_URL: ${{ github.ref == 'refs/heads/main' && secrets.IRM_E2E_WEBHOOK_URL || '' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FAILED: ${{ needs.unit.outputs.failed || needs.checks.outputs.failed }}
         run: |
-          failed=$(awk '$NF == "failure" { sub(/ [^ ]+$/, ""); print; exit }' <<<"$OUTCOMES")
           if [[ -z "$IRM_E2E_WEBHOOK_URL" ]]; then
             echo "alert skipped for setup: IRM_E2E_WEBHOOK_URL is not set"
             exit 0
           fi
-          jq -n --arg step "${failed:-a setup step}" --arg link "$RUN_URL" '{
+          jq -n --arg step "${FAILED:-a setup step}" --arg link "$RUN_URL" '{
             alert_uid: "e2e-setup",
             title: "e2e setup failed (production)",
             message: "\($step) failed before the checks started, so pricing, intent and apex were not checked.",
@@ -120,10 +181,3 @@ jobs:
           else
             echo "alert failed for setup: curl exited $?"
           fi
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: contracts-results
-          path: results/
-          if-no-files-found: ignore
