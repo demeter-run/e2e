@@ -225,18 +225,31 @@ export async function dailyRequests(page: Page, env: Environment, namespace: str
   return value
 }
 
+/** A port's row in the billing page's "Project Usage" card, from fabric's usage report. */
+export interface BillingRow {
+  /** Product, id, tier, usage and cost, as the card shows them. */
+  cells: string[]
+  /** The "Usage" cell: the units fabric has counted for the port this billing period. */
+  units: number
+}
+
 /**
  * The port's row in the billing page's "Project Usage" card
- * (`components/billing/ProjectUsage/ProjectUsage.tsx`): product, id, tier,
- * units and cost, or null while fabric has not reported it.
+ * (`components/billing/ProjectUsage/ProjectUsage.tsx`), or null while fabric
+ * has not reported it.
  */
-export async function billingRow(page: Page, env: Environment, namespace: string, port: ConsolePort): Promise<string[] | null> {
+export async function billingRow(page: Page, env: Environment, namespace: string, port: ConsolePort): Promise<BillingRow | null> {
   await page.goto(`${env.console}/${namespace}/billing`, { waitUntil: 'load', timeout: 60_000 })
   await visible(page, page.getByText('Project Usage', { exact: true }), '"Project Usage" card on the billing page')
   // The card's rows are six-column grids: product, id, tiers, usage and cost.
   const row = page.locator('div.grid-cols-6').filter({ has: page.getByText(port.name, { exact: true }) })
   if ((await row.count()) === 0) return null
-  return (await row.first().innerText()).split('\n').map((c) => c.trim()).filter(Boolean)
+  const cells = (await row.first().innerText()).split('\n').map((c) => c.trim()).filter(Boolean)
+  const units = Number(cells[3]?.replaceAll(',', ''))
+  if (cells.length !== 5 || !Number.isFinite(units)) {
+    throw new Failure(`the "Project Usage" row for ${port.name} reads "${cells.join(' · ')}", not product, id, tier, usage and cost`)
+  }
+  return { cells, units }
 }
 
 /** The visible text of each cell of the port's pricing grid, in order. */

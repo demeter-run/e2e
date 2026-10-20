@@ -4,6 +4,7 @@ import { safeUrl } from '../src/http.ts'
 import { signIn, type TestUser, testUser } from '../src/journeys/auth0.ts'
 import {
   billingRow,
+  type BillingRow,
   type ConsolePort,
   cookiesNamed,
   dailyRequests,
@@ -207,7 +208,9 @@ test('j2', async ({ browser }) => {
   })
 
   // 8. After the stopwatch: usage within minutes (Prometheus), cost within the
-  // hour (fabric's daemon reads Prometheus every 3600 s).
+  // hour (fabric's daemon reads Prometheus every 3600 s). Fabric lists the port
+  // before its daemon has counted the request (0 units 4 minutes after it, run
+  // 39411503584), so the cost waits for the count.
   await step('usage, then cost: the Console shows the request', async () => {
     if (!port || !namespace || j2.elapsedSeconds === undefined) throw new NotRun('no successful request')
     const [n, at] = [namespace, port]
@@ -216,11 +219,15 @@ test('j2', async ({ browser }) => {
       return count >= 1 ? `${count} daily requests` : null
     })
     if (!usage.value) throw new Failure(`the usage view showed no request within 5 minutes`)
+    let last = null as BillingRow | null
     const cost = await poll(75 * 60_000, 60_000, async () => {
-      const row = await billingRow(p, env, n, at)
-      return row ? row.join(' · ') : null
+      last = await billingRow(p, env, n, at)
+      return last && last.units >= 1 ? last.cells.join(' · ') : null
     })
-    if (!cost.value) throw new Failure(`usage: ${usage.value} after ${usage.seconds} s; cost: "Project Usage" did not list ${at.name} within 75 minutes`)
+    if (!cost.value) {
+      const seen = last ? `listed ${at.name} at ${last.units} units (${last.cells.join(' · ')})` : `did not list ${at.name}`
+      throw new Failure(`usage: ${usage.value} after ${usage.seconds} s; cost: "Project Usage" ${seen} after 75 minutes, wanted the request counted`)
+    }
     return `usage: ${usage.value} after ${usage.seconds} s; cost: "Project Usage" lists ${cost.value} after ${Math.round(cost.seconds / 60)} min`
   })
 
