@@ -57,11 +57,15 @@ const portType = 'cardano-preprod'
 /** A request a developer's first call could be, as `GET <endpoint>/epochs/latest`. */
 const firstCall = '/epochs/latest'
 
-/** The browser the journey and the edge cases share, signed in once J2 has signed in (`signedIn`). */
+/**
+ * What the edge cases share with J2: its browser, signed in once J2 has
+ * signed in (`signedIn`), and its port. J2's project stays J2's own: the
+ * legacy-cookie case needs only the session, which a later step that fails
+ * leaves signed in.
+ */
 let context: BrowserContext | undefined
 let page: Page | undefined
 let signedIn = false
-let namespace: string | undefined
 let port: ConsolePort | undefined
 
 const j2 = new Run('j2', env.name)
@@ -118,6 +122,7 @@ test('j2', async ({ browser }) => {
   j2Ran = true
   const step = stepsOf(j2)
   let landed: number | undefined
+  let namespace: string | undefined
 
   // 1. Before the stopwatch: the user owns nothing, so the Console's
   // first-project path runs, and Auth0 holds no session for the person's browser.

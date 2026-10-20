@@ -24,7 +24,10 @@ requests or alerts from a scheduled run, but nothing here is a required status.
 ## Setup
 
 Node 22 (`.nvmrc`) and pnpm (the version in `package.json`'s
-`packageManager`; `corepack enable` provides it). The checks need no
+`packageManager`; `corepack enable` provides it). `pnpm test` also runs the
+J2 workflow's scripts as the runner does, so it needs `bash`, `curl` and
+`jq` on `PATH`; without `curl` or `jq`, the alert script's test fails
+naming the missing tool. The checks need no
 credentials: every surface they read is public. The journeys sign in as the
 standing test user, `e2e@txpipe.io` (decision 0047), whose password is
 `E2E_USER_PASSWORD`. The port suite signs in too (see
@@ -461,21 +464,25 @@ without failing, so no alert would say that day went unchecked.
   is how a branch walks J2 before it merges. The sign-in proof (`pnpm journey
   sign-in`) runs first, and J2 only when the test user could sign in. A pull
   request from a fork runs neither. A newer push to the pull request cancels
-  its older run, waiting or walking, so superseded pushes do not queue for
-  the test user; the next run's clean slate deletes what a cancelled one
+  its older run, waiting or walking (J2's job is gated on `!cancelled()`,
+  not `always()`, which would walk on), so superseded pushes do not queue
+  for the test user; the next run's clean slate deletes what a cancelled one
   left;
 - when one of the alerting runs reports nothing, one IRM alert says so, as no
   result would: `e2e-j2-cancelled` when the job was cancelled (its timeout
   ran out, another job of the group took its place, or someone cancelled
-  it), and `e2e-j2-setup` when it failed with no result. The message says
-  whether J2 was walked: not when a set-up step failed (it names the step)
-  or `pnpm j2` exited 2 on a usage error such as a missing
-  `E2E_USER_PASSWORD`; maybe partway when it exited 3 on a break outside the
-  journey, or the job failed with no step to name (a lost runner). Those,
-  and a cancelled job, may leave a project on the test user's account until
-  the next run, and say so. `pnpm journey` exits 0 or 1 only once it has
-  reported the run. A unit test runs the workflow's three scripts: J2's
-  step, the one naming the set-up step that failed, and the alert.
+  it), and `e2e-j2-setup` when it failed with no result or was skipped. The
+  message says whether J2 was walked: not when a set-up step failed (it
+  names the step), `pnpm j2` exited 2 on a usage error such as a missing
+  `E2E_USER_PASSWORD`, or the job was skipped (the run was cancelled before
+  J2 started); maybe partway when it exited 3 on a break outside the
+  journey; maybe not at all, or partway, when the job failed with no step to
+  name (GitHub could not set it up, or its runner was lost). Those that may
+  have cut a walk short, and a cancelled job, may leave a project on the
+  test user's account until the next run, and say so. `pnpm journey` exits
+  0 or 1 only once it has reported the run. A unit test runs the workflow's
+  three scripts: J2's step, the one naming the set-up step that failed, and
+  the alert; another holds the jobs' and that step's `if:` gates as written.
 
 The job's timeout is 150 minutes: J2's test has 100, mostly the 75-minute wait
 on the cost, and when it times out the clean-up, the edge cases in a new

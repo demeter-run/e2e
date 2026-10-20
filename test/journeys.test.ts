@@ -140,6 +140,16 @@ describe('pnpm journey', () => {
     assert.match(written, /\*\*Elapsed:\*\* 7\.6 s/)
   })
 
+  // results/ is not in the repository, and nothing makes it before a fresh runner's first run.
+  it('starts Playwright when the results directory does not exist yet', async () => {
+    const fresh = join(dir, 'fresh')
+    const pw = playwright([])
+    const code = await withEnv({ E2E_USER_PASSWORD: 'stand-in' }, () => main(['walk', '--env', 'production', '--results', fresh], { all: [journey], playwright: pw.run }))
+    assert.deepEqual(pw.calls.map((c) => c.env.E2E_RESULTS), [fresh])
+    // The stand-in wrote no result, so both fail as missing.
+    assert.equal(code, 1)
+  })
+
   it('adds a failing result with --force-fail, and posts nothing without the webhook', async () => {
     const pw = playwright([result('walk', true), result('walk-edge', true)])
     assert.equal(await cli(['walk', '--env', 'production', '--force-fail', '--alert'], pw.run), 1)
@@ -241,11 +251,55 @@ describe('the j2 workflow', () => {
     assert.equal(top[2], "${{ github.event_name == 'pull_request' }}")
   })
 
+  /** The `if:` among `lines` at `indent`, written inline or folded (`>-`), as GitHub reads it. */
+  const condition = (lines: string[], indent: number): string | undefined => {
+    const at = lines.findIndex((l) => l.startsWith(`${' '.repeat(indent)}if:`))
+    if (at < 0) return undefined
+    const inline = lines[at]!.slice(indent + 'if:'.length).trim()
+    if (inline !== '>-') return inline
+    const folded: string[] = []
+    for (const line of lines.slice(at + 1)) {
+      if (line.trim() && line.search(/\S/) <= indent) break
+      folded.push(line.trim())
+    }
+    return folded.join(' ').trim()
+  }
+
+  /** The `if:` of j2.yml's job `name`. */
+  const jobIf = (name: string): string | undefined => {
+    const lines = workflow.split('\n')
+    const at = lines.indexOf(`  ${name}:`)
+    assert.ok(at >= 0, `j2.yml has a job ${name}`)
+    const end = lines.findIndex((l, i) => i > at && l.trim() !== '' && l.search(/\S/) <= 2)
+    return condition(lines.slice(at + 1, end < 0 ? undefined : end), 4)
+  }
+
+  // GitHub runs a job or step whose `if:` calls no status function only when
+  // everything before it succeeded, and re-evaluates a running job's `if:`
+  // when its run is cancelled: `always()` keeps the job running, and
+  // `!cancelled()` lets it stop. These gates decide which runs walk J2 and
+  // which alert, so each is held as written.
+  it('lets a newer push stop J2, waiting or walking, and walks it on a schedule or dispatch, where the sign-in proof is skipped', () => {
+    assert.equal(
+      jobIf('j2'),
+      "!cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.sign-in.result == 'success' || needs.sign-in.result == 'skipped')",
+    )
+    assert.equal(jobIf('sign-in'), "github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository")
+  })
+
+  it('alerts on a scheduled or dispatched J2 that did not succeed, a cancelled or skipped one too', () => {
+    assert.equal(jobIf('setup-alert'), "always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.j2.result != 'success'")
+  })
+
+  it('names the failed set-up step only once a step has failed', () => {
+    assert.equal(stepOf('failed').if, 'failure()')
+  })
+
   /**
    * The step of j2.yml with `id`: its `run` script, its `env` as written by
-   * name, and the ids of the steps of its job that come before it.
+   * name, its `if:`, and the ids of the steps of its job that come before it.
    */
-  const stepOf = (id: string): { run: string; env: Record<string, string>; before: string[] } => {
+  const stepOf = (id: string): { run: string; env: Record<string, string>; if?: string; before: string[] } => {
     const lines = workflow.split('\n')
     const at = lines.findIndex((l) => l.trim() === `- id: ${id}`)
     assert.ok(at >= 0, `j2.yml has a step with id ${id}`)
@@ -273,7 +327,7 @@ describe('the j2 workflow', () => {
         .filter((l) => l.search(/\S/) === indent + 2)
         .map((l) => [l.trim().split(':')[0]!, l.trim().slice(l.trim().indexOf(':') + 1).trim()]),
     )
-    return { run, env, before }
+    return { run, env, if: condition(body, indent), before }
   }
 
   /**
@@ -330,6 +384,9 @@ describe('the j2 workflow', () => {
   })
 
   it('alerts when J2 reported nothing, saying whether it walked and what it may have left', async () => {
+    // The script posts with curl and builds the alert with jq, as the runner has them (README, Setup).
+    const absent = ['curl', 'jq'].filter((tool) => spawnSync(tool, ['--version']).error)
+    assert.deepEqual(absent, [], `the alert script needs ${absent.join(' and ')} on PATH (README, Setup)`)
     const { run, env } = stepOf('alert')
     assert.deepEqual(Object.keys(env).sort(), ['FAILED', 'IRM_E2E_WEBHOOK_URL', 'RESULT', 'RUN_URL', 'STATUS'])
     assert.deepEqual([env.RESULT, env.STATUS, env.FAILED], ['${{ needs.j2.result }}', '${{ needs.j2.outputs.status }}', '${{ needs.j2.outputs.failed }}'])
@@ -358,11 +415,13 @@ describe('the j2 workflow', () => {
         assert.match(reported.stdout, new RegExp(`^J2 reported its results \\(exit ${status}\\)`))
       }
       const cases: [Record<string, string>, string, RegExp][] = [
-        [{ RESULT: 'cancelled' }, 'e2e-j2-cancelled', /^J2 was cancelled before it reported: /],
+        [{ RESULT: 'cancelled' }, 'e2e-j2-cancelled', /^J2 was cancelled before it reported: its timeout ran out, /],
+        [{ RESULT: 'skipped' }, 'e2e-j2-setup', /^J2's job was skipped, as it is when the run is cancelled before J2 starts, so J2 was not walked\.$/],
         [{ FAILED: 'the install failed' }, 'e2e-j2-setup', /^the install failed, so J2 was not walked\.$/],
         [{ STATUS: '2' }, 'e2e-j2-setup', /^J2 exited 2 on a usage error .+, so it was not walked\.$/],
         [{ STATUS: '3' }, 'e2e-j2-setup', /^J2 exited 3 with no result: it broke outside the journey, maybe partway through its walk or after it, so none of its results alerted/],
-        [{}, 'e2e-j2-setup', /^J2's job failed with no step to name .+: J2 may have stopped partway through its walk\./],
+        // GitHub could not set the job up, so no step ran, or its runner was lost.
+        [{}, 'e2e-j2-setup', /^J2's job failed with no result and no set-up step to name: .+ J2 may not have started, or may have stopped partway through its walk\./],
       ]
       for (const [vars, uid, message] of cases) {
         const [sent, ...more] = (await alert(vars)).posted
@@ -682,6 +741,24 @@ describe('browser steps', () => {
         assert.deepEqual(shots.map((s) => s.path), named)
         assert.deepEqual(run.finish().steps.map((s) => s.detail), named.map((path) => `wrong\nscreenshot: ${path}`))
         assert.deepEqual((await readdir(tmp)).sort(), ['walk-01-2.png', 'walk-01.png', 'walk-clean-up-worker-0-01-2.png', 'walk-clean-up-worker-0-01.png'])
+      })
+    } finally {
+      await rm(tmp, { recursive: true, force: true })
+    }
+  })
+
+  // On a fresh runner nothing has made the results directory before the first step that fails.
+  it('make the results directory for the first screenshot', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'e2e-steps-'))
+    try {
+      const fresh = join(tmp, 'results')
+      await withEnv({ E2E_RESULTS: fresh }, async () => {
+        const run = new Run('walk', 'production')
+        await browserSteps(run, () => stand().page, () => [])('first', () => {
+          throw new Failure('wrong')
+        })
+        assert.equal(run.finish().steps[0]!.detail, `wrong\nscreenshot: ${join(fresh, 'walk-01.png')}`)
+        assert.deepEqual(await readdir(fresh), ['walk-01.png'])
       })
     } finally {
       await rm(tmp, { recursive: true, force: true })

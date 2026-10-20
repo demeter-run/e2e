@@ -18,12 +18,15 @@ name: j2
 # - When an alerting run reports nothing, one alert says so, as no journey
 #   alert would fire: `e2e-j2-cancelled` when the job was cancelled (its
 #   timeout ran out, another job of the group took its place, or someone
-#   cancelled it), and `e2e-j2-setup` when it failed with no result. Its
-#   message says whether J2 was walked: not when a set-up step failed or J2
-#   refused its arguments (exit 2, a missing password, say); maybe partway
-#   when J2 broke outside the journey (exit 3) or the job failed with no step
-#   to name (a lost runner). A walk cut short may leave a project on the test
-#   user's account until the next run, and the message says so.
+#   cancelled it), and `e2e-j2-setup` when it failed with no result or was
+#   skipped. Its message says whether J2 was walked: not when a set-up step
+#   failed, J2 refused its arguments (exit 2, a missing password, say) or its
+#   job was skipped (the run was cancelled before J2 started); maybe partway
+#   when J2 broke outside the journey (exit 3); maybe not at all, or partway,
+#   when the job failed with no step to name (GitHub could not set it up, or
+#   its runner was lost). A walk that may have been cut short may leave a
+#   project on the test user's account until the next run, and the message
+#   says so.
 #
 # Every job that signs in sets the concurrency group production-test-user, so
 # no two runs use the user at once: J2 deletes every project the user owns
@@ -67,9 +70,9 @@ permissions:
   contents: read
 
 # One run per pull request: a newer push cancels the older run, waiting or
-# walking, and the next run's clean slate deletes what it left. Every other run
-# is a group of its own, so a scheduled or dispatched run is never cancelled
-# here.
+# walking (J2's `if:` below lets it), and the next run's clean slate deletes
+# what it left. Every other run is a group of its own, so a scheduled or
+# dispatched run is never cancelled here.
 concurrency:
   group: j2-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -116,9 +119,12 @@ jobs:
     name: J2 against production
     needs: sign-in
     # The sign-in proof gates J2 on pull requests; elsewhere it is skipped. A
-    # pull request from a fork runs neither.
+    # pull request from a fork runs neither. `!cancelled()` lets J2 run after
+    # the skipped proof, as `always()` would, but GitHub re-evaluates a
+    # running job's `if:` when its run is cancelled, and `always()` would walk
+    # on: this lets a newer push stop it.
     if: >-
-      always()
+      !cancelled()
       && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
       && (needs.sign-in.result == 'success' || needs.sign-in.result == 'skipped')
     runs-on: ubuntu-latest
@@ -199,10 +205,11 @@ jobs:
   # J2 that reported nothing posts no alert of its own. This posts one, in the
   # shape src/report.ts sends, with curl and jq: it needs no checkout or Node,
   # which may be what failed. The webhook URL goes to curl on stdin, never on a
-  # command line or in the log. `always()`, so a cancelled J2 alerts too. The
-  # script decides from J2's exit status, when it has one, and from the set-up
-  # step that failed, when one did; with neither (a lost runner, a timeout) it
-  # says J2 may have stopped partway.
+  # command line or in the log. `always()`, so a cancelled or skipped J2
+  # alerts too. The script decides from J2's result, from its exit status
+  # when it has one, and from the set-up step that failed when one did; with
+  # none of them (GitHub could not set the job up, or its runner was lost) it
+  # says J2 may not have started, or may have stopped partway.
   setup-alert:
     name: Alert when J2 reported nothing
     needs: j2
@@ -232,6 +239,8 @@ jobs:
             uid=j2-cancelled
             title="e2e j2 cancelled (production)"
             message="J2 was cancelled before it reported: its timeout ran out, another job of production-test-user took its place, or someone cancelled it. $left"
+          elif [[ "$RESULT" == skipped ]]; then
+            message="J2's job was skipped, as it is when the run is cancelled before J2 starts, so J2 was not walked."
           elif [[ -n "$FAILED" ]]; then
             message="$FAILED, so J2 was not walked."
           elif [[ "$STATUS" == 2 ]]; then
@@ -239,7 +248,7 @@ jobs:
           elif [[ -n "$STATUS" ]]; then
             message="J2 exited $STATUS with no result: it broke outside the journey, maybe partway through its walk or after it, so none of its results alerted; any it wrote are in the run's artifacts. $left"
           else
-            message="J2's job failed with no step to name (a lost runner, or its timeout) and no result: J2 may have stopped partway through its walk. $left"
+            message="J2's job failed with no result and no set-up step to name: GitHub could not set the job up (an action that would not download, say), or its runner was lost. J2 may not have started, or may have stopped partway through its walk. $left"
           fi
           if [[ -z "$IRM_E2E_WEBHOOK_URL" ]]; then
             echo "alert skipped for $uid: IRM_E2E_WEBHOOK_URL is not set"
