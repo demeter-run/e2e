@@ -235,22 +235,36 @@ Playwright, then prints its results, appends the job summary and alerts as
 the checks do. A journey's results are its verdict: each test records its
 steps and does not throw, because Playwright replaces its worker, and the
 signed-in browser the tests share, after any failed test. The spec fails the
-Playwright run once, last, naming the results that failed.
+Playwright run once, last, naming the results that failed. A test Playwright
+ends anyway, by its timeout or an error outside a step, fails its result: the
+step it was in reads "did not finish", and a step says how the test ended.
+Every action has a 30-second limit and every navigation a 60-second one
+(`playwright.config.ts`), so a click that cannot happen fails its step rather
+than hold it until the test's timeout.
 
 **What it costs and leaves behind.** J2 deletes every project the test user
 owns before it starts and after it ends, pass or fail, so it must not overlap
-another run signed in as the user (the concurrency group below, and fabric's
-daily e2e, which runs as the same user around midday UTC). In between it
-creates "My First Project" and one Free Blockfrost port on preprod: about $0
-a run. The request, its usage and its cost appear in production data under
-the test user.
+another run signed in as the user. The concurrency group below keeps this
+repository's runs apart. Fabric's daily e2e runs as the same user from
+another repository: scheduled at 12:00 UTC, GitHub has started it as late as
+21:07 UTC, so a pull request's J2 can overlap it, and its clean-up then
+deletes that run's project too. J2 itself deploys only into "My First
+Project": a Console that lands on another project fails the first-project
+step, and the port step does not run. In between it creates "My First
+Project" and one Free Blockfrost port on preprod: about $0 a run. The
+request, its usage and its cost appear in production data under the test
+user.
 
 **Secrets.** The password and the port's key never reach a result, a log, a
 summary or an alert: they are kept secret (`src/secrets.ts`), every step's
 detail is redacted, a browser error is cut to its first line, and the key
 travels only in the `dmtr-api-key` header. A failed step leaves a screenshot
 (`results/<name>-<step>.png`) with the password field and the port's key
-painted over. Playwright's traces stay off: they record what is typed, the
+painted over. The key's masks are found independently (`keyMasks` in
+`src/journeys/console.ts`): any text of a key's shape, the "Auth Token" row's
+value, the "Instance info" section, and the key itself once it is read. So
+a heading, a label or the key's shape that drifts loses one mask, never the
+key. Playwright's traces stay off: they record what is typed, the
 cookies sent (the Console's session is a signed Auth0 access token) and every
 response body, the key included, and none of that can be masked.
 
@@ -303,6 +317,7 @@ Three edge cases ride on J2's signed-in session, each a result of its own:
 ```sh
 pnpm test
 pnpm typecheck
+pnpm test:browser   # needs Chromium: pnpm exec playwright install --only-shell chromium
 ```
 
 The readers are tested on responses and pages captured from production, and
@@ -316,14 +331,17 @@ read from its cells as webui renders them (the page renders only signed in, so
 no capture of it is committed), `pnpm journey` runs against a stand-in
 Playwright, the project deletion against a stand-in Console and the port
 requests against a local server. No unit test reaches production or needs a
-browser.
+browser. The browser tests under `test/browser/` take a failed step's masked
+screenshot of a stand-in port page, as the Console lays it out, whose heading,
+label or key shape has drifted, and read its pixels back: every pixel of the
+key must be painted over.
 
 ## Workflows
 
 `.github/workflows/contracts.yml` runs:
 
-- on `pull_request` and on `push` to `main`: install, typecheck and unit tests
-  in the `unit` job, then `pnpm check all --env production`, no alert, in the
+- on `pull_request` and on `push` to `main`: install, typecheck, unit tests,
+  Chromium and the browser tests in the `unit` job, then `pnpm check all --env production`, no alert, in the
   `checks` job that needs it. The checks fail on every run while fabric
   publishes no prices, so a broken unit test fails a job of its own;
 - daily at 05:00 UTC and on `workflow_dispatch`:
@@ -342,19 +360,32 @@ browser.
 
 - daily at 06:00 UTC and on `workflow_dispatch`, with `--alert`. The dispatch
   takes the same `force_fail` input, and only runs of `main` receive the
-  webhook. A failure before the journey starts posts one `e2e-j2-setup`
-  alert, as `contracts.yml` does for the checks;
-- on pull requests that change a journey, no alert: GitHub dispatches only
-  workflows on the default branch, so this is how a branch walks J2 before it
-  merges. The sign-in proof (`pnpm journey sign-in`) runs first, and J2 only
-  when the test user could sign in.
+  webhook;
+- on pull requests from this repository that change what J2 runs (the specs,
+  every file they import, `playwright.config.ts`, the toolchain and the
+  dependencies; a unit test fails when an import is missing from the list),
+  no alert: GitHub dispatches only workflows on the default branch, so this
+  is how a branch walks J2 before it merges. The sign-in proof (`pnpm journey
+  sign-in`) runs first, and J2 only when the test user could sign in. A pull
+  request from a fork runs neither;
+- when one of the alerting runs reports nothing, one IRM alert says so, as no
+  result would: `e2e-j2-setup` when the job failed before J2 reported
+  (checkout, install or Chromium, or `pnpm j2` exiting 2 on a usage error such
+  as a missing `E2E_USER_PASSWORD`, or 3 on a break outside the journey), and
+  `e2e-j2-cancelled` when the job was cancelled: its timeout ran out, another
+  job of the group took its place, or someone cancelled it. `pnpm journey`
+  exits 0 or 1 only once it has reported the run.
 
-The job's timeout is 120 minutes, for the 75-minute wait on the cost. It
-uploads `results/`: the result files and the masked screenshots.
+The job's timeout is 150 minutes: J2's test has 100, mostly the 75-minute wait
+on the cost, and when it times out the clean-up, the edge cases in a new
+worker and that worker's clean-up take up to 33 more. It uploads `results/`:
+the result files and the masked screenshots.
 
 Every job that signs in as the standing test user sets the concurrency group
-`production-test-user` (`cancel-in-progress: false`), so no two runs use the
-user at once.
+`production-test-user` (`cancel-in-progress: false`, `queue: max`), so no two
+runs use the user at once and no waiting run is dropped. `queue: max` holds
+only while every job of the group sets it: by default the group keeps one
+pending job, and a newer one cancels it without failing it.
 
 ### Secrets
 

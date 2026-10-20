@@ -1,16 +1,20 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, normalize } from 'node:path'
 import { afterEach, beforeEach, describe, it, mock } from 'node:test'
 import { request } from '@playwright/test'
-import { type Journey, main, type Playwright } from '../src/cli/journeys.ts'
-import { deleteProjects } from '../src/journeys/console.ts'
+import { type Journey, journeys, main, type Playwright } from '../src/cli/journeys.ts'
+import { deleteProjects, keyShape } from '../src/journeys/console.ts'
 import { burst, describeTally, portGet, tally, untilSuccess } from '../src/journeys/port.ts'
-import { browserSteps, NotRun } from '../src/journeys/spec.ts'
+import { browserSteps, ended, NotRun, poll, within } from '../src/journeys/spec.ts'
 import { Failure, formatMarkdown, formatText, type Result, Run } from '../src/report.ts'
 import { forgetSecrets, keepSecret, redact } from '../src/secrets.ts'
-import { serve, withEnv } from './helpers.ts'
+import { refusedUrl, serve, withEnv } from './helpers.ts'
+
+const root = join(import.meta.dirname, '..')
 
 describe('secrets', () => {
   afterEach(forgetSecrets)
@@ -123,6 +127,16 @@ describe('pnpm journey', () => {
     assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /FAIL {2}walk-edge \(production\): 0\/1 steps\n {2}FAIL {2}report \(0 ms\): the journey wrote no result for walk-edge: Playwright exited 1/)
   })
 
+  it('appends the results to the job summary, with the elapsed time', async () => {
+    const summary = join(dir, 'summary.md')
+    const timed = { ...result('walk', true), elapsed_seconds: 7.6 }
+    await withEnv({ GITHUB_STEP_SUMMARY: summary }, () => cli(['walk', '--env', 'production'], playwright([timed, result('walk-edge', false)]).run))
+    const written = await readFile(summary, 'utf8')
+    assert.match(written, /^## Journey walk against production\n/)
+    assert.match(written, /\| `walk-edge` \(production\) \| ❌ fail \| 0\/1 \|/)
+    assert.match(written, /\*\*Elapsed:\*\* 7\.6 s/)
+  })
+
   it('adds a failing result with --force-fail, and posts nothing without the webhook', async () => {
     const pw = playwright([result('walk', true), result('walk-edge', true)])
     assert.equal(await cli(['walk', '--env', 'production', '--force-fail', '--alert'], pw.run), 1)
@@ -139,6 +153,70 @@ describe('pnpm journey', () => {
     assert.equal(pw.calls.length, 0)
     assert.match(String(error.mock.calls.at(-1)?.arguments[0]), /^set E2E_USER_PASSWORD to e2e@txpipe\.io's password/)
     assert.deepEqual(await readdir(dir), [])
+  })
+})
+
+describe('the pnpm journey entry point', () => {
+  // The script itself, in a child process, so its exit code is the one CI reads.
+  const entry = (env: NodeJS.ProcessEnv, ...argv: string[]) =>
+    spawnSync(process.execPath, ['--import', 'tsx', join('src', 'cli', 'journey.ts'), ...argv], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, IRM_E2E_WEBHOOK_URL: '', GITHUB_STEP_SUMMARY: '', ...env },
+    })
+
+  it('exits 2 on a usage error and 3 on a break before the journey reported, never the 1 of a reported failure', async () => {
+    const usage = entry({ E2E_USER_PASSWORD: '' }, 'sign-in', '--env', 'production')
+    assert.equal(usage.status, 2, usage.stderr)
+    // A results directory that is a file: clearing the old results breaks before Playwright starts.
+    const tmp = await mkdtemp(join(tmpdir(), 'e2e-entry-'))
+    try {
+      const file = join(tmp, 'not-a-directory')
+      await writeFile(file, '')
+      const broke = entry({ E2E_USER_PASSWORD: 'stand-in' }, 'sign-in', '--env', 'production', '--results', file)
+      assert.equal(broke.status, 3, broke.stderr)
+      assert.match(broke.stderr, /^the journey broke before it reported: /)
+    } finally {
+      await rm(tmp, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('the journey registry', () => {
+  // A result the registry leaves out is never read, so a test that fails it would not fail the run.
+  it("names one result per test each spec declares, as the spec's tests name their runs", () => {
+    for (const journey of journeys) {
+      const spec = readFileSync(join(root, journey.spec), 'utf8')
+      const tests = [...spec.matchAll(/^test\('([^']+)'/gm)].map((m) => m[1])
+      assert.deepEqual([...journey.results].sort(), tests.sort(), journey.spec)
+    }
+  })
+})
+
+describe('the j2 workflow', () => {
+  /** The relative imports of `file`, and theirs, as paths from the repository root. */
+  const imports = (files: string[]): Set<string> => {
+    const seen = new Set<string>()
+    const queue = [...files]
+    while (queue.length) {
+      const file = queue.pop()!
+      if (seen.has(file)) continue
+      seen.add(file)
+      for (const m of readFileSync(join(root, file), 'utf8').matchAll(/(?:from|import)\s+'(\.[^']+)'/g)) queue.push(normalize(join(dirname(file), m[1]!)))
+    }
+    return seen
+  }
+  const glob = (pattern: string) =>
+    new RegExp(`^${pattern.split('**').map((part) => part.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*')).join('.*')}$`)
+
+  it('runs on a pull request that changes any file J2 runs, the toolchain or the dependencies', () => {
+    const workflow = readFileSync(join(root, '.github', 'workflows', 'j2.yml'), 'utf8')
+    const block = /\n {2}pull_request:\n {4}paths:\n((?: {6}- .+\n)+)/.exec(workflow)?.[1]
+    assert.ok(block, 'j2.yml has a pull_request paths filter')
+    const paths = [...block.matchAll(/- (.+)/g)].map((m) => glob(m[1]!.trim()))
+    const specs = journeys.map((j) => j.spec)
+    const needed = [...imports([...specs, 'src/cli/journey.ts']), 'playwright.config.ts', '.nvmrc', 'package.json', 'pnpm-lock.yaml', '.github/workflows/j2.yml']
+    assert.deepEqual(needed.filter((file) => !paths.some((p) => p.test(file))), [])
   })
 })
 
@@ -160,34 +238,72 @@ describe('requests to a port', () => {
     }
   })
 
-  it('poll until the first 2xx, as a new key reaches the proxies', async () => {
+  it('answer no status, saying why, when nothing answers in time or nothing listens', async () => {
+    const server = await serve(() => {})
+    // Should the request not time out, closing the server ends it, and the assertion says so.
+    const stop = setTimeout(() => void server.close(), 2_000)
+    try {
+      assert.deepEqual(await portGet(`${server.url}/epochs/latest`, 'k', 50), { status: null, error: 'TimeoutError' })
+    } finally {
+      clearTimeout(stop)
+      await server.close()
+    }
+    assert.deepEqual(await portGet(`${await refusedUrl()}/epochs/latest`, 'k'), { status: null, error: 'ECONNREFUSED' })
+  })
+
+  it('poll until the first 2xx, as a new key reaches the proxies, and stop the stopwatch at it', async () => {
     let n = 0
     const server = await serve((_req, res) => {
       res.statusCode = (n += 1) < 3 ? 401 : 200
       res.end('{}')
     })
     try {
-      const { answer, tries } = await untilSuccess(`${server.url}/epochs/latest`, 'k', { timeoutMs: 5_000, everyMs: 10 })
+      const t0 = performance.now()
+      const { answer, tries, at } = await untilSuccess(`${server.url}/epochs/latest`, 'k', { timeoutMs: 5_000, everyMs: 40 })
       assert.equal(answer.status, 200)
       assert.equal(tries, 3)
+      // Two waits of 40 ms come before the 2xx.
+      assert.ok(at - t0 >= 80, `stopped ${at - t0} ms in`)
+      assert.ok(at <= performance.now())
     } finally {
       await server.close()
     }
   })
 
-  it('give up after the deadline, saying what answered, without the key', async () => {
+  it('give up after the deadline, saying what answered how often, without the key', async () => {
     const key = keepSecret('dmtr_blockfrost1secretkey')
+    let hits = 0
     const server = await serve((_req, res) => {
+      hits += 1
       res.statusCode = 401
       res.end()
     })
     try {
       await assert.rejects(untilSuccess(`${server.url}/epochs/latest?x=1`, key, { timeoutMs: 50, everyMs: 10 }), (error: Error) => {
         assert.ok(error instanceof Failure)
-        assert.match(error.message, /^http:\/\/127\.0\.0\.1:\d+\/epochs\/latest answered no 2xx in 0 s: \d+× 401$/)
+        assert.ok(hits > 1, `${hits} requests`)
+        assert.match(error.message, new RegExp(`^http://127\\.0\\.0\\.1:\\d+/epochs/latest answered no 2xx in 0 s: ${hits}× 401$`))
         assert.doesNotMatch(error.message, /secretkey/)
         return true
       })
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('send a burst at once', async () => {
+    let open = 0
+    let most = 0
+    const server = await serve((_req, res) => {
+      most = Math.max(most, (open += 1))
+      setTimeout(() => {
+        open -= 1
+        res.end()
+      }, 100)
+    })
+    try {
+      assert.equal((await burst(`${server.url}/epochs/latest`, 'k', 8)).length, 8)
+      assert.equal(most, 8)
     } finally {
       await server.close()
     }
@@ -206,6 +322,64 @@ describe('requests to a port', () => {
     } finally {
       await server.close()
     }
+  })
+})
+
+describe('waiting in a spec', () => {
+  it('polls until a read returns a value, retrying a read that fails', async () => {
+    let n = 0
+    const found = await poll(5_000, 5, async () => {
+      if ((n += 1) === 1) throw new Error('the page was busy')
+      return n === 3 ? 'listed' : null
+    })
+    assert.deepEqual([found.value, found.error, n], ['listed', undefined, 3])
+  })
+
+  it('gives up at the deadline with the last read failure only, never an earlier one', async () => {
+    let n = 0
+    const recovered = await poll(40, 5, async () => {
+      if ((n += 1) === 1) throw new Failure('no "Project Usage" card on the billing page')
+      return null
+    })
+    assert.equal(recovered.value, null)
+    assert.equal(recovered.error, undefined)
+    const failing = await poll(40, 5, async () => {
+      throw new Error('page.goto: net::ERR_CONNECTION_RESET\nCall log: the page')
+    })
+    assert.equal(failing.value, null)
+    assert.equal(failing.error, 'page.goto: net::ERR_CONNECTION_RESET')
+  })
+
+  it('cuts off what runs past its time with a Failure naming it', async () => {
+    assert.equal(await within(1_000, 'the clean-up', async () => 'done'), 'done')
+    await assert.rejects(
+      within(20, 'the clean-up', () => new Promise(() => {})),
+      (error: Error) => error instanceof Failure && error.message === 'the clean-up did not finish within 0 s',
+    )
+  })
+
+  it('records a test Playwright ended as a failed step, and nothing for one that passed', async () => {
+    const run = new Run('j2', 'production')
+    await ended(run, { status: 'passed', expectedStatus: 'passed', timeout: 6_000_000, error: undefined })
+    await ended(run, { status: 'timedOut', expectedStatus: 'passed', timeout: 6_000_000, error: undefined })
+    await ended(run, { status: 'failed', expectedStatus: 'passed', timeout: 1, error: { message: 'browser.newContext: closed\nCall log: …' } })
+    assert.deepEqual(
+      run.finish().steps.map(({ name, ok, detail }) => [name, ok, detail]),
+      [
+        ['the test ran to its end', false, 'Playwright ended the test: it timed out after 6000 s'],
+        ['the test ran to its end', false, 'Playwright ended the test: it failed: browser.newContext: closed'],
+      ],
+    )
+  })
+})
+
+describe('the key shape', () => {
+  it("matches a port's key as fabric writes it, alone or in a URL, and a legacy key", () => {
+    assert.match('blockfrost1qpzry9x8gf2tvdw0s3jn5', keyShape)
+    assert.match('https://ogmios1qpzry9x8gf2tvdw0s3jn5.cardano-preprod.ogmios-m1.demeter.run', keyShape)
+    assert.match('dmtr_blockfrost1qpzry9x8gf2tvdw0s3jn54khce6', keyShape)
+    assert.doesNotMatch('https://cardano-preprod.blockfrost-m1.demeter.run', keyShape)
+    assert.doesNotMatch('blockfrost-preprod-1a2b3c', keyShape)
   })
 })
 

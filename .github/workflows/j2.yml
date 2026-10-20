@@ -11,16 +11,24 @@ name: j2
 #   main hold the webhook, so a dispatch on a branch logs that its alert was
 #   skipped. The dispatch takes force_fail, which adds a result that fails on
 #   purpose.
-# - On pull requests that change a journey: the same, no alert. GitHub
-#   dispatches only workflows on the default branch, so this is how a branch
-#   runs J2 before it merges.
-# - When an alerting run fails before the journey starts (checkout, install or
-#   Chromium), one `e2e-j2-setup` alert says so: nothing was walked that day,
-#   and no journey alert would fire.
+# - On pull requests from this repository that change what J2 runs (the specs,
+#   every file they import, the toolchain and the dependencies; test/ keeps
+#   the list whole): the same, no alert. GitHub dispatches only workflows on
+#   the default branch, so this is how a branch runs J2 before it merges.
+# - When an alerting run reports nothing, one alert says so, as no journey
+#   alert would fire: `e2e-j2-setup` when the job failed before J2 reported
+#   (checkout, install or Chromium, or J2 exiting with no result: a usage
+#   error such as a missing password, or a break outside the journey), and
+#   `e2e-j2-cancelled` when the job was cancelled (its timeout ran out,
+#   another job of the group took its place, or someone cancelled it), which
+#   may leave a project on the test user's account until the next run.
 #
 # Every job that signs in sets the concurrency group production-test-user, so
 # no two runs use the user at once: J2 deletes every project the user owns
-# before it starts and after it ends.
+# before it starts and after it ends. `queue: max` keeps every waiting job, but
+# only while every job of the group sets it: by default the group keeps one
+# pending job, and a newer one cancels it without failing it, so no alert
+# would say that day went unwalked.
 
 on:
   schedule:
@@ -33,11 +41,23 @@ on:
         default: false
   pull_request:
     paths:
+      - .github/workflows/j2.yml
       - journeys/**
       - src/journeys/**
       - src/cli/journey*.ts
-      - src/surfaces/console.ts
-      - .github/workflows/j2.yml
+      - src/checks/check.ts
+      - src/checks/intent.ts
+      - src/surfaces/**
+      - src/env.ts
+      - src/html.ts
+      - src/http.ts
+      - src/report.ts
+      - src/secrets.ts
+      - playwright.config.ts
+      - .nvmrc
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
 
 permissions:
   contents: read
@@ -45,12 +65,14 @@ permissions:
 jobs:
   sign-in:
     name: Sign-in proof against production
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
       group: production-test-user
       cancel-in-progress: false
+      # actionlint 1.7.7 does not know this key yet; GitHub does.
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
@@ -81,16 +103,24 @@ jobs:
   j2:
     name: J2 against production
     needs: sign-in
-    # The sign-in proof gates J2 on pull requests; elsewhere it is skipped.
-    if: always() && (needs.sign-in.result == 'success' || needs.sign-in.result == 'skipped')
+    # The sign-in proof gates J2 on pull requests; elsewhere it is skipped. A
+    # pull request from a fork runs neither.
+    if: >-
+      always()
+      && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && (needs.sign-in.result == 'success' || needs.sign-in.result == 'skipped')
     runs-on: ubuntu-latest
-    # Up to 3 minutes to a first request, 5 for usage, 75 for the cost, plus
-    # the browser steps and the clean-up.
-    timeout-minutes: 120
+    # The worst case, when J2's test times out: about 5 minutes of set-up,
+    # J2's 100, its clean-up's 10, then in a new worker the edge cases' 13 and
+    # that worker's clean-up's 10.
+    timeout-minutes: 150
     concurrency:
       group: production-test-user
       cancel-in-progress: false
+      # actionlint 1.7.7 does not know this key yet; GitHub does.
+      queue: max
     outputs:
+      reported: ${{ steps.j2.outputs.reported }}
       failed: ${{ steps.failed.outputs.step }}
     steps:
       - id: checkout
@@ -119,25 +149,33 @@ jobs:
           IRM_E2E_WEBHOOK_URL: ${{ github.ref == 'refs/heads/main' && secrets.IRM_E2E_WEBHOOK_URL || '' }}
           ALERT: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           FORCE_FAIL: ${{ inputs.force_fail == true }}
+        # 0 and 1 are verdicts J2 reported, and alerted with --alert; 2 is a
+        # usage error (a missing password, say) and 3 a break outside the
+        # journey, and neither reported anything.
         run: |
           args=(--env production)
           if [[ "$ALERT" == true ]]; then args+=(--alert); fi
           if [[ "$FORCE_FAIL" == true ]]; then args+=(--force-fail); fi
-          pnpm j2 "${args[@]}"
+          status=0
+          pnpm j2 "${args[@]}" || status=$?
+          if [[ $status -le 1 ]]; then reported=true; else reported=false; fi
+          { echo "status=$status"; echo "reported=$reported"; } >> "$GITHUB_OUTPUT"
+          exit "$status"
 
-      # Only when the journey never started: a failed journey has posted its
-      # own alerts, so it names nothing here.
+      # Only when J2 reported nothing: a failed result has posted its own
+      # alert, so it names nothing here.
       - id: failed
-        name: Name the failed setup step
-        if: failure() && steps.j2.outcome == 'skipped'
+        name: Name the step that kept J2 from reporting
+        if: failure() && steps.j2.outputs.reported != 'true'
         env:
           OUTCOMES: |-
-            checkout ${{ steps.checkout.outcome }}
-            pnpm setup ${{ steps.pnpm.outcome }}
-            Node setup ${{ steps.node.outcome }}
-            install ${{ steps.install.outcome }}
-            Chromium install ${{ steps.chromium.outcome }}
-        run: awk '$NF == "failure" { sub(/ [^ ]+$/, ""); print "step=" $0; exit }' <<<"$OUTCOMES" >> "$GITHUB_OUTPUT"
+            the checkout failed|${{ steps.checkout.outcome }}
+            the pnpm setup failed|${{ steps.pnpm.outcome }}
+            the Node setup failed|${{ steps.node.outcome }}
+            the install failed|${{ steps.install.outcome }}
+            the Chromium install failed|${{ steps.chromium.outcome }}
+            J2 exited ${{ steps.j2.outputs.status }} with no result|${{ steps.j2.outputs.reported == 'false' && 'failure' || 'skipped' }}
+        run: awk -F'|' '$2 == "failure" { print "step=" $1; exit }' <<<"$OUTCOMES" >> "$GITHUB_OUTPUT"
 
       # The result files, and the masked screenshot each failed step leaves.
       - uses: actions/upload-artifact@v4
@@ -147,39 +185,51 @@ jobs:
           path: results/
           if-no-files-found: ignore
 
-  # A failure before the journey skips it, so no result posts an alert. This
-  # posts one, in the shape src/report.ts sends, with curl and jq: it needs no
-  # checkout or Node, which may be what failed. The webhook URL goes to curl on
-  # stdin, never on a command line or in the log.
+  # J2 that reported nothing posts no alert of its own. This posts one, in the
+  # shape src/report.ts sends, with curl and jq: it needs no checkout or Node,
+  # which may be what failed. The webhook URL goes to curl on stdin, never on a
+  # command line or in the log. `always()`, so a cancelled J2 alerts too. A
+  # failure that set up no step (the job's set-up, a lost runner) names
+  # nothing, so the alert goes on what J2 did not report.
   setup-alert:
-    name: Alert when setup failed
+    name: Alert when J2 reported nothing
     needs: j2
     if: >-
-      failure()
+      always()
       && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-      && needs.j2.outputs.failed != ''
+      && (needs.j2.result == 'cancelled' || (needs.j2.result == 'failure' && needs.j2.outputs.reported != 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - env:
           IRM_E2E_WEBHOOK_URL: ${{ github.ref == 'refs/heads/main' && secrets.IRM_E2E_WEBHOOK_URL || '' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CANCELLED: ${{ needs.j2.result == 'cancelled' }}
           FAILED: ${{ needs.j2.outputs.failed }}
         run: |
+          if [[ "$CANCELLED" == true ]]; then
+            uid=j2-cancelled
+            title="e2e j2 cancelled (production)"
+            message="J2 was cancelled before it finished: its timeout ran out, another job of production-test-user took its place, or someone cancelled it. A project it deployed may still be on the test user's account until the next run."
+          else
+            uid=j2-setup
+            title="e2e j2 reported nothing (production)"
+            message="${FAILED:-the job failed before any of its steps ran (its set-up, or a lost runner)}, so J2 was not walked."
+          fi
           if [[ -z "$IRM_E2E_WEBHOOK_URL" ]]; then
-            echo "alert skipped for j2 setup: IRM_E2E_WEBHOOK_URL is not set"
+            echo "alert skipped for $uid: IRM_E2E_WEBHOOK_URL is not set"
             exit 0
           fi
-          jq -n --arg step "$FAILED" --arg link "$RUN_URL" '{
-            alert_uid: "e2e-j2-setup",
-            title: "e2e j2 setup failed (production)",
-            message: "\($step) failed before the journey started, so J2 was not walked.",
+          jq -n --arg uid "e2e-$uid" --arg title "$title" --arg message "$message" --arg link "$RUN_URL" '{
+            alert_uid: $uid,
+            title: $title,
+            message: $message,
             state: "alerting",
             link_to_upstream_details: $link
           }' > "$RUNNER_TEMP/setup-alert.json"
           if status=$(printf 'url = "%s"\n' "$IRM_E2E_WEBHOOK_URL" | curl -K - -s -o /dev/null -w '%{http_code}' \
                 --max-time 15 -H 'content-type: application/json' --data-binary "@$RUNNER_TEMP/setup-alert.json"); then
-            if [[ "$status" == 2* ]]; then echo "alert sent for j2 setup"; else echo "alert failed with HTTP $status for j2 setup"; fi
+            if [[ "$status" == 2* ]]; then echo "alert sent for $uid"; else echo "alert failed with HTTP $status for $uid"; fi
           else
-            echo "alert failed for j2 setup: curl exited $?"
+            echo "alert failed for $uid: curl exited $?"
           fi
