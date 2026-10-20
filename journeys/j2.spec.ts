@@ -112,8 +112,7 @@ test('j2', async ({ browser }) => {
       await page.goto(`${env.console}/login`, { waitUntil: 'domcontentloaded', timeout: 30_000 })
       await signIn(page, env, user())
       const deleted = await deleteProjects(slate, env, await landOnPorts(page, env))
-      await signOut(page, env)
-      return `deleted ${deleted.length} (${deleted.join(', ')}) and signed out`
+      return `deleted ${deleted.length} (${deleted.join(', ')}); ${await signOut(page, env)}`
     } finally {
       page = undefined
       await slate.close()
