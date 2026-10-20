@@ -17,6 +17,11 @@ export default defineConfig({
   reporter: process.env.CI ? [['github'], ['list']] : 'list',
   use: {
     headless: true,
+    // Under the runner an action waits with no limit by default, so a click
+    // whose element never becomes clickable, or whose page never loads, would
+    // hold its step until the test's timeout and leave nothing said of it.
+    actionTimeout: 30_000,
+    navigationTimeout: 60_000,
     // Traces, screenshots and videos capture what is typed, the test user's
     // password included, and traces the session cookie and the port's key
     // too; CI uploads results/. A journey's failed step takes its own

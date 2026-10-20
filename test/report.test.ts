@@ -33,6 +33,27 @@ describe('results', () => {
     assert.equal(new Run('empty', 'production').finish().ok, false)
   })
 
+  it('fails a run reported while a step still runs, with that step in the place it started', async () => {
+    const run = new Run('j2', 'production')
+    await run.step('first', () => 'fine')
+    let release = () => {}
+    const hung = run.step('hangs', () => new Promise<string>((resolve) => (release = () => resolve('late'))))
+    await run.step('after', () => 'fine')
+    const result = run.finish()
+    assert.equal(result.ok, false)
+    assert.deepEqual(
+      result.steps.map(({ name, ok, detail }) => ({ name, ok, detail })),
+      [
+        { name: 'first', ok: true, detail: 'fine' },
+        { name: 'hangs', ok: false, detail: 'did not finish: the step was still running when the run was reported' },
+        { name: 'after', ok: true, detail: 'fine' },
+      ],
+    )
+    release()
+    await hung
+    assert.deepEqual(run.finish().steps.map((s) => [s.name, s.ok]), [['first', true], ['after', true], ['hangs', true]])
+  })
+
   it('writes results/<name>.json in the agreed shape', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'e2e-results-'))
     try {

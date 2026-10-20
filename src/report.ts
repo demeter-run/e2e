@@ -38,6 +38,8 @@ export class Failure extends Error {}
 /** Collects the steps of one check or journey run. */
 export class Run {
   readonly #steps: Step[] = []
+  /** The steps still running: when each started, and how many steps had been recorded then. */
+  readonly #running = new Map<object, { name: string; t0: number; at: number }>()
   readonly #started = new Date()
   /** Set by a journey when its stopwatch stops; written to the result as `elapsed_seconds`. */
   elapsedSeconds?: number
@@ -55,6 +57,8 @@ export class Run {
    */
   async step(name: string, fn: () => string | void | Promise<string | void>): Promise<boolean> {
     const t0 = performance.now()
+    const running = {}
+    this.#running.set(running, { name, t0, at: this.#steps.length })
     let ok = true
     let detail: string
     try {
@@ -62,19 +66,37 @@ export class Run {
     } catch (error) {
       ok = false
       detail = error instanceof Error ? error.message : String(error)
+    } finally {
+      this.#running.delete(running)
     }
     this.#steps.push({ name: redact(name), ok, ms: Math.round(performance.now() - t0), detail: redact(detail) })
     return ok
   }
 
+  /**
+   * The run's result. A step still running fails it, in the place it started:
+   * a journey whose test timed out is reported while the step that hung has
+   * not returned, and must not read as a pass for want of that step.
+   */
   finish(): Result {
+    const now = performance.now()
+    const steps = [...this.#steps]
+    // The latest first, so that each goes in before the steps recorded after it started.
+    for (const { name, t0, at } of [...this.#running.values()].reverse()) {
+      steps.splice(at, 0, {
+        name: redact(name),
+        ok: false,
+        ms: Math.round(now - t0),
+        detail: 'did not finish: the step was still running when the run was reported',
+      })
+    }
     return {
       name: this.name,
       env: this.env,
       started_at: this.#started.toISOString(),
       finished_at: new Date().toISOString(),
-      ok: this.#steps.length > 0 && this.#steps.every((s) => s.ok),
-      steps: this.#steps,
+      ok: steps.length > 0 && steps.every((s) => s.ok),
+      steps,
       ...(this.elapsedSeconds === undefined ? {} : { elapsed_seconds: this.elapsedSeconds }),
     }
   }

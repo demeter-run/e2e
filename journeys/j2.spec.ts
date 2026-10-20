@@ -9,7 +9,7 @@ import {
   dailyRequests,
   deleteProjects,
   deployPort,
-  detailSection,
+  keyMasks,
   landOnPorts,
   openPort,
   pricingCells,
@@ -18,7 +18,7 @@ import {
 } from '../src/journeys/console.ts'
 import { arrives, visible } from '../src/journeys/browser.ts'
 import { burst, describePortAnswer, describeTally, portGet, tally, untilSuccess } from '../src/journeys/port.ts'
-import { browserSteps, journeyEnvironment, NotRun, report, verdict } from '../src/journeys/spec.ts'
+import { browserSteps, ended, journeyEnvironment, NotRun, poll, report, verdict, within } from '../src/journeys/spec.ts'
 import { Failure, Run } from '../src/report.ts'
 import { keepSecret } from '../src/secrets.ts'
 import { type Card, compare, formatUsd } from '../src/surfaces/card.ts'
@@ -37,11 +37,13 @@ import { readPricingTable } from '../src/surfaces/website2.ts'
  * One test of named steps, then three edge cases on the same signed-in
  * session. Every test records its steps in a result (`results/j2*.json`) and
  * does not throw; the clean-up and the verdict run last, in `afterAll`
- * (`src/journeys/spec.ts` says why).
+ * (`src/journeys/spec.ts` says why). A test Playwright ends, by its timeout or
+ * an error outside a step, fails its result, which `afterEach` writes: J2's
+ * after the clean-up, in `afterAll`, and each edge case's at once.
  *
  * The port's key stays in memory: it is kept secret (`src/secrets.ts`), sent
  * only in a header, and painted over in every screenshot, with the password
- * field.
+ * field (`keyMasks` in `src/journeys/console.ts`).
  */
 
 const env = journeyEnvironment()
@@ -62,37 +64,49 @@ let namespace: string | undefined
 let port: ConsolePort | undefined
 
 const j2 = new Run('j2', env.name)
-/** Whether J2 ran in this worker, which owns its result. */
+/** Whether J2 ran in this worker, which owns its result, and whether its test returned. */
 let j2Ran = false
+let j2Returned = false
+/** Each test's run, by the test's title. */
+const runs = new Map<string, Run>([['j2', j2]])
 
 /** What a screenshot must not show: the password field, and the port's key wherever it is written. */
-const masks = (p: Page) => [
-  p.locator('input[type="password"]'),
-  detailSection(p, 'Instance info'),
-  ...(port ? [p.getByText(port.key)] : []),
-]
+const masks = (p: Page) => [p.locator('input[type="password"]'), ...keyMasks(p, port?.key)]
 
 const stepsOf = (run: Run) => browserSteps(run, () => page, masks)
+
+// A test Playwright ended fails its result. J2's is written after the
+// clean-up; an edge case's, here.
+test.afterEach(async ({}, testInfo) => {
+  const run = runs.get(testInfo.title)
+  if (!run) return
+  await ended(run, testInfo)
+  if (run !== j2) await report(run)
+})
 
 test.afterAll(async ({ browser }, testInfo) => {
   testInfo.setTimeout(10 * 60_000)
   const step = stepsOf(j2)
   // Pass or fail: the clean-up deletes whatever the user owns, so the next run
-  // starts from the same clean slate and nothing is left behind.
-  const cleaned = await step('clean up: delete every project the user owns', async () => {
-    if (!context || !page) {
-      context = await browser.newContext()
-      page = await context.newPage()
-    }
-    await page.goto(`${env.console}/`, { waitUntil: 'commit', timeout: 60_000 })
-    await arrives(page, (u) => u.origin === env.auth0 || /^\/[^/]+\/ports$/.test(u.pathname), 'the Console or Auth0')
-    if (new URL(page.url()).origin === env.auth0) await signIn(page, env, user())
-    const deleted = await deleteProjects(context, env, await landOnPorts(page, env))
-    return `deleted ${deleted.length} (${deleted.join(', ')}); the Console then names no project. ${await signOut(page, env)}`
-  })
-  await context?.close()
+  // starts from the same clean slate and nothing is left behind. It is cut
+  // off before the hook's 10 minutes, so that J2's result is still written. A
+  // J2 that Playwright ended may have left its page busy, so the clean-up
+  // opens another in the same signed-in browser.
+  const cleaned = await step('clean up: delete every project the user owns', () =>
+    within(8 * 60_000, 'the clean-up', async () => {
+      context ??= await browser.newContext()
+      if (!page || (j2Ran && !j2Returned)) page = await context.newPage()
+      const [c, p] = [context, page]
+      await p.goto(`${env.console}/`, { waitUntil: 'commit', timeout: 60_000 })
+      await arrives(p, (u) => u.origin === env.auth0 || /^\/[^/]+\/ports$/.test(u.pathname), 'the Console or Auth0')
+      if (new URL(p.url()).origin === env.auth0) await signIn(p, env, user())
+      const deleted = await deleteProjects(c, env, await landOnPorts(p, env))
+      return `deleted ${deleted.length} (${deleted.join(', ')}); the Console then names no project. ${await signOut(p, env)}`
+    }),
+  )
   if (j2Ran) await report(j2)
   else if (!cleaned) console.log('the clean-up failed in a worker that did not run J2')
+  await context?.close()
   verdict()
 })
 
@@ -105,19 +119,20 @@ test('j2', async ({ browser }) => {
 
   // 1. Before the stopwatch: the user owns nothing, so the Console's
   // first-project path runs, and Auth0 holds no session for the person's browser.
-  await step('clean slate: sign in, delete every project the user owns, sign out', async () => {
-    const slate = await browser.newContext()
-    page = await slate.newPage()
-    try {
-      await page.goto(`${env.console}/login`, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-      await signIn(page, env, user())
-      const deleted = await deleteProjects(slate, env, await landOnPorts(page, env))
-      return `deleted ${deleted.length} (${deleted.join(', ')}); ${await signOut(page, env)}`
-    } finally {
-      page = undefined
-      await slate.close()
-    }
-  })
+  // The browser is closed only after the step, which takes its screenshot first.
+  const slate = await browser.newContext()
+  try {
+    const s = (page = await slate.newPage())
+    await step('clean slate: sign in, delete every project the user owns, sign out', async () => {
+      await s.goto(`${env.console}/login`, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+      await signIn(s, env, user())
+      const deleted = await deleteProjects(slate, env, await landOnPorts(s, env))
+      return `deleted ${deleted.length} (${deleted.join(', ')}); ${await signOut(s, env)}`
+    })
+  } finally {
+    page = undefined
+    await slate.close()
+  }
 
   context = await browser.newContext()
   page = await context.newPage()
@@ -176,11 +191,14 @@ test('j2', async ({ browser }) => {
     return `"${label}" → ${env.console}/login?intent=signup → ${env.auth0}${want.path} ("${heading}") → signed in through the ${how}`
   })
 
-  // 5. The Console creates a first project for a user with none.
+  // 5. The Console creates a first project for a user with none. The later
+  // steps work in it only once it is that project: a run signed in as the
+  // same user elsewhere (fabric's daily e2e) can have left another.
   await step('first project: the Console lands on "My First Project"', async () => {
     if (!signedIn) throw new NotRun('not signed in')
-    namespace = await landOnPorts(p, env)
+    const first = await landOnPorts(p, env)
     await visible(p, p.getByText('My First Project', { exact: true }), 'project named "My First Project"')
+    namespace = first
     return `${env.console}/${namespace}/ports of "My First Project"`
   })
 
@@ -216,12 +234,14 @@ test('j2', async ({ browser }) => {
       const count = await dailyRequests(p, env, n, at)
       return count >= 1 ? `${count} daily requests` : null
     })
-    if (!usage.value) throw new Failure(`the usage view showed no request within 5 minutes`)
+    if (!usage.value) throw new Failure(`the usage view showed no request within 5 minutes${lastRead(usage.error)}`)
     const cost = await poll(75 * 60_000, 60_000, async () => {
       const row = await billingRow(p, env, n, at)
       return row ? `${row.cells.join(' · ')} (${row.units} units counted)` : null
     })
-    if (!cost.value) throw new Failure(`usage: ${usage.value} after ${usage.seconds} s; cost: "Project Usage" did not list ${at.name} within 75 minutes`)
+    if (!cost.value) {
+      throw new Failure(`usage: ${usage.value} after ${usage.seconds} s; cost: "Project Usage" did not list ${at.name} within 75 minutes${lastRead(cost.error)}`)
+    }
     return `usage: ${usage.value} after ${usage.seconds} s; cost: "Project Usage" lists ${cost.value} after ${Math.round(cost.seconds / 60)} min`
   })
 
@@ -246,6 +266,7 @@ test('j2', async ({ browser }) => {
     if (lines.length) throw new Failure([...lines, `the Console quotes ${read}`].join('\n'))
     return `the Console quotes ${read}, as fabric bills`
   })
+  j2Returned = true
 })
 
 // The proxies' meters drop 401, 429 and 503 from billing
@@ -254,7 +275,7 @@ test('j2', async ({ browser }) => {
 // wrong key must answer 401, which is never billed.
 test('j2-401', async () => {
   test.setTimeout(2 * 60_000)
-  const run = new Run('j2-401', env.name)
+  const run = edgeRun('j2-401')
   await stepsOf(run)(`a key with its last character changed: GET ${firstCall} answers 401`, async () => {
     if (!port) throw new NotRun('J2 deployed no port')
     const key = port.key
@@ -263,7 +284,6 @@ test('j2-401', async () => {
     if (answer.status !== 401) throw new Failure(`answered ${describePortAnswer(answer)}, wanted 401`)
     return '401'
   })
-  await report(run)
 })
 
 // The Free tier limits a key to 60 requests a minute across the Blockfrost
@@ -273,7 +293,7 @@ test('j2-401', async () => {
 // may answer 5xx.
 test('j2-429', async () => {
   test.setTimeout(3 * 60_000)
-  const run = new Run('j2-429', env.name)
+  const run = edgeRun('j2-429')
   await stepsOf(run)(`bursts of 30 concurrent GET ${firstCall} answer 429, and no 5xx`, async () => {
     if (!port) throw new NotRun('J2 deployed no port')
     const answers = []
@@ -288,7 +308,6 @@ test('j2-429', async () => {
     if (!counts.has('429')) throw new Failure(`${said}; none answered 429`)
     return said
   })
-  await report(run)
 })
 
 // Two Auth0 clients on one cookie domain after the 2026-07-31 cutover: the
@@ -298,7 +317,7 @@ test('j2-429', async () => {
 // browser holding the legacy app's cookie must still reach the Console.
 test('j2-legacy-cookie', async () => {
   test.setTimeout(8 * 60_000)
-  const run = new Run('j2-legacy-cookie', env.name)
+  const run = edgeRun('j2-legacy-cookie')
   const step = stepsOf(run)
   let legacy = false
   await step(`sign in through the legacy app at ${env.website}/auth`, async () => {
@@ -339,24 +358,16 @@ test('j2-legacy-cookie', async () => {
     const landedOn = await landOnPorts(page, env)
     return `${how}, landed on /${landedOn}/ports; the browser holds ${(await cookiesNamed(page.context(), sessionCookie)).join(', ')}`
   })
-  await report(run)
 })
 
-/** Calls `read` every `everyMs` until it returns a value or `timeoutMs` passes; a failed read is retried. */
-async function poll(timeoutMs: number, everyMs: number, read: () => Promise<string | null>): Promise<{ value: string | null; seconds: number }> {
-  const t0 = performance.now()
-  let last: unknown
-  while (performance.now() - t0 < timeoutMs) {
-    try {
-      const value = await read()
-      if (value) return { value, seconds: Math.round((performance.now() - t0) / 1000) }
-    } catch (error) {
-      last = error
-    }
-    await new Promise((resolve) => setTimeout(resolve, everyMs))
-  }
-  if (last) throw last
-  return { value: null, seconds: Math.round((performance.now() - t0) / 1000) }
+/** An edge case's run, which `afterEach` reports when its test ends. */
+function edgeRun(name: string): Run {
+  const run = new Run(name, env.name)
+  runs.set(name, run)
+  return run
 }
+
+/** What a deadline message adds when the last read before it failed. */
+const lastRead = (error: string | undefined) => (error ? ` (the last read failed: ${error})` : '')
 
 const describeCard = (c: Card) => `${tierName(c.tier)} ${formatUsd(c.minimum_usd)} minimum and ${formatUsd(c.per_100k_usd)} per 100k`

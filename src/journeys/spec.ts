@@ -1,4 +1,4 @@
-import type { Locator, Page } from '@playwright/test'
+import type { Locator, Page, TestInfo } from '@playwright/test'
 import { specEnv } from '../cli/journeys.ts'
 import { type Environment, environment } from '../env.ts'
 import { Failure, formatText, type Result, type Run, writeResult } from '../report.ts'
@@ -53,6 +53,63 @@ export function browserSteps(run: Run, page: () => Page | undefined, masks: (pag
       }
     })
   }
+}
+
+/**
+ * Records on `run` how Playwright ended the test that ran it, when the test
+ * did not pass: a test that timed out, or threw outside its steps, leaves a
+ * failed step saying so. Call it from `afterEach`, which Playwright runs after
+ * a timeout too, in the same worker.
+ */
+export async function ended(run: Run, testInfo: Pick<TestInfo, 'status' | 'expectedStatus' | 'timeout' | 'error'>): Promise<void> {
+  if (testInfo.status === testInfo.expectedStatus) return
+  const how =
+    testInfo.status === 'timedOut'
+      ? `timed out after ${Math.round(testInfo.timeout / 1000)} s`
+      : `${testInfo.status ?? 'ended'}${testInfo.error ? `: ${firstLine(testInfo.error.message ?? '')}` : ''}`
+  await run.step('the test ran to its end', () => {
+    throw new Failure(`Playwright ended the test: it ${how}`)
+  })
+}
+
+/** `fn`'s result, or a `Failure` naming `what` once `ms` pass first. `fn` is left running; the caller moves on. */
+export async function within<T>(ms: number, what: string, fn: () => Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Failure(`${what} did not finish within ${Math.round(ms / 1000)} s`)), ms)
+  })
+  try {
+    return await Promise.race([fn(), late])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * Calls `read` every `everyMs` until it returns a value or `timeoutMs` passes.
+ * A read that fails is retried; the error of the last read, when it failed,
+ * comes back beside the null value, so the caller's deadline message still
+ * says what it waited for.
+ */
+export async function poll(
+  timeoutMs: number,
+  everyMs: number,
+  read: () => Promise<string | null>,
+): Promise<{ value: string | null; seconds: number; error?: string }> {
+  const t0 = performance.now()
+  const seconds = () => Math.round((performance.now() - t0) / 1000)
+  let error: string | undefined
+  while (performance.now() - t0 < timeoutMs) {
+    try {
+      const value = await read()
+      if (value) return { value, seconds: seconds() }
+      error = undefined
+    } catch (thrown) {
+      error = thrown instanceof Failure ? thrown.message : firstLine(thrown)
+    }
+    await new Promise((resolve) => setTimeout(resolve, everyMs))
+  }
+  return { value: null, seconds: seconds(), ...(error === undefined ? {} : { error }) }
 }
 
 const reported: Result[] = []

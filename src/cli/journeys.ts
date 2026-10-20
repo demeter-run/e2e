@@ -75,7 +75,9 @@ function missing(name: string, env: string, code: number): Result {
  * `pnpm journey`: runs one journey's spec, reads its results, prints them,
  * appends the job summary and, with `--alert`, alerts on failures. Returns the
  * exit code: 0 when every result passed, 1 when one failed or is missing, 2 on
- * a usage error.
+ * a usage error. 0 and 1 are the only codes that reported the run; the entry
+ * point (`journey.ts`) exits 3 on a break outside it. A workflow alerts on the
+ * others itself (`.github/workflows/j2.yml`).
  */
 export async function main(
   argv: string[],
