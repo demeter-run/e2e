@@ -1,6 +1,6 @@
 import { rmSync } from 'node:fs'
 import { appendFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { constants, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type Browser, type BrowserContext, chromium } from '@playwright/test'
 import type { Environment } from '../env.ts'
@@ -20,6 +20,7 @@ import {
   register,
   type Secrets,
 } from './client.ts'
+import { addCookieSecrets, type ConsoleWaits, consoleWaits, deleteClaimed, firstLine, pageAnswer, said } from './console.ts'
 
 /**
  * J0, the coding agent's main journey (`solution/devex/contracts/
@@ -33,6 +34,18 @@ import {
  * never printed, and removed at the end, or on SIGINT or SIGTERM.
  */
 
+/** How long J0 waits, and how often it tries again; the tests shorten them. */
+export interface J0Waits extends ConsoleWaits {
+  /** For the port to answer its first request, while it comes up. */
+  firstRequestMs: number
+  /** Between requests to the port. */
+  requestEveryMs: number
+  /** For each page, form and button of the claim in the browser. */
+  browserMs: number
+}
+
+export const j0Waits: J0Waits = { ...consoleWaits, firstRequestMs: 180_000, requestEveryMs: 5_000, browserMs: 30_000 }
+
 export interface J0Options {
   env: Environment
   run: Run
@@ -45,8 +58,7 @@ export interface J0Options {
    * registration: the contract tests, so a production run registers once.
    */
   between?: (registration: Registration) => Promise<void>
-  /** How long the port may take to answer its first request. */
-  firstRequestMs?: number
+  waits?: Partial<J0Waits>
 }
 
 const AGENT = { name: 'e2e-j0', url: 'https://github.com/demeter-run/e2e' }
@@ -60,29 +72,6 @@ const fail = (message: string): never => {
 
 const seconds = (ms: number) => `${(ms / 1000).toFixed(1)} s`
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
-/**
- * The browser's cookies, for `Secrets`: a Playwright error's call log
- * carries the request's `cookie:` header, the Console session included.
- * Short values (flags, `Lax`) are not credentials.
- */
-async function addCookieSecrets(context: BrowserContext, secrets: Secrets): Promise<void> {
-  for (const cookie of await context.cookies()) if (cookie.value.length >= 16) secrets.add('session cookie', cookie.value)
-}
-
-/**
- * A Playwright call that may fail with its call log (request headers, the
- * cookie among them): the step keeps the first line, scrubbed.
- */
-async function guarded<T>(secrets: Secrets, what: string, fn: () => Promise<T>): Promise<T> {
-  try {
-    return await fn()
-  } catch (error) {
-    return fail(secrets.scrub(`${what}: ${(error as Error).message.split('\n')[0]}`))
-  }
-}
-
 /**
  * Requests `url` with the port's key until it answers 2xx or `withinMs` runs
  * out, `everyMs` apart. `retry` says which answers are worth another try:
@@ -93,7 +82,8 @@ async function request(url: string, key: string, withinMs: number, everyMs: numb
   const t0 = performance.now()
   const statuses: (number | null)[] = []
   for (;;) {
-    const answer = await call('GET', `${url}${REQUEST_PATH}`, { headers: { 'dmtr-api-key': key }, timeoutMs: 15_000 })
+    // A `_URL` may end in a slash (the mock's does), and the path is appended to it.
+    const answer = await call('GET', `${url.replace(/\/+$/, '')}${REQUEST_PATH}`, { headers: { 'dmtr-api-key': key }, timeoutMs: 15_000 })
     statuses.push(answer.status)
     const elapsed = performance.now() - t0
     if (answer.status !== null && answer.status >= 200 && answer.status < 300) return { answer, statuses, elapsed }
@@ -107,10 +97,17 @@ async function request(url: string, key: string, withinMs: number, everyMs: numb
 /** Origin and path of a URL a step may print; a key in the host or path is scrubbed by the caller. */
 const where = (url: string) => {
   const u = new URL(url)
-  return `${u.origin}${u.pathname}`
+  return `${u.origin}${u.pathname.replace(/\/+$/, '')}`
 }
 
-export async function j0({ env, run, secrets, user, password, between, firstRequestMs = 180_000 }: J0Options): Promise<void> {
+/** Where the browser is, as a step may print it: origin and path, with a claim link's token left out. */
+const browserAt = (url: string) => {
+  const u = new URL(url)
+  return u.protocol === 'http:' || u.protocol === 'https:' ? `${u.origin}${u.pathname.replace(/^\/claim\/.*/, '/claim/<token>')}` : u.protocol
+}
+
+export async function j0({ env, run, secrets, user, password, between, waits: shorter = {} }: J0Options): Promise<void> {
+  const waits = { ...j0Waits, ...shorter }
   const onMock = env.name === 'mock'
   const dir = await mkdtemp(join(tmpdir(), 'e2e-j0-'))
   const envFile = join(dir, '.env.demeter')
@@ -131,11 +128,13 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
   /** Positions in the mock's call log around `between`, whose calls are not J0's. */
   let skip: [number, number] | undefined
 
-  // A cancelled run skips `finally`: the .env.demeter goes before the signal
-  // takes its default course.
+  // A cancelled run skips `finally`: the .env.demeter goes, then the process.
+  // It exits rather than raising the signal again, which the listeners
+  // Playwright adds once Chromium runs (and tsx's) would absorb, so the run
+  // would go on with its browser closed.
   const onSignal = (signal: NodeJS.Signals) => {
     rmSync(dir, { recursive: true, force: true })
-    process.kill(process.pid, signal)
+    process.exit(128 + (constants.signals[signal] ?? 0))
   }
   process.once('SIGINT', onSignal)
   process.once('SIGTERM', onSignal)
@@ -147,7 +146,8 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
       const t0 = performance.now()
       registration.register = await register(env, AGENT)
       const answer = registration.register
-      if (answer.status !== 200) fail(`register answered ${describe(answer)}, wanted 200`)
+      // A 200 whose body did not finish registered a project this run cannot use.
+      if (answer.status !== 200 || answer.error) fail(`register answered ${describe(answer)}, wanted 200`)
       const got = dotenvVars(answer.body)
       addRegistrationSecrets(secrets, answer.body)
       await writeFile(envFile, answer.body, { mode: 0o600 })
@@ -164,7 +164,7 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
       const t0 = performance.now()
       registration.port = await createPort(env, { apiKey, projectId }, { ...J0_PORT })
       const answer = registration.port
-      if (answer.status !== 200) fail(`ports answered ${describe(answer)}, wanted 200`)
+      if (answer.status !== 200 || answer.error) fail(`ports answered ${describe(answer)}, wanted 200`)
       addPortSecrets(secrets, answer.body)
       await appendFile(envFile, answer.body)
       portId = (await vars()).get(`${PREFIX}_PORT_ID`) ?? ''
@@ -187,7 +187,7 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
 
     await run.step(`request ${PREFIX}_URL with ${PREFIX}_KEY until it answers 2xx`, async () => {
       const { url, key } = await port()
-      const { answer, statuses, elapsed } = await request(url, key, firstRequestMs, 5_000, () => true)
+      const { answer, statuses, elapsed } = await request(url, key, waits.firstRequestMs, waits.requestEveryMs, () => true)
       firstStatuses.push(...statuses)
       return `${where(url)}${REQUEST_PATH}: ${answer.status} after ${seconds(elapsed)} and ${statuses.length} attempt${statuses.length === 1 ? '' : 's'}`
     })
@@ -201,14 +201,27 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
       const t0 = performance.now()
       browser = await chromium.launch()
       context = await browser.newContext()
+      const session = context
       const page = await context.newPage()
+      page.setDefaultTimeout(waits.browserMs)
+      // How the last page the browser loaded answered, for an error: a page
+      // that answers 500 shows no button, and the wait for one says only that.
+      let loaded: number | undefined
+      page.on('response', (response) => {
+        try {
+          if (response.request().isNavigationRequest() && response.frame() === page.mainFrame()) loaded = response.status()
+        } catch {
+          // A service worker's response has no frame.
+        }
+      })
       try {
-        await page.goto(claimUrl, { waitUntil: 'domcontentloaded' })
+        const opened = await page.goto(claimUrl, { waitUntil: 'domcontentloaded' })
+        if (opened?.status() !== 200) fail(`the claim page answered ${opened?.status() ?? 'nothing'}, wanted 200`)
         await page.getByRole('link', { name: 'Log in' }).click()
-        await signIn(page, user, password, { origin: env.auth0 })
+        await signIn(page, user, password, { origin: env.auth0, timeoutMs: waits.browserMs })
         await addCookieSecrets(context, secrets)
         const claim = page.getByRole('button', { name: 'Claim project' })
-        await claim.waitFor({ timeout: 30_000 })
+        await claim.waitFor()
         // The name is read once the page has hydrated, which may change it, and
         // left as it is: the next step judges it, so a wrong default does not
         // stop the claim (the Console names a project left empty after its
@@ -217,18 +230,21 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
         offeredName = await page.locator('input[name="name"]').inputValue()
         claimSent = true
         await claim.click()
-        await page.waitForURL((url) => url.pathname === `/${namespace}/ports`, { timeout: 30_000 })
+        await page.waitForURL((url) => url.pathname === `/${namespace}/ports`)
+        // Reaching the page is not owning the project: a claim that failed
+        // can land there on an error page. Its loader must answer the user.
+        const landing = await pageAnswer(session.request, `${env.console}/${namespace}/ports`, secrets)
+        if (landing.status !== 200) fail(`landed on /${namespace}/ports, but it answered ${said(landing)} to ${user}'s session, wanted 200: the claim is unconfirmed`)
         claimed = true
       } catch (error) {
         if (error instanceof Failure) throw error
         // A Playwright error carries a call log and URLs with their queries
         // (Auth0's state); the first line and where the browser was are enough.
-        // Either may hold the claim URL, so neither leaves unscrubbed.
-        if (context) await addCookieSecrets(context, secrets).catch(() => {})
-        const here = new URL(page.url())
-        fail(secrets.scrub(`${(error as Error).message.split('\n')[0]} (the browser was at ${here.origin}${here.pathname})`))
+        await addCookieSecrets(session, secrets).catch(() => {})
+        const last = loaded === undefined ? '' : `, where the last page it loaded answered ${loaded}`
+        fail(`${firstLine(secrets, error)} (the browser was at ${secrets.scrub(browserAt(page.url()))}${last})`)
       }
-      return `claimed ${namespace} and landed on /${namespace}/ports in ${seconds(performance.now() - t0)}`
+      return `claimed ${namespace} and landed on /${namespace}/ports, which answers ${user} 200, in ${seconds(performance.now() - t0)}`
     })
 
     await run.step('the claim page offered the namespace as the project name', async () => {
@@ -241,7 +257,7 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
       if (!claimed) fail('not run: the claim did not land, so no request comes after it')
       const { url, key } = await port()
       // The port is up: only a missing or 5xx answer is worth another try.
-      const { answer, statuses, elapsed } = await request(url, key, 30_000, 5_000, (a) => a.status === null || a.status >= 500)
+      const { answer, statuses, elapsed } = await request(url, key, 30_000, waits.requestEveryMs, (a) => a.status === null || a.status >= 500)
       laterStatuses.push(...statuses)
       return `${answer.status} after ${seconds(elapsed)} and ${statuses.length} attempt${statuses.length === 1 ? '' : 's'}`
     })
@@ -261,7 +277,8 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
           'POST /login 302',
           'GET /claim/[redacted] 200', // signed in: the claim form
           'POST /claim/[redacted] 302',
-          `GET /${namespace}/ports 200`,
+          `GET /${namespace}/ports 200`, // the landing
+          `GET /${namespace}/ports 200`, // its check, outside the browser
           ...data(laterStatuses),
         ]
         if (got.join('\n') !== want.join('\n')) fail(`the mock logged:\n${got.join('\n')}\nwanted:\n${want.join('\n')}`)
@@ -270,85 +287,16 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
     } else {
       await run.step('delete the claimed project through the Console', async () => {
         const registered = registration.register
-        if (registered.status !== 200) {
-          // A refusal registered nothing; a timeout or a 5xx may have, without
-          // handing its credentials over.
-          return registered.status !== null && registered.status < 500
+        if (registered.status !== 200 || registered.error) {
+          // A refusal registered nothing; a timeout, a 5xx or a 200 cut short
+          // may have, without handing its credentials over.
+          return registered.status !== null && registered.status !== 200 && registered.status < 500
             ? `register answered ${describe(registered)}: nothing was registered, so nothing is left behind`
             : `register answered ${describe(registered)}: a project may have been registered without this run learning it, and if so it expires unclaimed within 7 days`
         }
-        if (!namespace) fail('register answered 200 but named no namespace, so nothing can be deleted')
+        if (!namespace) fail('register answered 200 but named no namespace: its project cannot be found, and expires unclaimed within 7 days')
         if (!claimSent || !context) fail(`${namespace} was never claimed: it expires unclaimed at ${expiresAt}`)
-        const session = context!
-        await addCookieSecrets(session, secrets)
-        const portsPage = `${env.console}/${namespace}/ports`
-        const get = (url: string) => guarded(secrets, `GET ${new URL(url).pathname}`, () => session.request.get(url, { maxRedirects: 0 }))
-        const redirectedTo = (answer: { headers(): Record<string, string> }) => new URL(answer.headers().location ?? '/', env.console).pathname
-
-        // The project must be the test user's to be deleted. A claim whose
-        // landing failed may still have gone through: it gets the landing's time.
-        if (!claimed) {
-          const t0 = performance.now()
-          for (;;) {
-            const page = await get(portsPage)
-            if (page.status() === 200) break
-            if (performance.now() - t0 > 30_000) {
-              fail(
-                `the claim was sent, but /${namespace}/ports answered ${page.status()} for the next 30 s: if the claim went through, ${namespace} is on ${user}'s account and needs deleting by hand; if not, it expires unclaimed at ${expiresAt}`,
-              )
-            }
-            await sleep(3_000)
-          }
-        }
-
-        // The settings page's DELETE button posts this form. Its action answers
-        // a redirect once fabric has taken the delete: to the user's next
-        // project, or to /, whose loader creates "My First Project" for a user
-        // left with none, so the redirect is not followed. A redirect to /login
-        // means the session was refused. A 200 is the action reporting an
-        // error, a 5xx one of its own (fabric's projection may lag the claim),
-        // and a lost answer says nothing: each is tried again, unless the
-        // project's page has stopped loading meanwhile, when the delete went
-        // through without its answer.
-        const settings = `${env.console}/${namespace}/settings`
-        let accepted = ''
-        for (let attempt = 1; !accepted; attempt++) {
-          let answered: string
-          try {
-            const answer = await session.request.post(settings, { form: { intent: 'DELETE_PROJECT' }, maxRedirects: 0 })
-            const to = answer.status() === 302 ? redirectedTo(answer) : ''
-            if (to.startsWith('/login')) fail(`POST /${namespace}/settings redirected to ${to}: the Console refused the session, so ${namespace} is still on ${user}'s account`)
-            if (to) {
-              accepted = `302 to ${to}${attempt > 1 ? ` on attempt ${attempt}` : ''}`
-              break
-            }
-            answered = String(answer.status())
-          } catch (error) {
-            if (error instanceof Failure) throw error
-            answered = secrets.scrub((error as Error).message.split('\n')[0]!)
-          }
-          await sleep(5_000)
-          const page = await get(portsPage)
-          if (page.status() !== 200 && page.status() !== 302) accepted = `${answered} on attempt ${attempt}, then /${namespace}/ports answered ${page.status()}`
-          else if (attempt === 3) fail(`POST /${namespace}/settings answered ${answered} on the last of 3 attempts, wanted a redirect after the delete: ${namespace} is still on ${user}'s account`)
-        }
-
-        // fabric deletes on its event stream: the project leaves the Console a
-        // moment later, and its pages stop loading (fabric no longer knows the
-        // namespace, and the Console answers 500). Two such answers in a row,
-        // so one passing error is not taken for the delete.
-        const t0 = performance.now()
-        let gone = 0
-        for (;;) {
-          const page = await get(portsPage)
-          if (page.status() === 302) {
-            fail(`deleted (${accepted}), but /${namespace}/ports then redirected to ${redirectedTo(page)}, so the session cannot confirm the project is gone`)
-          }
-          gone = page.status() === 200 ? 0 : gone + 1
-          if (gone === 2) return `deleted (${accepted}); /${namespace}/ports answers ${page.status()} twice in a row after ${seconds(performance.now() - t0)}`
-          if (performance.now() - t0 > 60_000) fail(`deleted (${accepted}), but /${namespace}/ports still loads after 60 s`)
-          await sleep(3_000)
-        }
+        return deleteClaimed({ console: env.console, namespace, expiresAt, user, session: context!.request, secrets, landed: claimed }, waits)
       })
     }
     await browser?.close()

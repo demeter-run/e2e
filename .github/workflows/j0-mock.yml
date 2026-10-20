@@ -1,9 +1,10 @@
 name: j0-mock
 
 # J0 and the whole agent contract suite against the agent-route mock
-# (src/mock/), on every pull request and push to main. Nothing here reaches
-# production or signs in as the test user. Report-only: nothing here is a
-# required status.
+# (src/mock/), and the tests that need a browser (test/browser/: J0's claim
+# and delete against a stand-in Console, and the sign-in form filler), on
+# every pull request and push to main. Nothing here reaches production or
+# signs in as the test user. Report-only: nothing here is a required status.
 #
 # The same contract tests run against production in agent-j0-probe.yml, so a
 # mock that drifts from the contract fails here, and a production that drifts
@@ -36,6 +37,10 @@ jobs:
 
       - name: Install Chromium
         run: pnpm exec playwright install --with-deps --only-shell chromium
+
+      # The unit job installs no browser.
+      - name: Browser tests
+        run: pnpm test:browser
 
       # The mock keeps running for the job's later steps.
       - name: Start the mock

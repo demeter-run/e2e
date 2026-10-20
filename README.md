@@ -229,7 +229,9 @@ message, retry_after_seconds?, docs}`, both `Cache-Control: no-store`, with
 production's messages. The contract defines `POST` only: the mock answers any
 other method on the two agent routes `405 invalid_request`, as production
 does for every method but `GET` and `HEAD`, which production's framework
-answers `400` in plain text. No test reads either. Credentials take the contract's formats:
+(Remix) answers `400` with its own JSON, `{"message": "Unexpected Server
+Error"}`, with no code, no `docs` and no `Cache-Control`. No test reads
+either. Credentials take the contract's formats:
 `dmtr_apikey1…` keys, 32-byte base64url claim tokens, `XXXX-XXXX` user codes
 from the contract's alphabet, expiry 7 days ahead in RFC 3339 UTC. The port
 catalog (which kinds exist, and which networks each offers) is fabric's,
@@ -237,7 +239,10 @@ copied into `src/mock/catalog.ts` with its date.
 
 ### Control routes
 
-Under `/__mock/`, never on a contract path, and not logged:
+Under `/__mock/`, never on a contract path, and not logged. A `POST` must be
+`Content-Type: application/json` (anything else is `415`), which a page on
+another site cannot send, so a page open in the same browser cannot switch
+states or reset the mock under a run:
 
 | Route | Body | Effect |
 | --- | --- | --- |
@@ -249,9 +254,9 @@ Under `/__mock/`, never on a contract path, and not logged:
 | `POST /__mock/reset` | | forgets every project, session, error state and call |
 
 ```sh
-curl -s -X POST localhost:4010/__mock/state -d '{"route": "register", "error": "ip_cap", "retry_after_seconds": 600}'
+curl -s localhost:4010/__mock/state -H 'content-type: application/json' -d '{"route": "register", "error": "ip_cap", "retry_after_seconds": 600}'
 curl -s localhost:4010/__mock/calls | jq '.[] | "\(.method) \(.path) \(.status)"'
-curl -s -X POST localhost:4010/__mock/reset -d '{}'
+curl -s localhost:4010/__mock/reset -H 'content-type: application/json' -d '{}'
 ```
 
 A handler error answers `500 mock_error` and is written to the mock's
@@ -264,8 +269,10 @@ instead of production: an agent given `E2E_MOCK_URL` as its Console registers,
 creates ports, requests them and hands over a claim link exactly as the
 contract says, and the call log shows what it did. Error states put it on the
 paths production rarely takes (caps, the kill switch, an expired project).
-Because the contract suite below runs against both the mock and production,
-a mock that no longer behaves like production fails a run.
+The contract suite's prod-safe tests below run against both the mock and
+production, so a mock that no longer behaves like production on those rules
+fails a run. The mock-only rules (the caps, the kill switch, expiry) are
+held to the contract alone: production's behaviour there is never compared.
 
 ## The agent contract suite
 
@@ -322,31 +329,35 @@ It takes `--alert`, `--force-fail` and `--results` as `pnpm check` does, and
 
 1. register as agent `e2e-j0` and write the body to `.env.demeter`, in a
    fresh temporary directory readable by this user only, never printed and
-   removed at the end (or on `SIGINT` or `SIGTERM`);
+   removed at the end (or on `SIGINT` or `SIGTERM`, which end the run with
+   exit 130 or 143); a `200` whose body did not finish fails the step;
 2. create a Blockfrost port (`BlockfrostPort`) on `cardano-preprod` and
    append its body; the contract tests run here, on this registration;
 3. `GET <_URL>/blocks/latest` with `dmtr-api-key: <_KEY>` until it answers
    2xx, every 5 s for up to 3 minutes while the port comes up;
 4. claim in Chromium: open `DEMETER_CLAIM_URL`, only when it is on the
-   environment's Console, "Log in", sign in (the mock's form as any user, or
-   Auth0 as `e2e@txpipe.io`; nothing is typed unless the form is on the
-   environment's sign-in origin), "Claim project" with the project name as
-   the page offers it, and land on `/<namespace>/ports`. A step of its own
-   then checks the name offered was the namespace, so a wrong default fails
-   that step without stopping the claim;
+   environment's Console and only to a `200`, "Log in", sign in (the mock's
+   form as any user, or Auth0 as `e2e@txpipe.io`; nothing is typed unless
+   the form is on the environment's sign-in origin), "Claim project" with
+   the project name as the page offers it, and land on
+   `/<namespace>/ports`, which must then answer the test user's session
+   `200` outside the browser: a failed claim can land there on an error
+   page. A step of its own then checks the name offered was the namespace,
+   so a wrong default fails that step without stopping the claim;
 5. the same request with the same key still answers 2xx;
 6. on production, delete the claimed project through the Console, pass or
    fail. A claim whose landing failed may still have gone through, so once
    "Claim project" was pressed, the step waits up to 30 s for the project's
-   page to load for the test user, and deletes it if it does. The delete
+   page to answer the test user `200`, and deletes it if it does. The delete
    posts the settings page's form without following its redirect to `/`,
-   which would create "My First Project" for a user left with none. A
-   redirect elsewhere means fabric took the delete; a redirect to `/login`
-   fails the step (the session was refused); a 200, a 5xx or a lost answer
-   is tried again, up to 3 times, unless the project's page has stopped
-   loading meanwhile. The step then waits until the project's page fails to
-   load twice in a row, 3 s apart, which is how a deleted namespace answers.
-   What it cannot delete it names, with whether it is on the test user's
+   which would create "My First Project" for a user left with none. Only a
+   redirect counts as the delete, as fabric has taken it by then; a redirect
+   to `/login` fails the step (the session was refused). A 200, a 5xx or a
+   lost answer is tried again, up to 3 times 5 s apart, and then fails the
+   step as unconfirmed. After the redirect the step waits until the
+   project's page fails to load twice in a row, 3 s apart, which is how a
+   deleted namespace answers; a lost answer counts for neither. What it
+   cannot delete it names, with whether it may be on the test user's
    account or expires unclaimed. On the mock instead, the call log holds
    exactly the calls steps 1–5 made.
 
@@ -357,9 +368,11 @@ every detail is scrubbed before it is written anyway, and a browser error
 keeps only its first line, as its call log carries request headers. In
 GitHub Actions each credential is also masked in the job log as it arrives.
 
-Without `E2E_USER_PASSWORD` off the mock, J0 registers nothing (a project
-nobody claims would stay behind for 7 days) and its one step fails, so the
-probe's result and alert say so. A run that breaks outside its steps exits 3,
+Without `E2E_USER_PASSWORD` off the mock (unset or empty, as Actions passes
+a missing secret), J0 registers nothing (a project nobody claims would stay
+behind for 7 days) and its one step fails, so the probe's result and alert
+say so. On the mock it types `mock` as the password whatever
+`E2E_USER_PASSWORD` holds, as the mock's form may sit on another machine. A run that breaks outside its steps exits 3,
 and a usage error exits 2.
 
 ### What the probe does in production
@@ -375,9 +388,11 @@ the standing test user only, in the browser.
 
 What outlives the run: each claim makes fabric create a billing (Stripe)
 customer for the test user, which deleting the project does not remove, so
-the test user's billing account gains one customer a day. A run cancelled
-after its claim, or whose delete fails, leaves the claimed project on the
-test user's account until someone deletes it; both alert.
+the test user's billing account gains one customer per run: one a day, and
+one for each pull-request run. A run cancelled after its claim, or whose
+delete fails, leaves the claimed project on the test user's account until
+someone deletes it. Scheduled and dispatched runs of main alert on both; a
+pull request's run has no webhook, so it shows only in its checks.
 
 The prod-safe contract tests send requests the Console refuses, apart from
 the 65-character name: should production ever accept it, that run leaves one
@@ -418,6 +433,7 @@ journeys go under `journeys/`, run by `playwright.config.ts`.
 ```sh
 pnpm test
 pnpm typecheck
+pnpm test:browser     # needs Chromium: pnpm exec playwright install chromium
 ```
 
 The readers are tested on responses and pages captured from production, and
@@ -434,8 +450,20 @@ a renamed or reordered dotenv line, a body in another form, a cacheable
 answer, an error's status or code alone, a non-JSON error, a moved docs link,
 an echoed key, a short claim token, a wrong expiry or `Retry-After`, a
 catalog that lost or gained a kind, and a credential that reaches a result,
-which the leak step must fail. Each makes the suite fail. So no unit test
-reaches production. J0's browser steps run in `j0-mock.yml`.
+which the leak step must fail. Each makes the suite fail. So does each value,
+header and line the contract fixes, drifting alone. J0's delete runs against
+a stand-in Console answering each way production may (a redirect, `/login`,
+an error page, a lost answer, a fabric outage on both routes), and J0 itself
+up to the browser against registrations that fail or are cut short. So no
+unit test reaches production.
+
+`pnpm test:browser` (`test/browser/`) drives Chromium: J0 against a stand-in
+Console (the mock behind a proxy that adds the settings form's delete),
+whole and with one thing broken at a time (a claim page that answers 500, a
+claim that lands without ownership, an empty default name, a reset on the
+check after the landing, `SIGTERM` while Chromium runs), and the sign-in form
+filler against Auth0's two screens and forms on another origin. `j0-mock.yml`
+runs them, and J0 on the mock.
 
 ## Workflows
 
@@ -458,10 +486,10 @@ reaches production. J0's browser steps run in `j0-mock.yml`.
   what failed.
 
 `.github/workflows/j0-mock.yml` runs on `pull_request` and on `push` to
-`main`: it starts the mock, runs `pnpm j0 --env mock --contract all`,
-uploads the results and the mock's (redacted) call log, and prints the
-mock's log, failing the job when it holds a handler error. Nothing in it
-reaches production.
+`main`: it runs `pnpm test:browser`, starts the mock, runs `pnpm j0 --env
+mock --contract all`, uploads the results and the mock's (redacted) call
+log, and prints the mock's log, failing the job when it holds a handler
+error. Nothing in it reaches production.
 
 `.github/workflows/agent-j0-probe.yml` runs `pnpm j0 --env production
 --contract prod-safe`:
@@ -471,22 +499,26 @@ reaches production.
   `e2e-agent-contract`). Only runs of `main` receive the webhook;
 - on pull requests from this repository that change the probe (its
   workflow, `src/agent/`, the agent CLI, `src/mock/catalog.ts`,
-  `src/signin.ts`, `src/env.ts`, `src/report.ts`, the package files), with
+  `src/signin.ts`, `src/env.ts`, `src/report.ts`, `.nvmrc`, the package and
+  workspace files), with
   no alert, so a change is proven against production before it merges. A
   dispatch needs the workflow on `main`: GitHub dispatches no workflow that
   the default branch does not have.
 
 When the probe reports nothing, a `curl` and `jq` job posts one alert, as
-`contracts.yml` does: `e2e-agent-j0-setup` when a step before J0 failed
-(checkout, install or Chromium) or J0 exited with no result (a usage error,
-or a break outside its steps), and `e2e-agent-j0-cancelled` when the job was
-cancelled (its 20 minutes ran out, a newer run took its place in the
-concurrency group, or someone cancelled it), since a claimed project may
-then be left on the test user's account.
+`contracts.yml` does: `e2e-agent-j0-setup` when the job failed before J0
+reported (its set-up or runner, the checkout, install or Chromium, or J0
+exiting with no result: a usage error, or a break outside its steps), and
+`e2e-agent-j0-cancelled` when the job was cancelled (its 30 minutes ran out,
+or someone cancelled it), since a claimed project may then be left on the
+test user's account.
 
 Any job that signs in as the standing test user sets the concurrency group
 `production-test-user` (`cancel-in-progress: false`), so no two runs use the
-user at once. The probe does.
+user at once. The probe does, with `queue: max`: by default a newer job in
+the group cancels the one pending, which would lose the day's probe to a
+pull request's run. The probe's third-party action (`pnpm/action-setup`) is
+pinned by commit, as that job holds the test user's password.
 
 ### Secrets
 

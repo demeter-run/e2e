@@ -13,7 +13,10 @@ import * as pages from './pages.ts'
  * data plane, `/data/<port id>/`.
  *
  * Control routes live under `/__mock/`, never on a contract path, and are not
- * logged:
+ * logged. A `POST` to one must be `Content-Type: application/json`, which a
+ * page on another site cannot send without a preflight the mock never
+ * grants, so a page open in the same browser cannot switch states or reset
+ * the mock under a run:
  *
  * - `POST /__mock/state` with `{"route": "register" | "ports", "error": <code>
  *   | null, "retry_after_seconds"?: <int>}` makes every call to that route
@@ -317,7 +320,7 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
     const prefix = variablePrefix(canonical, network)
     sendDotenv(response, [
       [`${prefix}_PORT_ID`, port.id],
-      [`${prefix}_URL`, `${base}/data/${port.id}`],
+      [`${prefix}_URL`, `${base}/data/${port.id}/`],
       [`${prefix}_KEY`, port.key],
     ])
   }
@@ -405,6 +408,10 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
   }
 
   async function control(request: IncomingMessage, response: ServerResponse, path: string) {
+    if (request.method === 'POST' && !/^application\/json\s*(;|$)/i.test(request.headers['content-type'] ?? '')) {
+      request.resume()
+      return sendJson(response, 415, { error: 'a control route takes Content-Type: application/json' })
+    }
     if (path === '/__mock/calls' && request.method === 'GET') return sendJson(response, 200, state.calls)
     if (path === '/__mock/state' && request.method === 'GET') return sendJson(response, 200, snapshot())
     if (path === '/__mock/reset' && request.method === 'POST') {
@@ -466,7 +473,8 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
     if (path === '/api/agent/register' || path === '/api/agent/ports') {
       // The contract defines POST only. Production answers another method
       // with this 405, except GET and HEAD, which never reach its action:
-      // Remix answers those 400 in plain text, which no test reads.
+      // Remix answers those 400 with its own JSON, `{"message": "Unexpected
+      // Server Error"}` (no code, no docs, no Cache-Control), which no test reads.
       if (request.method !== 'POST') return agentError(response, 'invalid_request', { message: 'Use POST with a JSON body.', status: 405 })
       return path === '/api/agent/register' ? register(request, response) : createPort(request, response)
     }

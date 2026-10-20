@@ -84,14 +84,16 @@ describe('the mock: register', () => {
 })
 
 describe('the mock: ports', () => {
-  it('answers _PORT_ID, _URL and _KEY, and the URL answers with the key and refuses without it', async () => {
+  it('answers _PORT_ID, _URL (ending in a slash) and _KEY, and the URL answers with the key and refuses without it', async () => {
     const { credentials } = await registered()
     const answer = await createPort(env, credentials, BLOCKFROST)
     assert.equal(answer.status, 200)
     assert.equal(answer.headers['cache-control'], 'no-store')
     assert.deepEqual(names(answer.body), ['DEMETER_BLOCKFROST_PREPROD_PORT_ID', 'DEMETER_BLOCKFROST_PREPROD_URL', 'DEMETER_BLOCKFROST_PREPROD_KEY'])
     const vars = dotenvVars(answer.body)
-    const url = `${vars.get('DEMETER_BLOCKFROST_PREPROD_URL')}/blocks/latest`
+    assert.equal(vars.get('DEMETER_BLOCKFROST_PREPROD_URL'), `${mock.url}/data/${vars.get('DEMETER_BLOCKFROST_PREPROD_PORT_ID')}/`)
+    // A path resolved against _URL stays under the port, as on production.
+    const url = new URL('blocks/latest', vars.get('DEMETER_BLOCKFROST_PREPROD_URL')).href
     assert.equal(url, `${mock.url}/data/${vars.get('DEMETER_BLOCKFROST_PREPROD_PORT_ID')}/blocks/latest`)
     assert.equal((await call('GET', url, { headers: { 'dmtr-api-key': vars.get('DEMETER_BLOCKFROST_PREPROD_KEY')! } })).status, 200)
     assert.equal((await call('GET', url, { headers: { 'dmtr-api-key': credentials.apiKey } })).status, 401)
@@ -177,7 +179,7 @@ describe('the mock: error states', () => {
     const port = dotenvVars((await createPort(env, credentials, BLOCKFROST)).body)
     await setMockState(env, { project: vars.get('DEMETER_PROJECT_NAMESPACE')!, expired: true })
     assert.deepEqual(codeOf(await createPort(env, credentials, BLOCKFROST)), [410, 'expired'])
-    const url = `${port.get('DEMETER_BLOCKFROST_PREPROD_URL')}/blocks/latest`
+    const url = new URL('blocks/latest', port.get('DEMETER_BLOCKFROST_PREPROD_URL')).href
     assert.equal((await call('GET', url, { headers: { 'dmtr-api-key': port.get('DEMETER_BLOCKFROST_PREPROD_KEY')! } })).status, 401)
     const visit = browser()
     await visit('POST', '/login', { username: 'alice', password: 'x' })
@@ -190,6 +192,22 @@ describe('the mock: error states', () => {
     assert.equal((await post({ route: 'register', error: 'ip_cap', retry_after_seconds: 0 })).status, 400)
     assert.equal((await post({ project: 'nope', expired: true })).status, 404)
     assert.equal((await post({})).status, 400)
+  })
+})
+
+describe('the mock: control routes', () => {
+  it('refuses a post that is not JSON, as a page on another site would send it, and changes nothing', async () => {
+    await setMockState(env, { route: 'register', error: 'ip_cap' })
+    for (const type of ['text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data; boundary=x', 'application/jsonp']) {
+      for (const path of ['/__mock/reset', '/__mock/state']) {
+        const answer = await call('POST', `${mock.url}${path}`, { headers: { 'content-type': type }, body: '{"route": "register", "error": null}' })
+        assert.equal(answer.status, 415, `${path} as ${type}`)
+      }
+    }
+    assert.deepEqual((await mockState(env)).errors, { register: { error: 'ip_cap' } })
+    const json = await call('POST', `${mock.url}/__mock/reset`, { headers: { 'content-type': 'application/json; charset=utf-8' }, body: '{}' })
+    assert.equal(json.status, 200)
+    assert.deepEqual((await mockState(env)).errors, {})
   })
 })
 
@@ -219,7 +237,7 @@ describe('the mock: claim pages', () => {
     assert.match((await visit('GET', claim)).body, /This link has expired or was already used/)
 
     // Owned now: the key keeps working, and the pre-claim port cap is gone.
-    const url = `${port.get('DEMETER_BLOCKFROST_PREPROD_URL')}/blocks/latest`
+    const url = new URL('blocks/latest', port.get('DEMETER_BLOCKFROST_PREPROD_URL')).href
     assert.equal((await call('GET', url, { headers: { 'dmtr-api-key': port.get('DEMETER_BLOCKFROST_PREPROD_KEY')! } })).status, 200)
     for (let i = 0; i < 3; i++) assert.equal((await createPort(env, credentials, BLOCKFROST)).status, 200)
   })
@@ -300,7 +318,7 @@ describe('the mock: control routes', () => {
     await visit('GET', new URL(vars.get('DEMETER_CLAIM_URL')!).pathname)
     await visit('GET', `/activate?code=${vars.get('DEMETER_USER_CODE')!.toLowerCase().replace('-', '')}`)
     await visit('POST', '/login', { username: 'alice', password: 'hunter22' })
-    await call('GET', `${port.get('DEMETER_BLOCKFROST_PREPROD_URL')}/x`, { headers: { 'dmtr-api-key': port.get('DEMETER_BLOCKFROST_PREPROD_KEY')! } })
+    await call('GET', new URL('x', port.get('DEMETER_BLOCKFROST_PREPROD_URL')).href, { headers: { 'dmtr-api-key': port.get('DEMETER_BLOCKFROST_PREPROD_KEY')! } })
 
     const calls = await mockCalls(env)
     assert.deepEqual(

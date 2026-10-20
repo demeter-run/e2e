@@ -143,7 +143,11 @@ test("register's values have the contract's formats", 'prod-safe', async (ctx) =
   const vars = dotenvVars(answer.body)
   const value = (name: string) => vars.get(name) ?? ''
   const claim = /^(.*)\/claim\/([A-Za-z0-9_-]+)$/.exec(value('DEMETER_CLAIM_URL'))
-  const expires = Date.parse(value('DEMETER_EXPIRES_AT'))
+  const expiresAt = value('DEMETER_EXPIRES_AT')
+  const expires = Date.parse(expiresAt)
+  // The shape lets 2026-13-45 or 02-30 through: the instant must be the one
+  // written, to the second.
+  const isDate = !Number.isNaN(expires) && new Date(expires).toISOString().slice(0, 19) === expiresAt.slice(0, 19)
   const sevenDays = Date.now() + 7 * 86_400_000
   const problems = [
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value('DEMETER_PROJECT_ID')) ? '' : 'DEMETER_PROJECT_ID is not a UUID',
@@ -155,10 +159,8 @@ test("register's values have the contract's formats", 'prod-safe', async (ctx) =
     /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}$/.test(value('DEMETER_USER_CODE'))
       ? ''
       : 'DEMETER_USER_CODE is not XXXX-XXXX in the contract alphabet',
-    /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|\+00:00)$/.test(value('DEMETER_EXPIRES_AT'))
-      ? ''
-      : `DEMETER_EXPIRES_AT "${value('DEMETER_EXPIRES_AT')}" is not RFC 3339 UTC`,
-    Number.isNaN(expires) || Math.abs(expires - sevenDays) <= 3_600_000 ? '' : `DEMETER_EXPIRES_AT ${value('DEMETER_EXPIRES_AT')} is not 7 days away`,
+    /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|\+00:00)$/.test(expiresAt) && isDate ? '' : `DEMETER_EXPIRES_AT "${expiresAt}" is not an RFC 3339 UTC date`,
+    !isDate || Math.abs(expires - sevenDays) <= 3_600_000 ? '' : `DEMETER_EXPIRES_AT ${expiresAt} is not 7 days away`,
   ].filter(Boolean)
   if (problems.length) fail(problems.join('\n'))
   return `namespace ${value('DEMETER_PROJECT_NAMESPACE')}, expires ${value('DEMETER_EXPIRES_AT')}`

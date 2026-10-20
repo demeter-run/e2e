@@ -135,8 +135,10 @@ export async function main(
         env,
         run: journey,
         secrets,
+        // The mock's form takes any password, and may sit on another machine
+        // over plain HTTP: the real one is typed only off the mock.
         user: env.name === 'mock' ? 'e2e-j0@mock' : TEST_USER,
-        password: password || 'mock',
+        password: env.name === 'mock' ? 'mock' : password,
         between: (registration) => runContractOn(async () => registration),
       })
     } catch (error) {

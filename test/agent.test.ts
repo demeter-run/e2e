@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import type { ServerResponse } from 'node:http'
+import type { Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, afterEach, before, beforeEach, describe, it, mock as mocks } from 'node:test'
@@ -14,9 +16,10 @@ import {
   Secrets,
 } from '../src/agent/client.ts'
 import { contractTests, runContract } from '../src/agent/contract.spec.ts'
+import { j0, type J0Waits, j0Waits } from '../src/agent/j0.ts'
 import { main } from '../src/cli/agent.ts'
 import { type Environment, environment, environments } from '../src/env.ts'
-import { mockState, resetMock, setMockState } from '../src/mock/control.ts'
+import { mockCalls, mockState, resetMock, setMockState } from '../src/mock/control.ts'
 import { type Mock, startMock } from '../src/mock/server.ts'
 import { Run, type Result } from '../src/report.ts'
 import { type Served, serve, withEnv } from './helpers.ts'
@@ -196,6 +199,62 @@ describe('the contract suite', () => {
     assert.match(failedDetail(expiry, "[prod-safe] register's values"), /^DEMETER_EXPIRES_AT .* is not 7 days away$/)
   })
 
+  it('fails each value, header and line the contract fixes, when it alone drifts', async () => {
+    const register = (edit: (body: string) => string) => onBody('/api/agent/register', edit)
+    const ports = (edit: (body: string) => string) => onBody('/api/agent/ports', (body) => (body.includes('_KEY=') ? edit(body) : body))
+    const cases: [string, (answer: AgentAnswer, request: Seen) => AgentAnswer, string, RegExp][] = [
+      [
+        'a dotenv answer of another type',
+        (answer, request) => (request.path === '/api/agent/register' && answer.status === 200 ? { ...answer, headers: { ...answer.headers, 'content-type': 'text/html' } } : answer),
+        '[prod-safe] register answers a dotenv body',
+        /^register's dotenv answer: Content-Type is "text\/html", wanted "text\/plain; charset=utf-8"$/,
+      ],
+      ['an error with no message', onError((answer) => ({ ...answer, body: answer.body.replace(/"message":"[^"]*"/, '"message":""') })), '[prod-safe] a bad API key', /^401 unauthenticated, but it has no message$/],
+      ['a project id that is not a UUID', register((b) => b.replace(/DEMETER_PROJECT_ID=.*/, 'DEMETER_PROJECT_ID=project-1')), "[prod-safe] register's values", /^DEMETER_PROJECT_ID is not a UUID$/],
+      ['a namespace with capitals', register((b) => b.replace(/DEMETER_PROJECT_NAMESPACE=.*/, 'DEMETER_PROJECT_NAMESPACE=Mock_Project')), "[prod-safe] register's values", /^DEMETER_PROJECT_NAMESPACE is not a namespace$/],
+      ['a key of another kind', register((b) => b.replace('DEMETER_API_KEY=dmtr_apikey1', 'DEMETER_API_KEY=dmtr_apikey2')), "[prod-safe] register's values", /^DEMETER_API_KEY is not dmtr_apikey1…$/],
+      [
+        'a claim URL off the Console',
+        register((b) => b.replace(/DEMETER_CLAIM_URL=http:\/\/[^/]+/, 'DEMETER_CLAIM_URL=http://elsewhere.example')),
+        "[prod-safe] register's values",
+        /^DEMETER_CLAIM_URL is not http:\/\/127\.0\.0\.1:\d+\/claim\/<token>$/,
+      ],
+      [
+        'an expiry shaped as RFC 3339 that is no date',
+        register((b) => b.replace(/DEMETER_EXPIRES_AT=.*/, 'DEMETER_EXPIRES_AT=2026-13-45T00:00:00+00:00')),
+        "[prod-safe] register's values",
+        /^DEMETER_EXPIRES_AT "2026-13-45T00:00:00\+00:00" is not an RFC 3339 UTC date$/,
+      ],
+      [
+        'an expiry on a day the month lacks',
+        register((b) => b.replace(/DEMETER_EXPIRES_AT=.*/, 'DEMETER_EXPIRES_AT=2026-02-30T00:00:00Z')),
+        "[prod-safe] register's values",
+        /^DEMETER_EXPIRES_AT "2026-02-30T00:00:00Z" is not an RFC 3339 UTC date$/,
+      ],
+      [
+        'an expiry with a space for its T',
+        register((b) => b.replace(/(DEMETER_EXPIRES_AT=\d{4}-\d\d-\d\d)T/, '$1 ')),
+        "[prod-safe] register's values",
+        /^DEMETER_EXPIRES_AT "[^"]+" is not an RFC 3339 UTC date$/,
+      ],
+      [
+        'ports with no _URL',
+        ports((b) => b.replace(/^DEMETER_BLOCKFROST_PREPROD_URL=.*\n/m, '')),
+        '[prod-safe] ports answers',
+        /answered DEMETER_BLOCKFROST_PREPROD_PORT_ID, DEMETER_BLOCKFROST_PREPROD_KEY, wanted/,
+      ],
+      ['a _URL that is not a URL', ports((b) => b.replace(/^(DEMETER_BLOCKFROST_PREPROD_URL)=.*$/m, '$1=not-a-url')), '[prod-safe] ports answers', /^DEMETER_BLOCKFROST_PREPROD_URL is empty or not a URL$/],
+      ['an empty _KEY', ports((b) => b.replace(/^(DEMETER_BLOCKFROST_PREPROD_KEY)=.*$/m, '$1=')), '[prod-safe] ports answers', /^DEMETER_BLOCKFROST_PREPROD_KEY is empty or not a URL$/],
+      [
+        'an unknown kind whose message lists no kinds',
+        onError((answer) => ({ ...answer, body: answer.body.replace(/use one of [A-Za-z, ]+\./, 'use a kind the Console knows.') })),
+        '[prod-safe] the port catalog',
+        /^an unknown kind answered 400 invalid_request with no list of kinds, so a kind the mock lacks would go unseen$/,
+      ],
+    ]
+    for (const [what, rewrite, step, detail] of cases) assert.match(failedDetail(await contractThrough(rewrite), step), detail, what)
+  })
+
   it('fails an ip_cap whose Retry-After differs from retry_after_seconds', async () => {
     const result = await contractThrough((answer) => (answer.headers['retry-after'] ? { ...answer, headers: { ...answer.headers, 'retry-after': '60' } } : answer))
     assert.deepEqual(failed(result), ['[mock-only] ip_cap is 429 with retry_after_seconds and the same Retry-After'])
@@ -289,19 +348,23 @@ describe('the agent CLI', () => {
     assert.match(usageError(), /only inside J0/)
   })
 
-  it('fails J0 on production without the password in a result its alert carries, registering nothing', async () => {
-    assert.equal(await run('j0', { E2E_USER_PASSWORD: undefined }, '--env', 'production', '--contract', 'prod-safe', '--alert'), 1)
-    assert.deepEqual(await readdir(dir), ['j0.json'])
-    const result = JSON.parse(await readFile(join(dir, 'j0.json'), 'utf8')) as Result
-    assert.deepEqual(
-      result.steps.map((s) => [s.name, s.ok]),
-      [
-        ['sign in as e2e@txpipe.io', false],
-        ['no credential in a result or the call log', true],
-      ],
-    )
-    assert.match(result.steps[0]!.detail, /E2E_USER_PASSWORD is not set/)
-    assert.ok(log.mock.calls.some((c) => /alert skipped for j0/.test(String(c.arguments[0]))), 'no alert was tried')
+  it('fails J0 on production without the password, unset or empty as Actions passes a missing secret, in a result its alert carries, registering nothing', async () => {
+    for (const password of [undefined, '']) {
+      log.mock.resetCalls()
+      assert.equal(await run('j0', { E2E_USER_PASSWORD: password }, '--env', 'production', '--contract', 'prod-safe', '--alert'), 1)
+      assert.deepEqual(await readdir(dir), ['j0.json'])
+      const result = JSON.parse(await readFile(join(dir, 'j0.json'), 'utf8')) as Result
+      assert.deepEqual(
+        result.steps.map((s) => [s.name, s.ok]),
+        [
+          ['sign in as e2e@txpipe.io', false],
+          ['no credential in a result or the call log', true],
+        ],
+        JSON.stringify(password),
+      )
+      assert.match(result.steps[0]!.detail, /E2E_USER_PASSWORD is not set/)
+      assert.ok(log.mock.calls.some((c) => /alert skipped for j0/.test(String(c.arguments[0]))), 'no alert was tried')
+    }
   })
 
   it("refuses the mock-only tests on production, which has no error states to switch", async () => {
@@ -374,9 +437,84 @@ describe('the credentials a body hands out', () => {
     assert.equal(secrets.scrub(text), '[redacted] /claim?token=[redacted] [redacted] [redacted] [redacted] [redacted]')
   })
 
+  it('takes the claim token from the path, whether or not the URL has a query', () => {
+    for (const url of ['https://console.example/claim/Path-form_token-0123456789', 'https://console.example/claim/Path-form_token-0123456789?from=x']) {
+      const secrets = new Secrets()
+      addRegistrationSecrets(secrets, `DEMETER_CLAIM_URL=${url}\n`)
+      assert.equal(secrets.scrub('at /claim/Path-form_token-0123456789, or Path-form_token-0123456789 alone'), 'at /claim/[redacted], or [redacted] alone', url)
+    }
+  })
+
   it('takes every dmtr_ key in a body, whatever its line looks like', () => {
     const secrets = new Secrets()
     addRegistrationSecrets(secrets, 'export DEMETER_API_KEY = "dmtr_apikey1bbbbbbbb"\r\nsomething dmtr_apikey1cccccccc\n')
     assert.equal(secrets.scrub('dmtr_apikey1bbbbbbbb dmtr_apikey1cccccccc'), '[redacted] [redacted]')
+  })
+})
+
+describe('J0 up to the browser', () => {
+  const fast: Partial<J0Waits> = { firstRequestMs: 2_000, requestEveryMs: 10, landingMs: 200, deleteEveryMs: 10, goneMs: 200, pageEveryMs: 10 }
+  const step = (result: Result, prefix: string) => result.steps.find((s) => s.name.startsWith(prefix)) ?? assert.fail(`no step starts with ${prefix}`)
+
+  it('opens no browser on a claim URL off the Console, so nothing is typed there', async () => {
+    // The same mock under another name: the browser would reach it.
+    const proxy = await rewriting(onBody('/api/agent/register', (body) => body.replace(/DEMETER_CLAIM_URL=http:\/\/127\.0\.0\.1:/, 'DEMETER_CLAIM_URL=http://localhost:')))
+    try {
+      const target = { ...env, console: proxy.url, auth0: proxy.url }
+      const run = new Run('j0', target.name)
+      await j0({ env: target, run, secrets: new Secrets(), user: 'e2e-j0@mock', password: 'mock', waits: fast })
+      const result = run.finish()
+      assert.match(step(result, 'claim in the browser').detail, /^DEMETER_CLAIM_URL is on http:\/\/localhost:\d+, not the Console \(http:\/\/127\.0\.0\.1:\d+\), so the browser does not open it$/)
+      assert.equal(step(result, 'the claim page offered').detail, 'not run: the claim form never showed')
+      assert.ok(!(await mockCalls(target)).some((c) => c.path.startsWith('/login') || c.path.startsWith('/claim')), 'the browser went to the claim page or the sign-in')
+    } finally {
+      await proxy.close()
+    }
+  })
+
+  /** J0 against a stand-in Console whose register answers as `answer` does, so the delete step runs as on production. */
+  async function j0Against(answer: (response: ServerResponse, socket: Socket) => void): Promise<Result> {
+    const standIn = await serve((request, response) => {
+      request.resume()
+      if (request.url === '/api/agent/register') answer(response, request.socket)
+      else response.writeHead(404).end()
+    })
+    try {
+      const url = standIn.url
+      const run = new Run('j0', 'standin')
+      await j0({ env: { name: 'standin', website: url, console: url, legacy: url, rpc: url, auth0: url }, run, secrets: new Secrets(), user: 'e2e@txpipe.io', password: 'x', waits: fast })
+      return run.finish()
+    } finally {
+      await standIn.close()
+    }
+  }
+
+  const json = (status: number, error: string) => (response: ServerResponse) =>
+    response.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error, message: 'm', docs: 'https://demeter.run/auth.md' }))
+
+  it('says a refused registration left nothing, and one that may have registered expires unclaimed', async () => {
+    const refused = await j0Against(json(429, 'ip_cap'))
+    assert.equal(step(refused, 'register as agent').detail, 'register answered 429 ip_cap, wanted 200')
+    assert.deepEqual([step(refused, 'delete').ok, step(refused, 'delete').detail], [true, 'register answered 429 ip_cap: nothing was registered, so nothing is left behind'])
+    const broken = await j0Against(json(500, 'internal'))
+    assert.match(step(broken, 'delete').detail, /^register answered 500 internal: a project may have been registered without this run learning it, and if so it expires unclaimed within 7 days$/)
+  })
+
+  it('fails a 200 whose body did not finish, naming the reset, and says its project expires unclaimed', async () => {
+    const result = await j0Against((response, socket) => {
+      response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'content-length': '500' })
+      response.write('DEMETER_PROJECT_ID=7e0b2f9c-0000-4000-8000-000000000000\n')
+      setTimeout(() => socket.destroy(), 20)
+    })
+    assert.equal(step(result, 'register as agent').detail, 'register answered 200, but the body did not finish: ECONNRESET, wanted 200')
+    assert.match(step(result, 'delete').detail, /^register answered 200, but the body did not finish: ECONNRESET: a project may have been registered without this run learning it/)
+  })
+
+  it('fails the delete step when a 200 names no namespace, as its project cannot be found', async () => {
+    const result = await j0Against((response) =>
+      response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('DEMETER_PROJECT_ID=7e0b2f9c-0000-4000-8000-000000000000\nDEMETER_API_KEY=dmtr_apikey1qqqqqqqq\n'),
+    )
+    assert.equal(step(result, 'register as agent').detail, 'register answered 200 without DEMETER_PROJECT_NAMESPACE and DEMETER_CLAIM_URL')
+    assert.deepEqual([step(result, 'delete').ok, step(result, 'delete').detail], [false, 'register answered 200 but named no namespace: its project cannot be found, and expires unclaimed within 7 days'])
   })
 })
