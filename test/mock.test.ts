@@ -257,6 +257,17 @@ describe('the mock: caps, kill switch and clock', () => {
     assert.deepEqual(codeOf(await register(env, { name: 'test-agent' })), [429, 'ip_cap'])
   })
 
+  it("keeps a tab in a comma-separated X-Forwarded-For entry, as the Console's parser does, so it counts as another source", async () => {
+    for (let i = 0; i < 3; i++) assert.equal((await from('192.0.2.1')).status, 200)
+    assert.deepEqual(codeOf(await from('198.51.100.0, 192.0.2.1')), [429, 'ip_cap'])
+    assert.equal((await from('198.51.100.0,\t192.0.2.1')).status, 200)
+  })
+
+  it("counts an X-Forwarded-For header that leaves no entry against the connection's address", async () => {
+    for (const header of [', ', ',,', '   ']) assert.equal((await from(header)).status, 200)
+    assert.deepEqual(codeOf(await register(env, { name: 'test-agent' })), [429, 'ip_cap'])
+  })
+
   it('lets an address register again once its oldest registration is 24 hours old on the clock, and waits for the next one after', async () => {
     assert.equal((await from('192.0.2.1')).status, 200)
     await advanceMockClock(env, 2 * 3600)

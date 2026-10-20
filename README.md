@@ -282,10 +282,12 @@ rules fabric does (`src/domain/provisional/` in fabric):
 
 - **Per client IP**: at most `ip_cap` registrations from one address in the
   trailing 24 hours, whether or not they were claimed or expired since. The
-  address is the last non-empty entry of `X-Forwarded-For`, as the Console
+  address is the last entry of `X-Forwarded-For`, as the Console's Fastify
   takes it behind its one trusted proxy (`TRUST_PROXY_HOPS`, 1 by default),
-  so an entry a client puts before it is ignored and an empty one is skipped;
-  or else the connection's. A run
+  so an entry a client puts before it is ignored; or else the connection's.
+  As Fastify's parser does, it skips empty entries and, when the header has a
+  comma, strips only the spaces around each entry (a tab stays in the
+  address, which fabric then counts as another source). A run
   sets the header so one runner acts as several sources. The refusal's
   `retry_after_seconds` and `Retry-After` are the whole seconds, rounded up,
   until enough of the address's registrations leave the window (normally

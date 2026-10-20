@@ -196,6 +196,22 @@ async function readBody(request: IncomingMessage): Promise<string> {
 
 const dotenv = (lines: [string, string][]): string => lines.map(([name, value]) => `${name}=${value}\n`).join('')
 
+/**
+ * The last address of an `X-Forwarded-For` header as the Console's Fastify
+ * parser (`@fastify/forwarded` 3.0.0) reads it: a header with no comma is
+ * trimmed whole; otherwise each entry loses only the spaces around it, so a
+ * tab stays part of the address, and an empty entry is skipped. Empty when no
+ * entry is left.
+ */
+const lastForwarded = (header: string): string =>
+  header.includes(',')
+    ? (header
+        .split(',')
+        .map((entry) => entry.replace(/^ +| +$/g, ''))
+        .filter(Boolean)
+        .at(-1) ?? '')
+    : header.trim()
+
 export interface MockOptions {
   /** Where the mock listens. Port 0 picks a free one. */
   port?: number
@@ -484,20 +500,12 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl, brok
   /**
    * The client IP registration counts by, as the Console's Fastify takes it
    * behind its one trusted proxy (`TRUST_PROXY_HOPS`, 1 by default): the last
-   * non-empty `X-Forwarded-For` entry, the one that proxy wrote, so an entry
-   * the client put before it is ignored, and an empty one is skipped as
-   * Fastify's `forwarded` parser drops it; or the connection's address. A run
-   * sets the header to act as several sources.
+   * `X-Forwarded-For` entry, the one that proxy wrote, so an entry the client
+   * put before it is ignored; or the connection's address when the header
+   * leaves none. A run sets the header to act as several sources.
    */
   const clientIp = (request: IncomingMessage): string =>
-    request.headers['x-forwarded-for']
-      ?.toString()
-      .split(',')
-      .map((entry) => entry.trim())
-      .filter(Boolean)
-      .at(-1) ||
-    request.socket.remoteAddress ||
-    ''
+    lastForwarded(request.headers['x-forwarded-for']?.toString() ?? '') || request.socket.remoteAddress || ''
 
   /** Whether a request names the mock as its host: its base URL's name, or a loopback one. */
   const ownHost = (request: IncomingMessage) => {
