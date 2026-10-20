@@ -25,7 +25,10 @@ export function projectOf(url: URL): string | null {
   return match ? match[1]! : null
 }
 
-/** Waits for the browser to land on a project's ports page, and returns that project's namespace. */
+/**
+ * Waits for the browser to land on a project's ports page with the Console's
+ * app started on it (`started`), and returns that project's namespace.
+ */
 export async function landOnPorts(page: Page, env: Environment, timeoutMs = 60_000): Promise<string> {
   const url = await arrives(
     page,
@@ -33,7 +36,26 @@ export async function landOnPorts(page: Page, env: Environment, timeoutMs = 60_0
     `a project's ports page on ${env.console}`,
     timeoutMs,
   )
+  await started(page, timeoutMs)
   return projectOf(url)!
+}
+
+/**
+ * Waits for the Console's app to start on the page: its Remix router, which
+ * Remix creates as React hydrates the server-rendered page. Until then a
+ * button does nothing and a link is a plain anchor, whose click loads its
+ * target as a page instead of navigating within the app.
+ */
+export async function started(page: Page, timeoutMs = 30_000): Promise<void> {
+  try {
+    await page.waitForFunction(
+      () => (window as { __remixRouter?: { state: { initialized: boolean } } }).__remixRouter?.state.initialized === true,
+      undefined,
+      { timeout: timeoutMs },
+    )
+  } catch {
+    throw new Failure(`the Console's app did not start on ${await where(page)} within ${timeoutMs / 1000} s`)
+  }
 }
 
 /**
@@ -93,10 +115,12 @@ export async function cookiesNamed(context: BrowserContext, name: string): Promi
  * loaders and the server answers the parent's redirect, to `/logout/auth0`
  * again, until the browser gives up with ERR_TOO_MANY_REDIRECTS (seen
  * 2026-10-20). The link navigates within the page instead, where Remix's
- * router follows the deepest route's redirect, to Auth0.
+ * router follows the deepest route's redirect, to Auth0, but only once the
+ * app has started: clicked before, it loads `/logout` as a page too.
  */
 export async function signOut(page: Page, env: Environment, timeoutMs = 30_000): Promise<string> {
   const link = await visible(page, page.locator('a[href="/logout"]'), 'sign-out link in the sidebar', timeoutMs)
+  await started(page, timeoutMs)
   // A page load that fails, as the loop does, leaves Chromium's error page,
   // whose URL says nothing: the failed request names the page and the error.
   let failed = ''
