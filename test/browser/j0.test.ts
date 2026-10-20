@@ -18,6 +18,12 @@ import { type Breaks, type StandIn, standIn } from './standin.ts'
  * `j0-mock.yml` runs these.
  */
 
+// Under node:test, a `::add-mask::` line that `Secrets` prints reaches the job
+// log as a `# ` diagnostic, which Actions does not read as a command: every
+// throwaway credential a test makes would print in plain text. This file's
+// process masks nothing; the test of the masking sets the variable itself.
+delete process.env.GITHUB_ACTIONS
+
 const PASSWORD = 'stand-in-password-0123456789'
 const fast: Partial<J0Waits> = { firstRequestMs: 2_000, requestEveryMs: 10, browserMs: 3_000, landingMs: 300, deleteEveryMs: 10, goneMs: 300, pageEveryMs: 10 }
 

@@ -24,6 +24,12 @@ import { type Mock, startMock } from '../src/mock/server.ts'
 import { Run, type Result } from '../src/report.ts'
 import { type Served, serve, withEnv } from './helpers.ts'
 
+// Under node:test, a `::add-mask::` line that `Secrets` prints reaches the job
+// log as a `# ` diagnostic, which Actions does not read as a command: every
+// throwaway credential a test makes would print in plain text. This file's
+// process masks nothing; the test of the masking sets the variable itself.
+delete process.env.GITHUB_ACTIONS
+
 let mock: Mock
 let env: Environment
 

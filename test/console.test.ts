@@ -13,6 +13,12 @@ import { type Served, serve } from './helpers.ts'
  * API, as the browser context's is, with a session cookie of its own.
  */
 
+// Under node:test, a `::add-mask::` line that `Secrets` prints reaches the job
+// log as a `# ` diagnostic, which Actions does not read as a command: every
+// throwaway credential a test makes would print in plain text. This file's
+// process masks nothing; the test of the masking sets the variable itself.
+delete process.env.GITHUB_ACTIONS
+
 const COOKIE = 'stand-in-session-cookie-0123456789'
 const NS = 'prj-stand-in-abc123'
 const fast: ConsoleWaits = { landingMs: 300, deleteAttempts: 3, deleteEveryMs: 10, goneMs: 300, pageEveryMs: 10 }
