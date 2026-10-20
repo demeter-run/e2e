@@ -155,9 +155,12 @@ test('j2', async ({ browser }) => {
   await step('sign up: the CTA reaches Auth0\'s signup screen, then sign in from it', async () => {
     const cta = await visible(p, p.locator(`a[href^="${env.console}/login"]`).filter({ hasText: signupText }), 'sign-up CTA')
     const label = (await cta.innerText()).trim()
-    const sent = p.waitForRequest((r) => r.isNavigationRequest() && r.url().startsWith(`${env.console}/login`), { timeout: 30_000 })
+    // Caught here so that a click that fails leaves no rejection unhandled.
+    const sent = p.waitForRequest((r) => r.isNavigationRequest() && r.url().startsWith(`${env.console}/login`), { timeout: 30_000 }).catch(() => null)
     await cta.click()
-    const login = new URL((await sent).url())
+    const request = await sent
+    if (!request) throw new Failure(`"${label}" requested nothing on ${env.console}/login within 30 s; the browser is on ${safeUrl(p.url())}`)
+    const login = new URL(request.url())
     if (`${login.origin}${login.pathname}${login.search}` !== `${env.console}/login?intent=signup`) {
       throw new Failure(`"${label}" sent the browser to ${safeUrl(login.toString(), ['intent'])}, wanted ${env.console}/login?intent=signup`)
     }
@@ -296,11 +299,13 @@ test('j2-legacy-cookie', async () => {
   let legacy = false
   await step(`sign in through the legacy app at ${env.website}/auth`, async () => {
     if (!page || !namespace) throw new NotRun('J2 left no signed-in session')
-    const callback = page.waitForResponse((r) => r.url().startsWith(`${env.website}/callbacks/auth0`), { timeout: 60_000 })
+    // Caught here so that a navigation that fails leaves no rejection unhandled.
+    const callback = page.waitForResponse((r) => r.url().startsWith(`${env.website}/callbacks/auth0`), { timeout: 60_000 }).catch(() => null)
     await page.goto(`${env.website}/auth`, { waitUntil: 'commit', timeout: 30_000 })
     await arrives(page, (u) => (u.origin === env.auth0 ? u.pathname === auth0Screens.login.path : u.pathname !== '/auth'), "Auth0's login form or the legacy callback")
     if (new URL(page.url()).origin === env.auth0) await signIn(page, env, user())
     const answered = await callback
+    if (!answered) throw new Failure(`the legacy app's ${env.website}/callbacks/auth0 never answered; the browser is on ${safeUrl(page.url())}`)
     const set = (await answered.headerValues('set-cookie')).map((c) => c.split('=')[0]!.trim())
     if (!set.includes(sessionCookie)) throw new Failure(`${env.website}/callbacks/auth0 answered ${answered.status()} and set ${set.join(', ') || 'no cookie'}, not ${sessionCookie}`)
     legacy = true
@@ -308,9 +313,21 @@ test('j2-legacy-cookie', async () => {
   })
   await step(`open ${env.console}/ and sign in: the Console lands on the ports page`, async () => {
     if (!page || !legacy) throw new NotRun('no legacy session')
-    await page.goto(`${env.console}/`, { waitUntil: 'commit', timeout: 60_000 })
-    await arrives(page, (u) => u.origin === env.auth0 || /^\/[^/]+\/ports$/.test(u.pathname), 'the Console or Auth0')
-    const how = new URL(page.url()).origin === env.auth0 ? `signed in through the ${await signIn(page, env, user())}` : 'still signed in'
+    // A Console that cannot read the cookie it is sent signs the browser in
+    // again, through Auth0's session when there is one: its callback says so.
+    let called = false
+    const callbacks = (r: { url(): string }) => {
+      if (r.url().startsWith(`${env.console}/callbacks/auth0`)) called = true
+    }
+    page.on('request', callbacks)
+    try {
+      await page.goto(`${env.console}/`, { waitUntil: 'commit', timeout: 60_000 })
+      await arrives(page, (u) => u.origin === env.auth0 || /^\/[^/]+\/ports$/.test(u.pathname), 'the Console or Auth0')
+      if (new URL(page.url()).origin === env.auth0) await signIn(page, env, user())
+    } finally {
+      page.off('request', callbacks)
+    }
+    const how = called ? 'the Console signed the browser in again' : 'the Console read its session'
     const landedOn = await landOnPorts(page, env)
     return `${how}, landed on /${landedOn}/ports; the browser holds ${(await cookiesNamed(page.context(), sessionCookie)).join(', ')}`
   })

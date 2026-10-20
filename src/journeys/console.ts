@@ -170,9 +170,10 @@ export async function dailyRequests(page: Page, env: Environment, namespace: str
 export async function billingRow(page: Page, env: Environment, namespace: string, port: ConsolePort): Promise<string[] | null> {
   await page.goto(`${env.console}/${namespace}/billing`, { waitUntil: 'load', timeout: 60_000 })
   await visible(page, page.getByText('Project Usage', { exact: true }), '"Project Usage" card on the billing page')
-  const id = page.getByText(port.name, { exact: true })
-  if ((await id.count()) === 0) return null
-  return (await id.first().locator('xpath=..').innerText()).split('\n').map((c) => c.trim()).filter(Boolean)
+  // The card's rows are six-column grids: product, id, tiers, usage and cost.
+  const row = page.locator('div.grid-cols-6').filter({ has: page.getByText(port.name, { exact: true }) })
+  if ((await row.count()) === 0) return null
+  return (await row.first().innerText()).split('\n').map((c) => c.trim()).filter(Boolean)
 }
 
 /** The visible text of each cell of the port's pricing grid, in order. */
