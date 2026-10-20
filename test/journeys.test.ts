@@ -554,7 +554,7 @@ describe('the j2 workflow', () => {
       assert.equal(ran.status, 0, ran.stderr)
       return { stdout: ran.stdout, posted: [...posted] }
     }
-    const left = "A project it deployed may still be on the test user's account until the next run."
+    const left = "A project it deployed may still be on the test user's account until a later run deletes it."
     try {
       for (const status of ['0', '1']) {
         const reported = await alert({ STATUS: status })

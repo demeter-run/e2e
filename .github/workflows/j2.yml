@@ -26,8 +26,8 @@ name: j2
 #   run ends it cancelled); maybe partway when J2 broke outside the journey
 #   (exit 3); maybe not at all, or partway, when the job failed with no step
 #   to name (GitHub could not set it up, or its runner was lost). A walk that may have been cut short may leave a
-#   project on the test user's account until the next run, and the message
-#   says so.
+#   project on the test user's account until a later run deletes it, and the
+#   message says so.
 #
 # Every job that signs in sets the concurrency group production-test-user, so
 # no two runs use the user at once: J2 deletes every project the user owns
@@ -81,9 +81,10 @@ defaults:
     shell: bash
 
 # One run per pull request: a newer push cancels the older run, waiting or
-# walking (J2's `if:` below lets it), and the next run's clean slate deletes
-# what it left. Every other run is a group of its own, so a scheduled or
-# dispatched run is never cancelled here.
+# walking (J2's `if:` below lets it). What it left stays until a later run
+# deletes it: the sign-in proof, J2's clean slate and its clean-up each delete
+# every project the user owns, when they get to sign in. Every other run is a
+# group of its own, so a scheduled or dispatched run is never cancelled here.
 concurrency:
   group: j2-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -243,7 +244,7 @@ jobs:
             echo "J2 reported its results (exit $STATUS); a failed one alerted on its own"
             exit 0
           fi
-          left="A project it deployed may still be on the test user's account until the next run."
+          left="A project it deployed may still be on the test user's account until a later run deletes it."
           uid=j2-setup
           title="e2e j2 reported nothing (production)"
           if [[ "$RESULT" == cancelled ]]; then

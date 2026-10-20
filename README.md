@@ -416,12 +416,16 @@ the test user's billing account gains one customer per run: one a day, and
 one for each pull-request run. A run cancelled after its claim, or whose
 delete fails, leaves the claimed project on the test user's account.
 Scheduled and dispatched runs of main alert on both; a pull request's run has
-no webhook, so it shows only in its checks. The project stays until a J2 run
-that signs in deletes it: J2 deletes every project the user owns before and
-after its walk (daily at 06:00 UTC). A J2 run deletes nothing when it never
-reaches its clean slate (cancelled, skipped, or a set-up step failed), cannot
-sign in, loses its session partway through a delete, or the Console refuses
-the delete; the project then waits for the next.
+no webhook, so it shows only in its checks. The project stays until a later
+run, signed in as the test user, deletes it. Three steps delete every project
+the user owns, each on its own: J2's clean slate before its walk and its
+clean-up after it, pass or fail (J2 runs daily at 06:00 UTC, on dispatch, and
+on pull requests that change it), and the sign-in proof that runs before J2
+on those pull requests. A step deletes nothing when it never runs (its run
+cancelled, its job skipped, or a set-up step failed) or cannot sign in and
+reach the ports page. It stops partway when it loses its session or the
+Console refuses a delete, leaving the projects it had not yet deleted. What
+all three leave waits for a later run.
 
 The prod-safe contract tests send requests the Console refuses, apart from
 the 65-character name: should production ever accept it, that run leaves one
@@ -550,7 +554,7 @@ user owns. `pnpm journey` waits for that, then reports as usual, so the
 prompt comes back only once nothing is left running. A SIGTERM to the
 journey's own process does the same (pnpm does not pass one on). A second
 Ctrl+C, a second or more after the first, gives up on the clean-up, which can
-leave a project on the test user's account until the next run.
+leave a project on the test user's account until a later run deletes it.
 
 **What it costs and leaves behind.** J2 deletes every project the test user
 owns before it starts and after it ends, pass or fail, so it must not overlap
@@ -747,8 +751,8 @@ without failing, so no alert would say that day went unchecked.
   request from a fork runs neither. A newer push to the pull request cancels
   its older run, waiting or walking (J2's job is gated on `!cancelled()`,
   not `always()`, which would walk on), so superseded pushes do not queue
-  for the test user; the next run's clean slate deletes what a cancelled one
-  left;
+  for the test user; what a cancelled run left stays until a later run
+  deletes it (see "What the probe does in production");
 - when one of the alerting runs reports nothing, one IRM alert says so, as no
   result would: `e2e-j2-cancelled` when the job was cancelled (its timeout
   ran out, another job of the group took its place, or someone cancelled
@@ -760,12 +764,12 @@ without failing, so no alert would say that day went unchecked.
   its turn for the test user ends it cancelled, as above); maybe partway
   when it exited 3 on a break outside the journey; maybe not at all, or
   partway, when the job failed with no step to name (GitHub could not set it
-  up, or its runner was lost). Those that may
-  have cut a walk short, and a cancelled job, may leave a project on the
-  test user's account until the next run, and say so. `pnpm journey` exits
-  0 or 1 only once it has reported the run. A unit test runs the workflow's
-  three scripts: J2's step, the one naming the set-up step that failed, and
-  the alert; another holds the jobs' and that step's `if:` gates as written.
+  up, or its runner was lost). Those that may have cut a walk short, and a
+  cancelled job, may leave a project on the test user's account until a
+  later run deletes it, and say so. `pnpm journey` exits 0 or 1 only once it
+  has reported the run. A unit test runs the workflow's three scripts: J2's
+  step, the one naming the set-up step that failed, and the alert; another
+  holds the jobs' and that step's `if:` gates as written.
 
 The job's timeout is 150 minutes: J2's test has 100, mostly the 75-minute wait
 on the cost, and when it times out the clean-up, the edge cases in a new
@@ -814,9 +818,18 @@ J2 run of an unmerged pull request did so to the agent probe on 2026-10-20),
 losing that day's run to it. A J2 or probe run of `main`, scheduled or
 dispatched, says so with its `-cancelled` alert; the port suite's alert is a
 step of the job that was cancelled, so it posts none. A unit test
-(`test/workflows.test.ts`) fails when a job that can read the password sits
-outside the group, or a job of the group drops either key, before a run is
-lost.
+(`test/workflows.test.ts`) fails, before a run is lost, when a job of the
+group drops either key, or a job outside the group can read the password: a
+`${{ }}` expression on one of its lines, or on one of its workflow's outside
+the jobs, names `secrets.E2E_USER_PASSWORD` (or `secrets['…']`). That is all
+it reads. Rather than skip any other shape that could hand the password over
+or set the group, it fails naming it: `secrets` used in an expression any
+other way (`secrets.*`, a computed index, `toJSON(secrets)`),
+`secrets: inherit`, a YAML anchor, alias or tag, a backslash outside a block
+scalar, an expression split over lines or held in a YAML comment, and a
+group that may be `production-test-user` (compared ignoring case, as GitHub
+does) set for a whole workflow, on a job that calls a reusable workflow, or
+by an expression.
 
 The agent probe adds a group of its own around the whole run, one per pull
 request (`agent-j0-probe-<number>`; each scheduled or dispatched run has its

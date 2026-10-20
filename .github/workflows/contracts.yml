@@ -25,8 +25,11 @@ name: contracts
 #       queue: max
 #
 # so no two runs use the user at once. `queue: max` keeps every waiting run:
-# without it the group holds one pending run, and a newer one cancels it
-# silently (no failure, so no alert), as happened to a ports run on PR #2.
+# without it the group holds one pending run, and a newer one cancels it. A
+# cancelled J2 or agent-probe run of main (scheduled or dispatched) posts its
+# `-cancelled` alert, but the port suite's alert is a step of the job that was
+# cancelled, and a pull request's run has no webhook, so those are lost
+# unannounced, as a ports run on PR #2 was.
 # No job here signs in; ports.yml's, j2.yml's and agent-j0-probe.yml's do.
 
 on:
