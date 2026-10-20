@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net'
 import { after, before, beforeEach, describe, it, mock as mocks } from 'node:test'
 import { type AgentAnswer, call, createPort, type Credentials, dotenvVars, errorBody, names, register } from '../src/agent/client.ts'
 import { type Environment, environments } from '../src/env.ts'
-import { mockCalls, mockState, resetMock, setMockState } from '../src/mock/control.ts'
+import { advanceMockClock, mockCalls, mockState, resetMock, setMockState } from '../src/mock/control.ts'
 import { type Mock, startMock } from '../src/mock/server.ts'
 
 let mock: Mock
@@ -199,7 +199,7 @@ describe('the mock: control routes', () => {
   it('refuses a post that is not JSON, as a page on another site would send it, and changes nothing', async () => {
     await setMockState(env, { route: 'register', error: 'ip_cap' })
     for (const type of ['text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data; boundary=x', 'application/jsonp']) {
-      for (const path of ['/__mock/reset', '/__mock/state']) {
+      for (const path of ['/__mock/reset', '/__mock/state', '/__mock/clock']) {
         const answer = await call('POST', `${mock.url}${path}`, { headers: { 'content-type': type }, body: '{"route": "register", "error": null}' })
         assert.equal(answer.status, 415, `${path} as ${type}`)
       }
@@ -215,7 +215,7 @@ describe('the mock: control routes', () => {
     const port = new URL(mock.url).port
     const as = (host: string, method: string, path: string) =>
       call(method, `${mock.url}${path}`, { headers: { host, 'content-type': 'application/json' }, ...(method === 'POST' ? { body: '{}' } : {}) })
-    for (const [method, path] of [['POST', '/__mock/reset'], ['POST', '/__mock/state'], ['GET', '/__mock/calls'], ['GET', '/__mock/state']] as const) {
+    for (const [method, path] of [['POST', '/__mock/reset'], ['POST', '/__mock/state'], ['POST', '/__mock/clock'], ['GET', '/__mock/calls'], ['GET', '/__mock/state']] as const) {
       assert.equal((await as(`rebound.example:${port}`, method, path)).status, 403, `${method} ${path}`)
     }
     assert.deepEqual((await mockState(env)).errors, { register: { error: 'ip_cap' } })
@@ -232,6 +232,118 @@ describe('the mock: control routes', () => {
     } finally {
       await other.close()
     }
+  })
+})
+
+describe('the mock: caps, kill switch and clock', () => {
+  const DAY = 86_400
+  /** A registration from `ip`, as `X-Forwarded-For` names it. */
+  const from = (ip: string, name = 'test-agent') => register(env, { name }, { 'x-forwarded-for': ip })
+  const credentialsOf = (answer: AgentAnswer): Credentials => {
+    const vars = dotenvVars(answer.body)
+    return { apiKey: vars.get('DEMETER_API_KEY')!, projectId: vars.get('DEMETER_PROJECT_ID')! }
+  }
+
+  it("counts registrations by the first X-Forwarded-For address, or the connection's, three in 24 hours", async () => {
+    for (let i = 0; i < 3; i++) assert.equal((await from('192.0.2.1, 10.0.0.1')).status, 200)
+    const fourth = await from('192.0.2.1')
+    assert.deepEqual(codeOf(fourth), [429, 'ip_cap'])
+    const wait = errorBody(fourth)!.retry_after_seconds!
+    assert.ok(wait > DAY - 60 && wait <= DAY, `retry_after_seconds ${wait}`)
+    assert.equal(fourth.headers['retry-after'], String(wait))
+    assert.equal((await from('192.0.2.2')).status, 200)
+    for (let i = 0; i < 3; i++) assert.equal((await register(env, { name: 'test-agent' })).status, 200)
+    assert.deepEqual(codeOf(await register(env, { name: 'test-agent' })), [429, 'ip_cap'])
+  })
+
+  it('lets an address register again once its oldest registration is 24 hours old on the clock, and waits for the next one after', async () => {
+    assert.equal((await from('192.0.2.1')).status, 200)
+    await advanceMockClock(env, 2 * 3600)
+    assert.equal((await from('192.0.2.1')).status, 200)
+    assert.equal((await from('192.0.2.1')).status, 200)
+    await advanceMockClock(env, 22 * 3600 - 1)
+    const before = await from('192.0.2.1')
+    assert.deepEqual(codeOf(before), [429, 'ip_cap'])
+    assert.ok(errorBody(before)!.retry_after_seconds! <= 1)
+    await advanceMockClock(env, 2)
+    assert.equal((await from('192.0.2.1')).status, 200)
+    const next = errorBody(await from('192.0.2.1'))!
+    assert.equal(next.error, 'ip_cap')
+    assert.ok(next.retry_after_seconds! > 2 * 3600 - 60 && next.retry_after_seconds! <= 2 * 3600, `retry_after_seconds ${next.retry_after_seconds}`)
+  })
+
+  it('refuses registration past the global limit of live unclaimed projects; an expired or claimed one is not live', async () => {
+    await setMockState(env, { limits: { global_cap: 2 } })
+    const first = await from('192.0.2.1')
+    const second = await from('192.0.2.2')
+    assert.deepEqual(codeOf(await from('192.0.2.3')), [503, 'global_cap'])
+    await setMockState(env, { project: credentialsOf(first).projectId, expired: true })
+    assert.equal((await from('192.0.2.3')).status, 200)
+    assert.deepEqual(codeOf(await from('192.0.2.4')), [503, 'global_cap'])
+    const visit = browser()
+    await visit('POST', '/login', { username: 'alice', password: 'x' })
+    assert.equal((await visit('POST', new URL(dotenvVars(second.body).get('DEMETER_CLAIM_URL')!).pathname, { name: '' })).status, 302)
+    assert.equal((await from('192.0.2.4')).status, 200)
+  })
+
+  it('caps ports per unclaimed project at its limit, and not once claimed', async () => {
+    await setMockState(env, { limits: { port_cap: 1 } })
+    const { credentials, vars } = await registered()
+    assert.equal((await createPort(env, credentials, BLOCKFROST)).status, 200)
+    assert.deepEqual(codeOf(await createPort(env, credentials, BLOCKFROST)), [429, 'port_cap'])
+    const visit = browser()
+    await visit('POST', '/login', { username: 'alice', password: 'x' })
+    await visit('POST', new URL(vars.get('DEMETER_CLAIM_URL')!).pathname, { name: '' })
+    assert.equal((await createPort(env, credentials, BLOCKFROST)).status, 200)
+  })
+
+  it('stops registration with the kill switch, and nothing else: ports, the data plane and claims go on', async () => {
+    const { credentials, vars } = await registered()
+    const port = dotenvVars((await createPort(env, credentials, BLOCKFROST)).body)
+    await setMockState(env, { provisional_enabled: false })
+    assert.deepEqual(codeOf(await from('192.0.2.1')), [503, 'registration_disabled'])
+    assert.equal((await createPort(env, credentials, { kind: 'OgmiosPort', network: 'cardano-preprod' })).status, 200)
+    const url = new URL('blocks/latest', port.get('DEMETER_BLOCKFROST_PREPROD_URL')).href
+    assert.equal((await call('GET', url, { headers: { 'dmtr-api-key': port.get('DEMETER_BLOCKFROST_PREPROD_KEY')! } })).status, 200)
+    const visit = browser()
+    await visit('POST', '/login', { username: 'alice', password: 'x' })
+    assert.equal((await visit('POST', new URL(vars.get('DEMETER_CLAIM_URL')!).pathname, { name: '' })).status, 302)
+    await setMockState(env, { provisional_enabled: true })
+    assert.equal((await from('192.0.2.1')).status, 200)
+  })
+
+  it('expires unclaimed projects as the clock passes their expiry, and leaves claimed ones', async () => {
+    const kept = await registered()
+    const lapsed = await registered()
+    const port = dotenvVars((await createPort(env, kept.credentials, BLOCKFROST)).body)
+    const visit = browser()
+    await visit('POST', '/login', { username: 'alice', password: 'x' })
+    await visit('POST', new URL(kept.vars.get('DEMETER_CLAIM_URL')!).pathname, { name: '' })
+    const start = Date.parse((await mockState(env)).now)
+    assert.deepEqual((await advanceMockClock(env, 7 * DAY - 5)).expired, [])
+    assert.equal((await createPort(env, lapsed.credentials, BLOCKFROST)).status, 200)
+    const state = await advanceMockClock(env, 10)
+    assert.deepEqual(state.expired, [lapsed.credentials.projectId])
+    assert.ok(Date.parse(state.now) - start >= (7 * DAY + 5) * 1000)
+    assert.deepEqual(codeOf(await createPort(env, lapsed.credentials, BLOCKFROST)), [410, 'expired'])
+    const url = new URL('blocks/latest', port.get('DEMETER_BLOCKFROST_PREPROD_URL')).href
+    assert.equal((await call('GET', url, { headers: { 'dmtr-api-key': port.get('DEMETER_BLOCKFROST_PREPROD_KEY')! } })).status, 200)
+    // A new registration's expiry is 7 days on from the mock's clock, not this machine's.
+    const later = dotenvVars((await register(env, { name: 'test-agent' })).body).get('DEMETER_EXPIRES_AT')!
+    assert.ok(Math.abs(Date.parse(later) - (Date.parse(state.now) + 7 * DAY * 1000)) < 5_000, later)
+  })
+
+  it('refuses a clock move or a limit it does not know with 400, and changes nothing', async () => {
+    const clock = (body: unknown) => call('POST', `${mock.url}/__mock/clock`, { body: JSON.stringify(body) })
+    const state = (body: unknown) => call('POST', `${mock.url}/__mock/state`, { body: JSON.stringify(body) })
+    for (const body of [{}, { advance_seconds: -1 }, { advance_seconds: 1.5 }, { advance_seconds: '60' }]) assert.equal((await clock(body)).status, 400, JSON.stringify(body))
+    for (const body of [{ limits: { ip_cap: -1 } }, { limits: { ip_cap: 2.5 } }, { limits: { ttl_days: 1 } }, { limits: [] }, { provisional_enabled: 'no' }]) {
+      assert.equal((await state(body)).status, 400, JSON.stringify(body))
+    }
+    assert.equal((await call('GET', `${mock.url}/__mock/clock`)).status, 404)
+    const { now, ...held } = await mockState(env)
+    assert.deepEqual(held, { errors: {}, expired: [], provisional_enabled: true, limits: { ip_cap: 3, global_cap: 200, port_cap: 3 } })
+    assert.ok(Math.abs(Date.parse(now) - Date.now()) < 5_000)
   })
 })
 
@@ -311,12 +423,24 @@ describe('the mock: control routes', () => {
     await setMockState(env, { route: 'register', error: 'ip_cap', retry_after_seconds: 90 })
     await setMockState(env, { route: 'ports', error: 'global_cap' })
     await setMockState(env, { project: vars.get('DEMETER_PROJECT_ID')!, expired: true })
-    assert.deepEqual(await mockState(env), {
+    await setMockState(env, { provisional_enabled: false })
+    await setMockState(env, { limits: { global_cap: 5 } })
+    const { now, ...held } = await mockState(env)
+    assert.deepEqual(held, {
       errors: { register: { error: 'ip_cap', retry_after_seconds: 90 }, ports: { error: 'global_cap' } },
       expired: [vars.get('DEMETER_PROJECT_ID')],
+      provisional_enabled: false,
+      limits: { ip_cap: 3, global_cap: 5, port_cap: 3 },
     })
+    assert.ok(Math.abs(Date.parse(now) - Date.now()) < 5_000, `now is ${now}`)
     await resetMock(env)
-    assert.deepEqual(await mockState(env), { errors: {}, expired: [] })
+    assert.deepEqual({ ...(await mockState(env)), now: '' }, {
+      errors: {},
+      expired: [],
+      provisional_enabled: true,
+      limits: { ip_cap: 3, global_cap: 200, port_cap: 3 },
+      now: '',
+    })
   })
 
   it('answers a handler error 500 and writes it to stderr without its credentials', async () => {

@@ -11,9 +11,10 @@ product repository, and it gates no other repository's pull requests. Each
 product repository keeps its own static checks. Drift between surfaces is
 caught here, afterwards, against production.
 
-Today it holds the harness, three contract checks, the port suite, and the
+Today it holds the harness, three contract checks, the port suite, the
 coding agent's journey (J0) with the agent-route mock it runs against on every
-merge. Two parts write, as the standing test user: the port suite creates a
+merge, and the expiry (J3) and abuse (J9) journeys, which run on the mock
+alone. Two parts write, as the standing test user: the port suite creates a
 project and its ports through fabric's API and deletes them, and J0's daily
 probe claims the project it registered as an agent and deletes it. The
 person's journey (J2) builds on the same harness.
@@ -221,8 +222,8 @@ E2E_MOCK_URL=http://mock.local:4020 pnpm j0 --env mock
 
 | Route | What it does |
 | --- | --- |
-| `POST /api/agent/register` | `{"agent": {"name", "version"?, "url"?}}` → the six dotenv lines in the contract's order; name required and at most 64 characters, version and url at most 256 |
-| `POST /api/agent/ports` | `dmtr-api-key` and `project-id` headers, `{"kind", "network", "throughputTier"?}` → `<PREFIX>_PORT_ID`, `<PREFIX>_URL`, `<PREFIX>_KEY`; checks in the Console's order (headers, body, network and tier, kind and its options, then key, expiry and the 3-port cap) |
+| `POST /api/agent/register` | `{"agent": {"name", "version"?, "url"?}}` → the six dotenv lines in the contract's order; name required and at most 64 characters, version and url at most 256; then, in fabric's order, the kill switch, the client IP's cap and the global cap (see [Caps, the kill switch and the clock](#caps-the-kill-switch-and-the-clock)) |
+| `POST /api/agent/ports` | `dmtr-api-key` and `project-id` headers, `{"kind", "network", "throughputTier"?}` → `<PREFIX>_PORT_ID`, `<PREFIX>_URL`, `<PREFIX>_KEY`; checks in the Console's order (headers, body, network and tier, kind and its options, then key, expiry and the port cap, 3 unless set) |
 | `GET /data/<port id>/…` | the fake data plane each `_URL` points at: `200` JSON to a request carrying the port's key in `dmtr-api-key`, `401` otherwise, and `401` once its project expires |
 | `GET /claim/<token>`, `POST` | signed out, "Log in" and "Sign up" (and the page is remembered for after sign-in); signed in, the agent's identity, its ports and the expiry, a project-name field defaulting to the namespace, and "Claim project", which makes the user the owner, voids the token and the user code, and redirects to `/<namespace>/ports`. A used, unknown or expired token shows the expired page |
 | `GET /activate?code=…`, `POST` | the same, for a user code typed in any case, with or without the hyphen |
@@ -238,7 +239,8 @@ does for every method but `GET` and `HEAD`, which production's framework
 Error"}`, with no code, no `docs` and no `Cache-Control`. No test reads
 either. Credentials take the contract's formats:
 `dmtr_apikey1…` keys, 32-byte base64url claim tokens, `XXXX-XXXX` user codes
-from the contract's alphabet, expiry 7 days ahead in RFC 3339 UTC. The port
+from the contract's alphabet, expiry 7 days ahead on the mock's clock in RFC
+3339 UTC. The port
 catalog (which kinds exist, and which networks each offers) is fabric's,
 copied into `src/mock/catalog.ts` with its date.
 
@@ -257,15 +259,48 @@ states or reset the mock under a run:
 | `POST /__mock/state` | `{"route": "register" \| "ports", "error": "<code>", "retry_after_seconds"?: <int>}` | every call to that route answers that error, any code of the contract's table with its status; `ip_cap` carries `retry_after_seconds` and `Retry-After` (86400 unless given) |
 | | `{"route": …, "error": null}` | stops it |
 | | `{"project": "<id or namespace>", "expired": true \| false}` | expires a project (`/ports` is `410 expired`, its ports stop answering, its claim link shows expired) or revives it |
+| | `{"provisional_enabled": true \| false}` | the kill switch: off, registration is `503 registration_disabled`; on by default |
+| | `{"limits": {"ip_cap"?: <int>, "global_cap"?: <int>, "port_cap"?: <int>}}` | the caps the mock enforces; by default fabric's, 3, 200 and 3 |
+| `POST /__mock/clock` | `{"advance_seconds": <int>}` | moves the mock's clock forward, then expires every unclaimed project whose expiry it passed; answers the state, as `GET /__mock/state` does |
 | `GET /__mock/calls` | | every other call so far, `[{method, path, status, headers}]`: claim tokens, user codes and every credential the mock issued are `[redacted]`, and `dmtr-api-key`, `cookie` and `authorization` are redacted whole |
-| `GET /__mock/state` | | the error states and expired projects, `{"errors": {"<route>": {"error", "retry_after_seconds"?}}, "expired": ["<project id>"]}`; `POST /__mock/state` answers the same |
-| `POST /__mock/reset` | | forgets every project, session, error state and call |
+| `GET /__mock/state` | | the error states, expired projects, kill switch, caps and the mock's time, `{"errors": {"<route>": {"error", "retry_after_seconds"?}}, "expired": ["<project id>"], "provisional_enabled", "limits": {"ip_cap", "global_cap", "port_cap"}, "now"}`; `POST /__mock/state` answers the same |
+| `POST /__mock/reset` | | forgets every project, session, error state and call, and puts the kill switch, the caps and the clock back |
 
 ```sh
 curl -s localhost:4010/__mock/state -H 'content-type: application/json' -d '{"route": "register", "error": "ip_cap", "retry_after_seconds": 600}'
+curl -s localhost:4010/__mock/state -H 'content-type: application/json' -d '{"provisional_enabled": false}'
+curl -s localhost:4010/__mock/state -H 'content-type: application/json' -d '{"limits": {"global_cap": 5}}'
+curl -s localhost:4010/__mock/clock -H 'content-type: application/json' -d '{"advance_seconds": 604860}'   # 7 days and a minute
 curl -s localhost:4010/__mock/calls | jq '.[] | "\(.method) \(.path) \(.status)"'
 curl -s localhost:4010/__mock/reset -H 'content-type: application/json' -d '{}'
 ```
+
+### Caps, the kill switch and the clock
+
+Behind the error states, which still answer first, the mock enforces the
+rules fabric does (`src/domain/provisional/` in fabric):
+
+- **Per client IP**: at most `ip_cap` registrations from one address in the
+  trailing 24 hours, whether or not they were claimed or expired since. The
+  address is the first entry of `X-Forwarded-For`, which a run sets so one
+  runner acts as several sources, or else the connection's. The refusal's
+  `retry_after_seconds` and `Retry-After` are the whole seconds, rounded up,
+  until enough of the address's registrations leave the window (normally
+  the oldest).
+- **Global**: at most `global_cap` unclaimed projects live (neither claimed
+  nor expired).
+- **Per project**: at most `port_cap` ports on an unclaimed project; a
+  claimed one has none.
+- **Kill switch**: off, it refuses registration only. Existing projects keep
+  their ports, take new ones and can be claimed, as fabric's
+  `provisional.enabled` does.
+- **Expiry**: the mock's clock is this machine's plus every
+  `POST /__mock/clock` so far. A registration expires 7 days on that clock,
+  and the 24-hour window is read on it. Each move sweeps, as fabric's sweep
+  does every 10 minutes: an unclaimed project past its expiry expires
+  (decision 0041), its `/ports` answers `410 expired`, its ports' data plane
+  answers `401` (fabric deletes the project's namespace), and its claim link
+  shows the expired page. A claimed project never expires.
 
 A handler error answers `500 mock_error` and is written to the mock's
 standard error, with credentials redacted.
@@ -417,6 +452,58 @@ The prod-safe contract tests send requests the Console refuses, apart from
 the 65-character name: should production ever accept it, that run leaves one
 more unclaimed project to expire.
 
+## J3 and J9, on the mock
+
+The journey matrix's expiry (J3) and abuse (J9) journeys, as scripted calls
+with no model, against the mock only: production's expiry takes 7 days, and
+its caps and kill switch are shared state. Each resets the mock, drives its
+clock, caps and kill switch through the control routes, and writes
+`results/j3.json` or `results/j9.json`. CI runs both after J0 in
+`j0-mock.yml`.
+
+```sh
+pnpm j3 --env mock
+pnpm j9 --env mock
+```
+
+**J3, expiry** (`src/agent/j3.ts`), as agent `e2e-j3` from `192.0.2.3`:
+
+1. Register: the expiry is 7 days after the mock's now.
+2. Create a Blockfrost port on preprod, and it answers 2xx.
+3. Advance the clock 7 days less a minute: the project still takes a port.
+4. Advance two minutes more: the next port call is `410 expired`, with
+   `docs`.
+5. The first port's data plane request is refused.
+6. Register again: a new project, whose new port answers 2xx.
+7. Signed in, the expired project's claim link shows "This link has expired
+   or was already used", claiming it redirects nowhere, and its ports page
+   answers the person `404`.
+
+**J9, abuse** (`src/agent/j9.ts`), from three addresses in TEST-NET-1:
+
+1. From `192.0.2.9`, a registration, then, an hour later on the clock, two
+   more: all `200`.
+2. The fourth is `429 ip_cap`, with `retry_after_seconds` equal to
+   `Retry-After`: the 23 hours until the first is 24 hours old.
+3. A minute before that wait ends it is still `ip_cap`, with at most the
+   minute left; past it, the address registers again.
+4. The window slides: the next is `ip_cap` again, under the hour until the
+   second registration leaves it.
+5. One project takes three ports, and the fourth is `429 port_cap`.
+6. With the global limit one above the live projects, `192.0.2.20` registers
+   once, then gets `503 global_cap`; the limit goes back after.
+7. With the kill switch off, `192.0.2.30` gets `503 registration_disabled`,
+   while an existing project's port still answers and its project takes a new
+   one, and an existing project is claimed (`302` to its ports page, which
+   answers `200`). On again, registration opens.
+
+The claims go over HTTP with the mock's sign-in (any user name), and need
+no browser. A step reports statuses, codes and namespaces, never a body. As
+in J0, the last step checks that no credential the run held (API keys, port
+keys, claim tokens, user codes, session cookies) appears in its result or
+the mock's call log. A run that breaks outside its steps exits 3, a usage
+error (any `--env` but `mock`) 2.
+
 ## The port suite
 
 ```sh
@@ -539,8 +626,15 @@ answering each way production may (a redirect, a redirect back into the
 project, `/login`, an error page, a lost answer, a fabric outage on both
 routes), and J0 itself up to the browser against registrations and ports
 that fail or are cut short, or name no namespace or one that is not a DNS
-label. The CLI's tests name production where nothing listens. So no unit
-test reaches production.
+label. The mock's caps, kill switch and clock are tested over HTTP too
+(the client IP it counts by, the sliding window and its wait, the global and
+port limits, what the kill switch leaves working, which projects a clock move
+expires). J3 and J9 run whole on an in-process mock, then once on a mock that
+stops enforcing each rule in turn (the IP cap, its window, the port cap, the
+global cap, the kill switch, expiry, an expired project's data plane and its
+claim page): each break fails the step that holds the rule. A credential
+that reaches a result fails their leak step. The CLI's tests name production
+where nothing listens. So no unit test reaches production.
 
 `pnpm test:browser` (`test/browser/`) drives Chromium: J0 against a stand-in
 Console (the mock behind a proxy that adds the settings form's delete),
