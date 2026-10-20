@@ -61,6 +61,19 @@ describe('J3 and J9 on the mock', () => {
     })
   }
 
+  it('resets the mock it starts on, so each passes run after run on one long-lived mock', async () => {
+    const mock: Mock = await startMock({ port: 0 })
+    try {
+      for (const name of ['j9', 'j9', 'j3', 'j3', 'j9'] as const) {
+        const { code, result } = await journey(name, { ...environments.mock, console: mock.url })
+        assert.deepEqual(failed(result), [], `${name}: ${JSON.stringify(result.steps.filter((s) => !s.ok))}`)
+        assert.equal(code, 0)
+      }
+    } finally {
+      await mock.close()
+    }
+  })
+
   // Each rule the mock enforces, broken alone, fails the step that holds it,
   // and that step names what went wrong.
   const breaks: [Rule, MockJourney, string, RegExp][] = [

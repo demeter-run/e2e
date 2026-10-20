@@ -244,9 +244,10 @@ describe('the mock: caps, kill switch and clock', () => {
     return { apiKey: vars.get('DEMETER_API_KEY')!, projectId: vars.get('DEMETER_PROJECT_ID')! }
   }
 
-  it("counts registrations by the last X-Forwarded-For address, as the Console's one trusted hop does, or the connection's, three in 24 hours", async () => {
-    for (let i = 0; i < 3; i++) assert.equal((await from(`198.51.100.${i}, 192.0.2.1`)).status, 200)
-    const fourth = await from('192.0.2.1')
+  it("counts registrations by the last non-empty X-Forwarded-For address, as the Console's one trusted hop does, or the connection's, three in 24 hours", async () => {
+    // Fastify's parser drops empty entries, so a trailing comma still names 192.0.2.1.
+    for (const header of ['198.51.100.0, 192.0.2.1', '198.51.100.1, 192.0.2.1,', '192.0.2.1, ']) assert.equal((await from(header)).status, 200)
+    const fourth = await from('198.51.100.2, 192.0.2.1,,')
     assert.deepEqual(codeOf(fourth), [429, 'ip_cap'])
     const wait = errorBody(fourth)!.retry_after_seconds!
     assert.ok(wait > DAY - 60 && wait <= DAY, `retry_after_seconds ${wait}`)
@@ -288,7 +289,8 @@ describe('the mock: caps, kill switch and clock', () => {
     mocks.timers.enable({ apis: ['Date'], now: start })
     try {
       for (let i = 0; i < 3; i++) assert.equal((await from('192.0.2.1')).status, 200)
-      mocks.timers.tick(400)
+      // 600 ms in, the wait is 86399.4 s: rounding up gives 86400, rounding to the nearest 86399.
+      mocks.timers.tick(600)
       const fourth = await from('192.0.2.1')
       assert.equal(errorBody(fourth)!.retry_after_seconds, DAY)
       assert.equal(fourth.headers['retry-after'], String(DAY))
@@ -397,6 +399,16 @@ describe('the mock: caps, kill switch and clock', () => {
     assert.deepEqual((await advanceMockClock(env, 0)).expired, [])
     assert.equal((await createPort(env, credentials, BLOCKFROST)).status, 200)
     assert.deepEqual((await advanceMockClock(env, 7 * DAY - 60)).expired, [])
+    assert.deepEqual((await advanceMockClock(env, 120)).expired, [credentials.projectId])
+  })
+
+  it('keeps the expiry of a project revived before it, as registered', async () => {
+    const { credentials } = await registered()
+    await setMockState(env, { project: credentials.projectId, expired: true })
+    await advanceMockClock(env, DAY)
+    await setMockState(env, { project: credentials.projectId, expired: false })
+    assert.equal((await createPort(env, credentials, BLOCKFROST)).status, 200)
+    assert.deepEqual((await advanceMockClock(env, 6 * DAY - 60)).expired, [])
     assert.deepEqual((await advanceMockClock(env, 120)).expired, [credentials.projectId])
   })
 

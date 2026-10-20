@@ -484,12 +484,20 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl, brok
   /**
    * The client IP registration counts by, as the Console's Fastify takes it
    * behind its one trusted proxy (`TRUST_PROXY_HOPS`, 1 by default): the last
-   * `X-Forwarded-For` entry, the one that proxy wrote, so an entry the client
-   * put before it is ignored; or the connection's address. A run sets the
-   * header to act as several sources.
+   * non-empty `X-Forwarded-For` entry, the one that proxy wrote, so an entry
+   * the client put before it is ignored, and an empty one is skipped as
+   * Fastify's `forwarded` parser drops it; or the connection's address. A run
+   * sets the header to act as several sources.
    */
   const clientIp = (request: IncomingMessage): string =>
-    request.headers['x-forwarded-for']?.toString().split(',').at(-1)?.trim() || request.socket.remoteAddress || ''
+    request.headers['x-forwarded-for']
+      ?.toString()
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .at(-1) ||
+    request.socket.remoteAddress ||
+    ''
 
   /** Whether a request names the mock as its host: its base URL's name, or a loopback one. */
   const ownHost = (request: IncomingMessage) => {
