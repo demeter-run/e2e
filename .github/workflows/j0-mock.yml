@@ -1,0 +1,66 @@
+name: j0-mock
+
+# J0 and the whole agent contract suite against the agent-route mock
+# (src/mock/), on every pull request and push to main. Nothing here reaches
+# production or signs in as the test user. Report-only: nothing here is a
+# required status.
+#
+# The same contract tests run against production in agent-j0-probe.yml, so a
+# mock that drifts from the contract fails here, and a production that drifts
+# from the mock fails there.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  j0:
+    name: Contract suite and J0 on the mock
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps --only-shell chromium
+
+      # The mock keeps running for the job's later steps.
+      - name: Start the mock
+        run: |
+          pnpm mock --port 4010 > "$RUNNER_TEMP/mock.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:4010/__mock/calls; then exit 0; fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/mock.log"
+          exit 1
+
+      - name: Run the contract suite and J0 on the mock
+        run: pnpm j0 --env mock --contract all
+
+      # Redacted by the mock, and checked for credentials by the run itself.
+      - name: Save the mock's call log
+        if: always()
+        run: |
+          mkdir -p results
+          curl -sf http://127.0.0.1:4010/__mock/calls > results/mock-calls.json || echo "the mock did not answer"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: j0-mock-results
+          path: results/
+          if-no-files-found: ignore

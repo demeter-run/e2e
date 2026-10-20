@@ -1,0 +1,129 @@
+name: agent-j0-probe
+
+# The daily agent probe against production (umbrella ruling 3): J0 registers
+# as a coding agent with no account, creates a Free Blockfrost port on
+# preprod and requests it; the prod-safe contract tests run on that same
+# registration; the standing test user (e2e@txpipe.io) claims the project in
+# the browser; the request is made again; and J0 deletes the claimed
+# project, pass or fail. One registration per run, well inside fabric's caps
+# of 3 per IP and 200 unclaimed in 24 hours. Nothing is left to the expiry
+# sweep.
+#
+# - Daily at 18:00 UTC and on workflow_dispatch, with a boolean force_fail
+#   that makes the run fail on purpose. Only runs of main receive the IRM
+#   webhook, so a dispatch on another branch logs that its alert was skipped.
+# - It signs in as the test user, so it shares the production-test-user
+#   concurrency group with every job that does (J2 at 06:00 UTC, the port
+#   suite at 10:00 UTC).
+# - When the run fails before J0 starts (checkout, install or Chromium), one
+#   `e2e-agent-j0-setup` alert says so: nothing was probed that day, and no
+#   result alert would fire.
+
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: Fail the run on purpose, to prove the alert path
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Agent J0 against production
+    runs-on: ubuntu-latest
+    # Up to 3 minutes for the port to answer, and a minute for the delete.
+    timeout-minutes: 20
+    concurrency:
+      group: production-test-user
+      cancel-in-progress: false
+    outputs:
+      failed: ${{ steps.failed.outputs.step }}
+    steps:
+      - id: checkout
+        uses: actions/checkout@v4
+
+      - id: pnpm
+        uses: pnpm/action-setup@v4
+
+      - id: node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - id: install
+        run: pnpm install --frozen-lockfile
+
+      - id: chromium
+        name: Install Chromium
+        run: pnpm exec playwright install --with-deps --only-shell chromium
+
+      - id: probe
+        name: Run the prod-safe contract tests and J0 against production
+        env:
+          E2E_USER_PASSWORD: ${{ secrets.E2E_USER_PASSWORD }}
+          IRM_E2E_WEBHOOK_URL: ${{ github.ref == 'refs/heads/main' && secrets.IRM_E2E_WEBHOOK_URL || '' }}
+          FORCE_FAIL: ${{ inputs.force_fail == true }}
+        run: |
+          args=(--env production --contract prod-safe --alert)
+          if [[ "$FORCE_FAIL" == true ]]; then args+=(--force-fail); fi
+          pnpm j0 "${args[@]}"
+
+      # Only when the probe never started: a failed result has posted its own
+      # alert, so it names nothing here.
+      - id: failed
+        name: Name the failed setup step
+        if: failure() && steps.probe.outcome == 'skipped'
+        env:
+          OUTCOMES: |-
+            checkout ${{ steps.checkout.outcome }}
+            pnpm setup ${{ steps.pnpm.outcome }}
+            Node setup ${{ steps.node.outcome }}
+            install ${{ steps.install.outcome }}
+            Chromium install ${{ steps.chromium.outcome }}
+        run: awk '$NF == "failure" { sub(/ [^ ]+$/, ""); print "step=" $0; exit }' <<<"$OUTCOMES" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-j0-probe-results
+          path: results/
+          if-no-files-found: ignore
+
+  # As in contracts.yml: posted with curl and jq, needing no checkout or Node,
+  # which may be what failed. The webhook URL goes to curl on stdin, never on
+  # a command line or in the log.
+  setup-alert:
+    name: Alert when setup failed
+    needs: probe
+    if: failure() && needs.probe.outputs.failed != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          IRM_E2E_WEBHOOK_URL: ${{ github.ref == 'refs/heads/main' && secrets.IRM_E2E_WEBHOOK_URL || '' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FAILED: ${{ needs.probe.outputs.failed }}
+        run: |
+          if [[ -z "$IRM_E2E_WEBHOOK_URL" ]]; then
+            echo "alert skipped for agent-j0-setup: IRM_E2E_WEBHOOK_URL is not set"
+            exit 0
+          fi
+          jq -n --arg step "$FAILED" --arg link "$RUN_URL" '{
+            alert_uid: "e2e-agent-j0-setup",
+            title: "e2e agent probe setup failed (production)",
+            message: "\($step) failed before the probe started, so J0 and the agent contract were not run against production.",
+            state: "alerting",
+            link_to_upstream_details: $link
+          }' > "$RUNNER_TEMP/setup-alert.json"
+          if status=$(printf 'url = "%s"\n' "$IRM_E2E_WEBHOOK_URL" | curl -K - -s -o /dev/null -w '%{http_code}' \
+                --max-time 15 -H 'content-type: application/json' --data-binary "@$RUNNER_TEMP/setup-alert.json"); then
+            if [[ "$status" == 2* ]]; then echo "alert sent for agent-j0-setup"; else echo "alert failed with HTTP $status for agent-j0-setup"; fi
+          else
+            echo "alert failed for agent-j0-setup: curl exited $?"
+          fi

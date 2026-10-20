@@ -10,9 +10,9 @@ product repository, and it gates no other repository's pull requests. Each
 product repository keeps its own static checks. Drift between surfaces is
 caught here, afterwards, against production.
 
-Today it holds the harness and three contract checks. The journeys (a person's
-path from `demeter.run` to a first request, and an agent's) build on the same
-harness.
+Today it holds the harness, three contract checks, and the coding agent's
+journey (J0) with the agent-route mock it runs against on every merge. The
+person's journey (J2) builds on the same harness.
 
 Every check is **report-only**: a failure shows on this repository's pull
 requests or alerts from a scheduled run, but nothing here is a required status.
@@ -21,11 +21,13 @@ requests or alerts from a scheduled run, but nothing here is a required status.
 
 Node 22 (`.nvmrc`) and pnpm (the version in `package.json`'s
 `packageManager`; `corepack enable` provides it). No credentials: every
-surface the checks read is public.
+surface the checks read is public, and the mock issues its own. Only J0
+against production signs in, as the standing test user, with
+`E2E_USER_PASSWORD`.
 
 ```sh
 pnpm install
-pnpm exec playwright install chromium   # for intent's last two steps
+pnpm exec playwright install chromium   # for intent's last two steps and J0's claim
 ```
 
 ## Running a check
@@ -43,10 +45,13 @@ pnpm check all --env production             # every check
 | `--force-fail` | Add a check named `force-fail` that fails on purpose, to prove the alert path. |
 | `--results <dir>` | Where result files go (default `results/`). |
 
-Environments are named in `src/env.ts`. `production` is the only one:
+Environments are named in `src/env.ts`. `production` is
 `https://demeter.run` (website2), `https://console.demeter.run`,
 `https://legacy.demeter.run`, `https://rpc.demeter.run` (fabric's gRPC-web
-API) and the Auth0 tenant `https://txpipe.us.auth0.com`.
+API) and the Auth0 tenant `https://txpipe.us.auth0.com`. `mock` is the
+agent-route mock below, at `E2E_MOCK_URL` (default `http://127.0.0.1:4010`),
+standing in for the Console and the sign-in; the contract checks do not run
+against it.
 
 ## The checks
 
@@ -182,9 +187,160 @@ or a refused connection the same way (`src/surfaces/fabric.ts`).
 | 9 | `/assets/logos/favicon.ico` | 200 |
 | 10 | `https://legacy.demeter.run/faq` | 200 |
 
+## The agent-route mock
+
+A mock of the Console's agent routes and claim pages, built from the
+registration-and-claim contract that the devex context publishes
+(`solution/devex/contracts/registration-and-claim.md` in the Demeter domain):
+its sections "HTTP for agents", "Errors" and "Claim pages". It is a plain Node HTTP server
+(`src/mock/`) with no dependency, and every credential it issues is random and
+reaches nothing real. It has no sign-in or payment routes for agents yet:
+those arrive with the contract changes that add them, and extend the mock.
+
+```sh
+pnpm mock                                   # http://127.0.0.1:4010
+pnpm mock --port 4020 --host 0.0.0.0 --base-url http://mock.local:4020
+E2E_MOCK_URL=http://127.0.0.1:4020 pnpm j0 --env mock
+```
+
+`--base-url` is the origin the mock writes into claim and port URLs (by
+default, where it listens). `--env mock` reads the mock's URL from
+`E2E_MOCK_URL`.
+
+| Route | What it does |
+| --- | --- |
+| `POST /api/agent/register` | `{"agent": {"name", "version"?, "url"?}}` → the six dotenv lines in the contract's order; name required and at most 64 characters, version and url at most 256 |
+| `POST /api/agent/ports` | `dmtr-api-key` and `project-id` headers, `{"kind", "network", "throughputTier"?}` → `<PREFIX>_PORT_ID`, `<PREFIX>_URL`, `<PREFIX>_KEY`; checks in the Console's order (headers, body, network and tier, kind and its options, then key, expiry and the 3-port cap) |
+| `GET /data/<port id>/…` | the fake data plane each `_URL` points at: `200` JSON to a request carrying the port's key in `dmtr-api-key`, `401` otherwise, and `401` once its project expires |
+| `GET /claim/<token>`, `POST` | signed out, "Log in" and "Sign up" (and the page is remembered for after sign-in); signed in, the agent's identity, its ports and the expiry, a project-name field defaulting to the namespace, and "Claim project", which makes the user the owner, voids the token and the user code, and redirects to `/<namespace>/ports`. A used, unknown or expired token shows the expired page |
+| `GET /activate?code=…`, `POST` | the same, for a user code typed in any case, with or without the hyphen |
+| `GET /login`, `POST` | the mock's sign-in form: Auth0's field names (`#username`, `#password`, "Continue"), and any user name and password sign in |
+| `GET /<namespace>/ports` | the claimed project's ports, for its owner |
+
+Dotenv bodies are `text/plain; charset=utf-8` and errors JSON `{error,
+message, retry_after_seconds?, docs}`, both `Cache-Control: no-store`, with
+production's messages. Credentials take the contract's formats:
+`dmtr_apikey1…` keys, 32-byte base64url claim tokens, `XXXX-XXXX` user codes
+from the contract's alphabet, expiry 7 days ahead in RFC 3339 UTC. The port
+catalog (which kinds exist, and which networks each offers) is fabric's,
+copied into `src/mock/catalog.ts` with its date.
+
+### Control routes
+
+Under `/__mock/`, never on a contract path, and not logged:
+
+| Route | Body | Effect |
+| --- | --- | --- |
+| `POST /__mock/state` | `{"route": "register" \| "ports", "error": "<code>", "retry_after_seconds"?: <int>}` | every call to that route answers that error, any code of the contract's table with its status; `ip_cap` carries `retry_after_seconds` and `Retry-After` (86400 unless given) |
+| | `{"route": …, "error": null}` | stops it |
+| | `{"project": "<id or namespace>", "expired": true \| false}` | expires a project (`/ports` is `410 expired`, its ports stop answering, its claim link shows expired) or revives it |
+| `GET /__mock/calls` | | every other call so far, `[{method, path, status, headers}]`: claim tokens, user codes and every credential the mock issued are `[redacted]`, and `dmtr-api-key`, `cookie` and `authorization` are redacted whole |
+| `POST /__mock/reset` | | forgets every project, session, error state and call |
+
+```sh
+curl -s -X POST localhost:4010/__mock/state -d '{"route": "register", "error": "ip_cap", "retry_after_seconds": 600}'
+curl -s localhost:4010/__mock/calls | jq '.[] | "\(.method) \(.path) \(.status)"'
+curl -s -X POST localhost:4010/__mock/reset -d '{}'
+```
+
+### For local development and the agent evals
+
+The mock is what `agent-first-devex-journey-evals` points its agents at
+instead of production: an agent given `E2E_MOCK_URL` as its Console registers,
+creates ports, requests them and hands over a claim link exactly as the
+contract says, and the call log shows what it did. Error states put it on the
+paths production rarely takes (caps, the kill switch, an expired project).
+Because the contract suite below runs against both the mock and production,
+a mock that no longer behaves like production fails a run.
+
+## The agent contract suite
+
+`src/agent/contract.spec.ts` holds one test per rule of the contract's HTTP
+sections, and runs against any environment. Each test is tagged:
+
+- **`prod-safe`**: it reads, or uses the run's own registration. Run on
+  production, these use J0's one registration (before J0 claims it): the
+  register and ports bodies' line names and order, register's value formats
+  (UUID, namespace, key prefix, a claim URL on the Console with a 43-character
+  token, the user code, an expiry 7 days ahead), a 65-character agent name as
+  `400 invalid_request`, a bad key on `/ports` as `401 unauthenticated`,
+  mainnet and a paid tier as `403 pre_claim_limit`, an unknown kind as
+  `400 invalid_request`, and every error body as JSON with `error`, `message`
+  and `docs` that carries no credential.
+- **`mock-only`**: it needs a mock error state or more ports than a
+  production run may create: `ip_cap` with `retry_after_seconds` and an equal
+  `Retry-After`, `port_cap` on a fourth port, `global_cap`,
+  `registration_disabled`, and `expired`.
+
+A test reports statuses, codes and line names, never a body.
+
+```sh
+pnpm contract --env mock                   # every test, on a registration of its own
+pnpm contract --env mock --tag prod-safe   # one tag
+```
+
+On production the suite runs only inside J0 (`pnpm j0 --contract
+prod-safe`), which claims and deletes the registration it shares; `pnpm
+contract --env production` refuses.
+
+## J0, the coding agent's journey
+
+J0 is the main journey of the journey matrix
+(`solution/devex/contracts/journey-matrix.md`): a coding agent with no
+account, as scripted calls with no model, up to a claim by a person.
+
+```sh
+pnpm j0 --env mock --contract all                                    # what CI runs
+E2E_USER_PASSWORD=… pnpm j0 --env production --contract prod-safe    # the daily probe
+```
+
+It takes `--alert`, `--force-fail` and `--results` as `pnpm check` does, and
+`--contract all|prod-safe` to run the contract tests on its registration
+(`all` only on the mock). Its steps:
+
+1. register as agent `e2e-j0` and write the body to `.env.demeter`, in a
+   fresh temporary directory readable by this user only, never printed and
+   removed at the end;
+2. create a Blockfrost port (`BlockfrostPort`) on `cardano-preprod` and
+   append its body; the contract tests run here, on this registration;
+3. `GET <_URL>/blocks/latest` with `dmtr-api-key: <_KEY>` until it answers
+   2xx, every 5 s for up to 3 minutes while the port comes up;
+4. claim in Chromium: open `DEMETER_CLAIM_URL`, "Log in", sign in (the
+   mock's form as any user, or Auth0 as `e2e@txpipe.io`), check the project
+   name defaults to the namespace, "Claim project", and land on
+   `/<namespace>/ports`;
+5. the same request with the same key still answers 2xx;
+6. on production, delete the claimed project through the Console, pass or
+   fail, and wait until its pages stop loading. The delete posts the
+   settings page's form without following its redirect to `/`, which would
+   create "My First Project" for a user left with none. On the mock instead,
+   the call log holds exactly the calls steps 1–5 made.
+
+A last step checks that no credential the run held (API key, port key,
+claim token, user code, the test user's password) appears in either result
+or, on the mock, in the call log; every detail is scrubbed before it is
+written anyway. In GitHub Actions each credential is also masked in the job
+log as it arrives.
+
+### What the probe does in production
+
+Once a day it creates one provisional project, one Free (tier `0`) Blockfrost
+port on preprod and a handful of requests, all deleted within minutes: about
+$0 a run. One registration a day sits well inside the caps of 3 per client
+IP and 200 unclaimed projects in 24 hours, and the expiry sweep gets no
+traffic from it. A run that fails before the claim leaves its provisional
+project to expire in 7 days, and says so in its delete step. It signs in as
+the standing test user only, in the browser, and creates nothing on that
+user's account that outlives the run.
+
+The prod-safe contract tests send requests the Console refuses, apart from
+the 65-character name: should production ever accept it, that run leaves one
+more unclaimed project to expire.
+
 ## Results and alerts
 
-Every check and journey writes `results/<name>.json`:
+Every check and journey writes `results/<name>.json` (J0's run writes
+`j0.json` and `agent-contract.json`):
 
 ```json
 {
@@ -224,8 +380,11 @@ where each came from. A variant is a copy of a captured page with one edit.
 Requests, alerts and the `pricing` check end to end run against local servers
 serving those captures (an HTTP/2 one for fabric), `apex` against a local apex
 answering as production does, intent's browser steps against a stand-in page,
-and `pnpm check` itself against stand-in checks, so no unit test reaches
-production.
+and `pnpm check` itself against stand-in checks. The mock is tested over HTTP
+(routes, error states, claim pages, redaction), and the contract suite and
+`pnpm contract` against an in-process mock, including through a proxy that
+renames one dotenv line, which the suite must fail. So no unit test reaches
+production. J0's browser steps run in `j0-mock.yml`.
 
 ## Workflows
 
@@ -247,13 +406,28 @@ production.
   job posts it with `curl` and `jq`, needing no checkout or Node, which may be
   what failed.
 
+`.github/workflows/j0-mock.yml` runs on `pull_request` and on `push` to
+`main`: it starts the mock, runs `pnpm j0 --env mock --contract all`, and
+uploads the results and the mock's (redacted) call log. Nothing in it reaches
+production.
+
+`.github/workflows/agent-j0-probe.yml` runs daily at 18:00 UTC and on
+`workflow_dispatch` (with `force_fail`): `pnpm j0 --env production
+--contract prod-safe --alert`, so each failed result posts its IRM alert
+(`e2e-j0`, `e2e-agent-contract`). Only runs of `main` receive the webhook. A
+failure before J0 starts (checkout, install or Chromium) posts one
+`e2e-agent-j0-setup` alert from a `curl` and `jq` job, as `contracts.yml`
+does. A dispatch needs the workflow on `main`: GitHub dispatches no
+workflow that the default branch does not have.
+
 Any job that signs in as the standing test user sets the concurrency group
 `production-test-user` (`cancel-in-progress: false`), so no two runs use the
-user at once. None does yet.
+user at once. The probe does.
 
 ### Secrets
 
 | Name | Used by | For |
 | --- | --- | --- |
 | `IRM_E2E_WEBHOOK_URL` | scheduled and dispatched runs of `main` | the IRM integration alerts post to |
-| `E2E_USER_PASSWORD`, `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET` | the journeys | signing in as the standing test user |
+| `E2E_USER_PASSWORD` | the agent probe, and the journeys | signing in as the standing test user |
+| `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET` | the journeys | signing in as the standing test user |
