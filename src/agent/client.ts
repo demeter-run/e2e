@@ -99,7 +99,7 @@ export const createPort = (env: Environment, credentials: Credentials, body: Rec
 /** The port J0 creates, and the one the contract's ports rules read: the cheapest real port, Free on preprod. */
 export const J0_PORT = { kind: 'BlockfrostPort', network: 'cardano-preprod' } as const
 
-/** A project namespace, as the contract has it: a DNS label. */
+/** A project namespace, as fabric generates it: a DNS label. */
 export const NAMESPACE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/
 
 /**
