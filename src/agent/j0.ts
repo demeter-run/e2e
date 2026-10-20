@@ -226,6 +226,7 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
     })
 
     await run.step('after the claim, the same request with the same key still answers 2xx', async () => {
+      if (!claimed) fail('not run: the claim did not land, so no request comes after it')
       const { url, key } = await port()
       // The port is up: only a missing or 5xx answer is worth another try.
       const { answer, statuses, elapsed } = await request(url, key, 30_000, 5_000, (a) => a.status === null || a.status >= 500)
