@@ -18,16 +18,18 @@ name: agent-j0-probe
 #   merges. GitHub dispatches only workflows already on the default branch.
 # - It signs in as the test user, so it shares the production-test-user
 #   concurrency group with every job that does (J2 at 06:00 UTC, the port
-#   suite at 10:00 UTC). `queue: max` keeps it waiting there: by default a
-#   newer job in the group cancels the one pending, which would lose the
-#   day's probe to a pull request's run.
+#   suite at 10:00 UTC). `queue: max` keeps it waiting there, but only while
+#   every job of the group sets it: by default a newer job in the group
+#   cancels the one pending, and a job without it still cancels every
+#   pending one when it comes up (a J2 run did so to this probe on
+#   2026-10-20), losing the day's probe to a pull request's run.
 # - When the probe reports nothing, one alert says so, as no result alert
 #   would fire: `e2e-agent-j0-setup` when the job failed before J0 reported
 #   (its set-up or runner, the checkout, install or Chromium, or J0 exiting
 #   without results: a usage error, or a break outside its steps), and
 #   `e2e-agent-j0-cancelled` when the job was cancelled (its 30 minutes ran
-#   out, or someone cancelled it), which may leave a claimed project on the
-#   test user's account.
+#   out, another job of the group took its place, or someone cancelled it),
+#   which may leave a claimed project on the test user's account.
 
 on:
   pull_request:
@@ -157,7 +159,7 @@ jobs:
           if [[ "$CANCELLED" == true ]]; then
             uid=agent-j0-cancelled
             title="e2e agent probe cancelled (production)"
-            message="The probe was cancelled before it finished: its 30 minutes ran out, or someone cancelled it. If it had claimed its project, the project may still be on the test user's account."
+            message="The probe was cancelled before it finished: its 30 minutes ran out, another job of production-test-user took its place, or someone cancelled it. If it had claimed its project, the project may still be on the test user's account."
           else
             uid=agent-j0-setup
             title="e2e agent probe reported nothing (production)"

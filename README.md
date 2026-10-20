@@ -510,14 +510,17 @@ When the probe reports nothing, a `curl` and `jq` job posts one alert, as
 reported (its set-up or runner, the checkout, install or Chromium, or J0
 exiting with no result: a usage error, or a break outside its steps), and
 `e2e-agent-j0-cancelled` when the job was cancelled (its 30 minutes ran out,
-or someone cancelled it), since a claimed project may then be left on the
-test user's account.
+another job of the concurrency group took its place, or someone cancelled
+it), since a claimed project may then be left on the test user's account.
 
 Any job that signs in as the standing test user sets the concurrency group
 `production-test-user` (`cancel-in-progress: false`), so no two runs use the
 user at once. The probe does, with `queue: max`: by default a newer job in
 the group cancels the one pending, which would lose the day's probe to a
-pull request's run. The probe's third-party action (`pnpm/action-setup`) is
+pull request's run. That holds only while every job of the group sets it,
+as a job without it cancels every pending one when it comes up; a J2 run
+did so to this probe on 2026-10-20. The probe's third-party action
+(`pnpm/action-setup`) is
 pinned by commit, as that job holds the test user's password.
 
 ### Secrets
