@@ -17,8 +17,11 @@ import { keyMasks } from '../../src/journeys/console.ts'
 
 const key = 'blockfrost1qpzry9x8gf2tvdw0s3jn5'
 
-/** The port page, as the Console lays it out, with `heading` over the key's section and `label` beside the key. */
-const portPage = (heading: string, label: string, secret: string) => `<!doctype html>
+/** The labels of the rows that write the key, as the Console shows them and drifted. */
+const labels = { shown: ['Auth Token', 'Authenticated Endpoint URL'], drifted: ['API key', 'Keyed endpoint'] }
+
+/** The port page, as the Console lays it out, with `heading` over the key's section and `label`s beside the key's rows. */
+const portPage = (heading: string, [label, url]: string[], secret: string) => `<!doctype html>
 <style>body { font: 14px sans-serif; } .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .value { grid-column: span 3; display: flex; } .copy { margin-left: 12px; }</style>
 <div>
@@ -28,7 +31,7 @@ const portPage = (heading: string, label: string, secret: string) => `<!doctype 
   </div></div>
   <div><h2>${heading}</h2><div class="grid">
     <div class="label"><div>Endpoint URL</div></div><div class="value"><div>https://cardano-preprod.blockfrost-m1.demeter.run</div><div class="copy">⧉</div></div>
-    <div class="label"><div>Authenticated Endpoint URL</div></div><div class="value"><div>https://${secret}.cardano-preprod.blockfrost-m1.demeter.run</div><div class="copy">⧉</div></div>
+    <div class="label"><div>${url}</div></div><div class="value"><div>https://${secret}.cardano-preprod.blockfrost-m1.demeter.run</div><div class="copy">⧉</div></div>
     <div class="label"><div>${label}</div></div><div class="value"><div>${secret}</div><div class="copy">⧉</div></div>
   </div></div>
 </div>`
@@ -96,14 +99,16 @@ describe('the key masks', () => {
   }
 
   const drifted = 'KEY-7F3A9C21B04E55D6A8'
-  const cases: [string, string, string, string, boolean][] = [
-    ['as the Console renders it', 'Instance info', 'Auth Token', key, false],
-    ['under a heading that drifted', 'Instance information', 'Auth Token', key, false],
-    ['beside a label that drifted', 'Instance info', 'API key', key, false],
-    ['of a shape that drifted', 'Instance info', 'Auth Token', drifted, false],
-    ['under a heading and beside a label that both drifted', 'Connection', 'API key', key, false],
-    ['of a shape and beside a label that both drifted', 'Instance info', 'API key', drifted, false],
-    ['under a heading, beside a label and of a shape that all drifted, once the key is known', 'Connection', 'API key', drifted, true],
+  // Each drift alone, each pair of them, and all three once the key is known.
+  const cases: [string, string, string[], string, boolean][] = [
+    ['as the Console renders it', 'Instance info', labels.shown, key, false],
+    ['under a heading that drifted', 'Instance information', labels.shown, key, false],
+    ['beside labels that drifted', 'Instance info', labels.drifted, key, false],
+    ['of a shape that drifted', 'Instance info', labels.shown, drifted, false],
+    ['under a heading and beside labels that both drifted', 'Connection', labels.drifted, key, false],
+    ['of a shape and beside labels that both drifted', 'Instance info', labels.drifted, drifted, false],
+    ['of a shape and under a heading that both drifted', 'Connection', labels.shown, drifted, false],
+    ['under a heading, beside labels and of a shape that all drifted, once the key is known', 'Connection', labels.drifted, drifted, true],
   ]
   for (const [what, heading, label, secret, known] of cases) {
     it(`paint over a key ${what}`, async () => {
@@ -122,7 +127,7 @@ describe('the key masks', () => {
   it('leave the key showing with no mask, so the check can fail', async () => {
     const page = await browser.newPage()
     try {
-      await page.setContent(portPage('Connection', 'API key', key))
+      await page.setContent(portPage('Connection', labels.drifted, key))
       const { left, checked } = await unmasked(page, key, [], 'no-mask')
       assert.ok(left > checked / 2, `${left} of ${checked} pixels unpainted`)
     } finally {

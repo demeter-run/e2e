@@ -257,18 +257,25 @@ export const detailSection = (page: Page, heading: string) => page.getByRole('he
 export const keyShape = /[a-z_]+1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{19,}/
 
 /**
+ * The rows of a port's detail page that write its key: the "Auth Token", and
+ * the "Authenticated Endpoint URL" built on it (fabric's
+ * `bootstrap/rpc/crds/blockfrostport.hbs`).
+ */
+export const keyRows = ['Auth Token', 'Authenticated Endpoint URL']
+
+/**
  * What a screenshot of a Console page paints over so that no port's key
- * shows. The detail page writes the key in the "Auth Token" row and inside the
- * "Authenticated Endpoint URL" (fabric's `bootstrap/rpc/crds/blockfrostport.hbs`),
- * both under "Instance info". Each mask is found on its own, so a heading, a
- * label or the key's shape that drifts loses one mask, never the key: any text
- * of the key's shape, the "Auth Token" row's value wherever it is, the
- * "Instance info" section, and the `key` itself once it is known.
+ * shows. The detail page writes the key in each of `keyRows`, both under
+ * "Instance info". Each mask is found on its own, so that the key stays
+ * covered while any two of the section's heading, the rows' labels and the
+ * key's shape drift: any text of the key's shape, each key row's value
+ * wherever it is, the "Instance info" section, and the `key` itself once it
+ * is known.
  */
 export function keyMasks(page: Page, key?: string): Locator[] {
   return [
     page.getByText(keyShape),
-    page.getByText('Auth Token', { exact: true }).locator('xpath=../following-sibling::*[1]'),
+    ...keyRows.map((label) => page.getByText(label, { exact: true }).locator('xpath=../following-sibling::*[1]')),
     detailSection(page, 'Instance info'),
     ...(key ? [page.getByText(key)] : []),
   ]
