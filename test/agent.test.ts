@@ -22,7 +22,7 @@ import { type Environment, environment, environments } from '../src/env.ts'
 import { mockCalls, mockState, resetMock, setMockState } from '../src/mock/control.ts'
 import { type Mock, startMock } from '../src/mock/server.ts'
 import { Run, type Result } from '../src/report.ts'
-import { type Served, serve, withEnv } from './helpers.ts'
+import { refusedUrl, type Served, serve, withEnv } from './helpers.ts'
 
 // Under node:test, a `::add-mask::` line that `Secrets` prints reaches the job
 // log as a `# ` diagnostic, which Actions does not read as a command: every
@@ -206,6 +206,8 @@ describe('the contract suite', () => {
   })
 
   it('fails each value, header and line the contract fixes, when it alone drifts', async () => {
+    // Seven days ahead to the second, as UTC with its Z, so only the zone a case writes is wrong.
+    const inSevenDays = () => new Date(Math.floor(Date.now() / 1000) * 1000 + 7 * 86_400_000).toISOString().replace('.000Z', 'Z')
     const register = (edit: (body: string) => string) => onBody('/api/agent/register', edit)
     const ports = (edit: (body: string) => string) => onBody('/api/agent/ports', (body) => (body.includes('_KEY=') ? edit(body) : body))
     const cases: [string, (answer: AgentAnswer, request: Seen) => AgentAnswer, string, RegExp][] = [
@@ -244,18 +246,67 @@ describe('the contract suite', () => {
         /^DEMETER_EXPIRES_AT "[^"]+" is not an RFC 3339 UTC date$/,
       ],
       [
+        'an expiry with no zone',
+        register((b) => b.replace(/DEMETER_EXPIRES_AT=.*/, `DEMETER_EXPIRES_AT=${inSevenDays().replace('Z', '')}`)),
+        "[prod-safe] register's values",
+        /^DEMETER_EXPIRES_AT "[^"]+" is not an RFC 3339 UTC date$/,
+      ],
+      [
+        'an expiry with a zone written +0000',
+        register((b) => b.replace(/DEMETER_EXPIRES_AT=.*/, `DEMETER_EXPIRES_AT=${inSevenDays().replace('Z', '+0000')}`)),
+        "[prod-safe] register's values",
+        /^DEMETER_EXPIRES_AT "[^"]+\+0000" is not an RFC 3339 UTC date$/,
+      ],
+      [
+        'a user code with a letter outside the alphabet',
+        register((b) => b.replace(/DEMETER_USER_CODE=./, 'DEMETER_USER_CODE=O')),
+        "[prod-safe] register's values",
+        /^DEMETER_USER_CODE is not XXXX-XXXX in the contract alphabet$/,
+      ],
+      [
+        'a register answer that is plain text with no charset',
+        (answer, request) => (request.path === '/api/agent/register' && answer.status === 200 ? { ...answer, headers: { ...answer.headers, 'content-type': 'text/plain' } } : answer),
+        '[prod-safe] register answers a dotenv body',
+        /^register's dotenv answer: Content-Type is "text\/plain", wanted "text\/plain; charset=utf-8"$/,
+      ],
+      [
+        'a ports answer of another type',
+        (answer, request) => (request.path === '/api/agent/ports' && answer.status === 200 ? { ...answer, headers: { ...answer.headers, 'content-type': 'text/html' } } : answer),
+        '[prod-safe] ports answers',
+        /^ports's dotenv answer: Content-Type is "text\/html", wanted "text\/plain; charset=utf-8"$/,
+      ],
+      [
+        'a ports answer that may be cached',
+        (answer, request) => (request.path === '/api/agent/ports' && answer.status === 200 ? { ...answer, headers: { ...answer.headers, 'cache-control': 'private' } } : answer),
+        '[prod-safe] ports answers',
+        /^ports's dotenv answer: Cache-Control is "private", wanted "no-store"$/,
+      ],
+      [
         'ports with no _URL',
         ports((b) => b.replace(/^DEMETER_BLOCKFROST_PREPROD_URL=.*\n/m, '')),
         '[prod-safe] ports answers',
         /answered DEMETER_BLOCKFROST_PREPROD_PORT_ID, DEMETER_BLOCKFROST_PREPROD_KEY, wanted/,
       ],
       ['a _URL that is not a URL', ports((b) => b.replace(/^(DEMETER_BLOCKFROST_PREPROD_URL)=.*$/m, '$1=not-a-url')), '[prod-safe] ports answers', /^DEMETER_BLOCKFROST_PREPROD_URL is empty or not a URL$/],
+      ['a _URL of another scheme', ports((b) => b.replace(/^(DEMETER_BLOCKFROST_PREPROD_URL)=http/m, '$1=ftp')), '[prod-safe] ports answers', /^DEMETER_BLOCKFROST_PREPROD_URL is empty or not a URL$/],
       ['an empty _KEY', ports((b) => b.replace(/^(DEMETER_BLOCKFROST_PREPROD_KEY)=.*$/m, '$1=')), '[prod-safe] ports answers', /^DEMETER_BLOCKFROST_PREPROD_KEY is empty or not a URL$/],
       [
         'an unknown kind whose message lists no kinds',
         onError((answer) => ({ ...answer, body: answer.body.replace(/use one of [A-Za-z, ]+\./, 'use a kind the Console knows.') })),
         '[prod-safe] the port catalog',
         /^an unknown kind answered 400 invalid_request with no list of kinds, so a kind the mock lacks would go unseen$/,
+      ],
+      [
+        'an unknown kind whose list lost one the mock knows',
+        onError((answer) => ({ ...answer, body: answer.body.replace(', UtxoRpcPort.', '.') })),
+        '[prod-safe] the port catalog',
+        /^the mock knows UtxoRpcPort, which the Console does not$/,
+      ],
+      [
+        "an ip_cap whose retry_after_seconds is not the mock's",
+        onError((answer) => ({ ...answer, body: answer.body.replace('"retry_after_seconds":4321', '"retry_after_seconds":60') })),
+        '[mock-only] ip_cap',
+        /^retry_after_seconds is 60, wanted the mock's 4321$/,
       ],
     ]
     for (const [what, rewrite, step, detail] of cases) assert.match(failedDetail(await contractThrough(rewrite), step), detail, what)
@@ -291,6 +342,13 @@ describe('the agent CLI', () => {
   let dir: string
   let log: ReturnType<typeof mocks.method>
   let error: ReturnType<typeof mocks.method>
+  /** Production by name, where nothing listens: a guard that regressed would fail here, not register there. */
+  let production: Environment
+
+  before(async () => {
+    const dead = await refusedUrl()
+    production = { ...environments.production, website: dead, console: dead, legacy: dead, rpc: dead, auth0: dead }
+  })
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'e2e-agent-'))
@@ -303,7 +361,7 @@ describe('the agent CLI', () => {
     await rm(dir, { recursive: true, force: true })
   })
 
-  const lookup = (name: string) => (name === 'mock' ? env : environment(name))
+  const lookup = (name: string) => (name === 'mock' ? env : name === 'production' ? production : environment(name))
   const quiet = { IRM_E2E_WEBHOOK_URL: undefined, GITHUB_STEP_SUMMARY: undefined, GITHUB_ACTIONS: undefined }
   const run = (suite: 'j0' | 'contract', vars: Record<string, string | undefined>, ...argv: string[]) =>
     withEnv({ ...quiet, ...vars }, () => main(suite, [...argv, '--results', dir], { lookup }))
@@ -478,11 +536,14 @@ describe('J0 up to the browser', () => {
     }
   })
 
-  /** J0 against a stand-in Console whose register answers as `answer` does, so the delete step runs as on production. */
-  async function j0Against(answer: (response: ServerResponse, socket: Socket) => void): Promise<Result> {
+  type Answers = (response: ServerResponse, socket: Socket) => void
+
+  /** J0 against a stand-in Console whose register (and ports) answer as given, so the delete step runs as on production. */
+  async function j0Against(register: Answers, ports?: Answers): Promise<Result> {
     const standIn = await serve((request, response) => {
       request.resume()
-      if (request.url === '/api/agent/register') answer(response, request.socket)
+      if (request.url === '/api/agent/register') register(response, request.socket)
+      else if (request.url === '/api/agent/ports' && ports) ports(response, request.socket)
       else response.writeHead(404).end()
     })
     try {
@@ -514,6 +575,52 @@ describe('J0 up to the browser', () => {
     })
     assert.equal(step(result, 'register as agent').detail, 'register answered 200, but the body did not finish: ECONNRESET, wanted 200')
     assert.match(step(result, 'delete').detail, /^register answered 200, but the body did not finish: ECONNRESET: a project may have been registered without this run learning it/)
+  })
+
+  /** A register body whole but for `drop`, with its claim URL off every Console, so no browser opens. */
+  const registered = (drop = '') => (response: ServerResponse) =>
+    response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end(
+      [
+        'DEMETER_PROJECT_ID=7e0b2f9c-0000-4000-8000-000000000000',
+        'DEMETER_PROJECT_NAMESPACE=prj-stand-in-abc123',
+        'DEMETER_API_KEY=dmtr_apikey1qqqqqqqq',
+        'DEMETER_CLAIM_URL=http://elsewhere.invalid/claim/stand-in-token',
+        'DEMETER_USER_CODE=ABCD-2345',
+        'DEMETER_EXPIRES_AT=2026-10-27T12:00:00Z',
+      ]
+        .filter((line) => !drop || !line.startsWith(drop))
+        .map((line) => `${line}\n`)
+        .join(''),
+    )
+
+  it('fails a ports 200 whose body did not finish, naming the reset', async () => {
+    const result = await j0Against(registered(), (response, socket) => {
+      response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'content-length': '500' })
+      response.write('DEMETER_BLOCKFROST_PREPROD_PORT_ID=port-1\n')
+      setTimeout(() => socket.destroy(), 20)
+    })
+    assert.equal(step(result, 'create a Blockfrost port').detail, 'ports answered 200, but the body did not finish: ECONNRESET, wanted 200')
+  })
+
+  it('claims nothing when register names no namespace, as a claimed project could not be found to delete', async () => {
+    // On the stand-in's own origin, so only the missing namespace keeps the browser shut.
+    const standIn = await serve((request, response) => {
+      request.resume()
+      if (request.url !== '/api/agent/register') return response.writeHead(404).end()
+      const origin = `http://${request.headers.host}`
+      response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end(`DEMETER_PROJECT_ID=7e0b2f9c-0000-4000-8000-000000000000\nDEMETER_CLAIM_URL=${origin}/claim/stand-in-token\n`)
+    })
+    try {
+      const run = new Run('j0', 'standin')
+      const url = standIn.url
+      await j0({ env: { name: 'standin', website: url, console: url, legacy: url, rpc: url, auth0: url }, run, secrets: new Secrets(), user: 'e2e@txpipe.io', password: 'x', waits: fast })
+      const result = run.finish()
+      assert.equal(step(result, 'claim in the browser').detail, 'not run: register named no namespace, so a claimed project could not be found to delete')
+      assert.equal(step(result, 'after the claim').detail, 'not run: no claim was sent, so no request comes after it')
+      assert.equal(step(result, 'delete').detail, 'register answered 200 but named no namespace: its project cannot be found, and expires unclaimed within 7 days')
+    } finally {
+      await standIn.close()
+    }
   })
 
   it('fails the delete step when a 200 names no namespace, as its project cannot be found', async () => {

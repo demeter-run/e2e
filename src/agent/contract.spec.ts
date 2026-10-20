@@ -22,10 +22,11 @@ import {
 
 /**
  * The registration-and-claim contract's HTTP rules, one test per rule, run
- * against any environment: the same file runs on the mock in CI and on
- * production in the daily probe, so the mock cannot drift from production
- * unnoticed (`solution/devex/contracts/registration-and-claim.md`, "HTTP for
- * agents" and "Errors").
+ * against any environment: the same file runs on the mock in CI and, for its
+ * prod-safe tests, on production in the daily probe, so on those rules the
+ * mock cannot drift from production unnoticed. The mock-only rules are held
+ * to the contract alone (`solution/devex/contracts/registration-and-claim.md`,
+ * "HTTP for agents" and "Errors").
  *
  * Each test is tagged:
  *

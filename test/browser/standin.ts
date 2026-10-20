@@ -16,16 +16,28 @@ export interface Breaks {
   claimPage?: 'first' | 'signed-in'
   /** `GET /claim/<token>` never answers. */
   hangClaimPage?: boolean
-  /** The claim form's project name comes empty. */
-  emptyName?: boolean
+  /**
+   * The claim form's project name is emptied as the page finishes loading,
+   * by a script that delays its `load`, as production's hydration does. The
+   * signed-in claim page first comes as a page that reloads itself by
+   * script, as a sign-in callback may, so the sign-in's own wait for a page
+   * load ends before the claim form's page loads.
+   */
+  hydrationEmptiesName?: boolean
   /** The claim's post never reaches the mock: it is redirected to the project's page, which answers 500 as it does to a user who does not own it. */
   claimLost?: boolean
-  /** The first request for the project's page from outside the browser gets a reset. */
-  resetFirstCheck?: boolean
+  /**
+   * The claim form posts by fetch, as production's hydrated form does, and
+   * the post answers 500 with the Console's error, which the page shows: a
+   * claim fabric refused. The browser stays on the claim page.
+   */
+  claimRefused?: boolean
+  /** How many requests for the project's page from outside the browser get a reset, from the first. */
+  resetChecks?: number
 }
 
 export interface StandIn extends Served {
-  /** The calls the proxy answered itself, or held: `POST /<ns>/settings <body>`, `GET /claim held`. */
+  /** The calls the proxy answered itself, or held: `POST /<ns>/settings <body>`, `GET /claim held`, `POST /login <body>`. */
   readonly log: string[]
   /** The mock's session cookie, once the sign-in set it. */
   readonly sessionCookie: string
@@ -50,7 +62,7 @@ export async function standIn(breaks: Breaks = {}): Promise<StandIn> {
   let upstream = ''
 
   /** Forwards to the mock, rewriting its body when asked; the mock's headers (two Set-Cookie among them) go back as they came. */
-  const forward = (req: IncomingMessage, res: ServerResponse, rewrite?: (body: string) => string) => {
+  const forward = (req: IncomingMessage, res: ServerResponse, rewrite?: (body: string) => string, sent?: string) => {
     const up = httpRequest(`${upstream}${req.url}`, { method: req.method, headers: req.headers, agent: false }, (answer) => {
       const cookie = /mock_session=([^;]+)/.exec([answer.headers['set-cookie'] ?? []].flat().join('\n'))?.[1]
       if (cookie) sessionCookie = cookie
@@ -68,8 +80,26 @@ export async function standIn(breaks: Breaks = {}): Promise<StandIn> {
       })
     })
     up.on('error', () => res.destroy())
-    req.pipe(up)
+    if (sent === undefined) req.pipe(up)
+    else up.end(sent)
   }
+
+  /** Scripts the claim form's page gets, on the load where it has the form. */
+  const scripts = [
+    breaks.hydrationEmptiesName ? '<script async src="/__standin/hydrate.js"></script>' : '',
+    breaks.claimRefused
+      ? `<script>
+document.querySelector('form').addEventListener('submit', async (event) => {
+  event.preventDefault()
+  const answer = await fetch(event.target.action + '?_data=routes%2Fclaim.%24token', { method: 'POST', body: new URLSearchParams(new FormData(event.target)) })
+  const alert = document.createElement('p')
+  alert.setAttribute('role', 'alert')
+  alert.textContent = (await answer.json()).error
+  event.target.append(alert)
+})
+</script>`
+      : '',
+  ].join('')
 
   const served = await serve(async (req, res) => {
     const path = new URL(req.url ?? '/', 'http://x').pathname
@@ -88,7 +118,17 @@ export async function standIn(breaks: Breaks = {}): Promise<StandIn> {
     if (ports && req.method === 'GET') {
       if (deleted.has(ports[1]!) || lost) return page(500)
       // Chromium marks its navigations; Playwright's request API does not.
-      if (breaks.resetFirstCheck && req.headers['sec-fetch-mode'] !== 'navigate' && checks++ === 0) return req.socket.destroy()
+      if (req.headers['sec-fetch-mode'] !== 'navigate' && checks++ < (breaks.resetChecks ?? 0)) return req.socket.destroy()
+    }
+    if (path === '/__standin/hydrate.js') {
+      // Late enough that the button shows well before the page's load.
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      return res.writeHead(200, { 'content-type': 'text/javascript' }).end(`document.querySelector('input[name="name"]').value = ''`)
+    }
+    if (path === '/login' && req.method === 'POST') {
+      const body = await text(req)
+      log.push(`POST /login ${body}`)
+      return forward(req, res, undefined, body)
     }
     if (claim && req.method === 'GET') {
       claimLoads += 1
@@ -97,12 +137,20 @@ export async function standIn(breaks: Breaks = {}): Promise<StandIn> {
         return void held.push(res)
       }
       if (breaks.claimPage === (claimLoads === 1 ? 'first' : 'signed-in')) return page(500)
-      if (breaks.emptyName) return forward(req, res, (body) => body.replace(/(<input[^>]*name="name"[^>]*value=")[^"]*"/, '$1"'))
+      if (breaks.hydrationEmptiesName && claimLoads === 2) {
+        return res.writeHead(200, { 'content-type': 'text/html' }).end('<p>Signing you in…</p><script>setTimeout(() => location.reload(), 100)</script>')
+      }
+      if (scripts) return forward(req, res, (body) => (body.includes('name="name"') ? body.replace('</body>', `${scripts}</body>`) : body))
     }
     if (claim && req.method === 'POST' && breaks.claimLost) {
       req.resume()
       lost = true
       return res.writeHead(302, { location: `/${namespace}/ports` }).end()
+    }
+    if (claim && req.method === 'POST' && breaks.claimRefused) {
+      req.resume()
+      log.push('POST /claim refused')
+      return res.writeHead(500, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'The project could not be claimed. Try again.' }))
     }
     if (path === '/api/agent/register') {
       return forward(req, res, (body) => {

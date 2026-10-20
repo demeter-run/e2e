@@ -136,6 +136,16 @@ describe("J0's delete through the Console", () => {
     assert.equal(asked().length, 5, 'one failed page load between two that loaded was taken for the delete')
   })
 
+  it('takes a redirect back into the project for no delete, as the settings loader sends a user who is not its owner there', async () => {
+    const { ok, detail } = await remove({ settings: [{ redirect: `/${NS}/ports` }], ports: [500] })
+    assert.ok(!ok)
+    assert.equal(
+      detail,
+      `POST /${NS}/settings answered 302 back to /${NS}/ports, then 302 back to /${NS}/ports, then 302 back to /${NS}/ports, never the redirect that follows a delete: the delete is unconfirmed, and ${NS} may still be on e2e@txpipe.io's account`,
+    )
+    assert.ok(asked().every((c) => c.startsWith('POST ')), 'it looked for the project to be gone')
+  })
+
   it('fails when the project page still loads, or redirects, after the delete', async () => {
     const loads = await remove({ settings: [{ redirect: '/' }], ports: [200] })
     assert.ok(!loads.ok)
@@ -159,5 +169,13 @@ describe("J0's delete through the Console", () => {
       `the claim was sent, but /${NS}/ports answered 404 for the next 0.3 s: if the claim went through, ${NS} is on e2e@txpipe.io's account and needs deleting by hand; if not, it expires unclaimed at 2026-10-27T12:00:00+00:00`,
     )
     assert.ok(asked().every((c) => c.startsWith('GET ')), 'it posted the delete')
+  })
+
+  it('after a claim whose landing failed, takes no redirect for the page loading', async () => {
+    const { ok, detail } = await remove({ settings: [{ redirect: '/' }], ports: [{ redirect: '/login' }] }, false)
+    assert.ok(!ok)
+    assert.match(detail, new RegExp(`^the claim was sent, but /${NS}/ports answered 302 to /login for the next 0\\.3 s: `))
+    assert.ok(asked().every((c) => c.startsWith('GET ')), 'it posted the delete')
+    assert.ok(asked().length > 1, 'it took the redirect for the page loading')
   })
 })

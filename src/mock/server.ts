@@ -15,8 +15,10 @@ import * as pages from './pages.ts'
  * Control routes live under `/__mock/`, never on a contract path, and are not
  * logged. A `POST` to one must be `Content-Type: application/json`, which a
  * page on another site cannot send without a preflight the mock never
- * grants, so a page open in the same browser cannot switch states or reset
- * the mock under a run:
+ * grants, and each answers only a `Host` naming the mock (its base URL's
+ * name, or a loopback one), which a page that rebinds a name of its own to
+ * the mock's address does not send. So a page open in the same browser
+ * cannot read the call log, switch states or reset the mock under a run:
  *
  * - `POST /__mock/state` with `{"route": "register" | "ports", "error": <code>
  *   | null, "retry_after_seconds"?: <int>}` makes every call to that route
@@ -407,7 +409,18 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
     return claimPage(request, response, project, 'code', `${url.pathname}${url.search}`)
   }
 
+  /** Whether a request names the mock as its host: its base URL's name, or a loopback one. */
+  const ownHost = (request: IncomingMessage) => {
+    const host = `http://${request.headers.host ?? ''}`
+    const name = URL.canParse(host) ? new URL(host).hostname : ''
+    return name === new URL(base).hostname || name === '127.0.0.1' || name === 'localhost' || name === '[::1]'
+  }
+
   async function control(request: IncomingMessage, response: ServerResponse, path: string) {
+    if (!ownHost(request)) {
+      request.resume()
+      return sendJson(response, 403, { error: `a control route answers only under the mock's own name (${new URL(base).hostname}) or a loopback one` })
+    }
     if (request.method === 'POST' && !/^application\/json\s*(;|$)/i.test(request.headers['content-type'] ?? '')) {
       request.resume()
       return sendJson(response, 415, { error: 'a control route takes Content-Type: application/json' })

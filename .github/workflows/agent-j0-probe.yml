@@ -23,13 +23,20 @@ name: agent-j0-probe
 #   cancels the one pending, and a job without it still cancels every
 #   pending one when it comes up (a J2 run did so to this probe on
 #   2026-10-20), losing the day's probe to a pull request's run.
+# - Each pull request's runs share a group of their own around the whole run,
+#   with the default queue: a push replaces that pull request's pending run
+#   before it reaches production-test-user, so however often it is pushed a
+#   pull request has at most two runs against production (the one running,
+#   and the latest), each registering, claiming and deleting. A scheduled or
+#   dispatched run has a group of its own (its run id), and is never replaced.
 # - When the probe reports nothing, one alert says so, as no result alert
 #   would fire: `e2e-agent-j0-setup` when the job failed before J0 reported
 #   (its set-up or runner, the checkout, install or Chromium, or J0 exiting
 #   without results: a usage error, or a break outside its steps), and
-#   `e2e-agent-j0-cancelled` when the job was cancelled (its 30 minutes ran
-#   out, another job of the group took its place, or someone cancelled it),
-#   which may leave a claimed project on the test user's account.
+#   `e2e-agent-j0-cancelled` when the job was cancelled before J0 reported
+#   (its 30 minutes ran out, another job of the group took its place, or
+#   someone cancelled it). A cancel, or a failure that names no step (a lost
+#   runner), may leave a claimed project on the test user's account.
 
 on:
   pull_request:
@@ -58,6 +65,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: agent-j0-probe-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   probe:
     name: Agent J0 against production
@@ -78,8 +89,10 @@ jobs:
       - id: checkout
         uses: actions/checkout@v4
 
-      # Pinned by commit: a third party's code, in the one job that holds the
-      # test user's password.
+      # Pinned by commit: a third party's code, in a job that holds the test
+      # user's password. For the same reason the job restores no pnpm cache:
+      # jobs with the unpinned action write it, under a key of the lockfile
+      # alone.
       - id: pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
 
@@ -87,7 +100,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: pnpm
 
       - id: install
         run: pnpm install --frozen-lockfile
@@ -140,13 +152,14 @@ jobs:
 
   # As in contracts.yml: posted with curl and jq, needing no checkout or Node,
   # which may be what failed. The webhook URL goes to curl on stdin, never on
-  # a command line or in the log. `always()`, so a cancelled probe alerts too.
-  # A failure that set up no step (the job's set-up, a lost runner) names
-  # nothing, so the alert goes on what J0 did not report.
+  # a command line or in the log. `always()`, so a cancelled probe alerts too,
+  # unless J0 had reported, and so alerted on its own. A failure that set up
+  # no step names nothing: the job's set-up failed, or its runner was lost,
+  # before or after J0 reported, and a lost runner leaves no outputs.
   setup-alert:
     name: Alert when the probe reported nothing
     needs: probe
-    if: always() && (needs.probe.result == 'cancelled' || (needs.probe.result == 'failure' && needs.probe.outputs.reported != 'true'))
+    if: always() && needs.probe.outputs.reported != 'true' && (needs.probe.result == 'cancelled' || needs.probe.result == 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -159,11 +172,15 @@ jobs:
           if [[ "$CANCELLED" == true ]]; then
             uid=agent-j0-cancelled
             title="e2e agent probe cancelled (production)"
-            message="The probe was cancelled before it finished: its 30 minutes ran out, another job of production-test-user took its place, or someone cancelled it. If it had claimed its project, the project may still be on the test user's account."
-          else
+            message="The probe was cancelled before J0 reported: its 30 minutes ran out, another job of production-test-user took its place, or someone cancelled it. If it had claimed its project, the project may still be on the test user's account."
+          elif [[ -n "$FAILED" ]]; then
             uid=agent-j0-setup
             title="e2e agent probe reported nothing (production)"
-            message="${FAILED:-the job failed before any of its steps ran (its set-up, or a lost runner)}, so J0 and the agent contract reported nothing against production."
+            message="$FAILED, so J0 and the agent contract reported nothing against production."
+          else
+            uid=agent-j0-setup
+            title="e2e agent probe failed naming no step (production)"
+            message="The probe job failed naming no step: its set-up failed, or its runner was lost, maybe after J0 claimed its project, which may then still be on the test user's account. If J0 reported first, its own alert fired as well."
           fi
           if [[ -z "$IRM_E2E_WEBHOOK_URL" ]]; then
             echo "alert skipped for $uid: IRM_E2E_WEBHOOK_URL is not set"

@@ -246,7 +246,10 @@ copied into `src/mock/catalog.ts` with its date.
 
 Under `/__mock/`, never on a contract path, and not logged. A `POST` must be
 `Content-Type: application/json` (anything else is `415`), which a page on
-another site cannot send, so a page open in the same browser cannot switch
+another site cannot send, and each route answers only a `Host` naming the
+mock, its `--base-url` name or a loopback one (anything else is `403`),
+which a page that rebinds a name of its own to the mock's address does not
+send. So a page open in the same browser cannot read the call log, switch
 states or reset the mock under a run:
 
 | Route | Body | Effect |
@@ -341,15 +344,21 @@ It takes `--alert`, `--force-fail` and `--results` as `pnpm check` does, and
 3. `GET <_URL>/blocks/latest` with `dmtr-api-key: <_KEY>` until it answers
    2xx, every 5 s for up to 3 minutes while the port comes up;
 4. claim in Chromium: open `DEMETER_CLAIM_URL`, only when it is on the
-   environment's Console and only to a `200`, "Log in", sign in (the mock's
-   form as any user, or Auth0 as `e2e@txpipe.io`; nothing is typed unless
-   the form is on the environment's sign-in origin), "Claim project" with
-   the project name as the page offers it, and land on
-   `/<namespace>/ports`, which must then answer the test user's session
-   `200` outside the browser: a failed claim can land there on an error
-   page. A step of its own then checks the name offered was the namespace,
-   so a wrong default fails that step without stopping the claim;
-5. the same request with the same key still answers 2xx;
+   environment's Console, only to a `200` and only when register named the
+   project's namespace (a project claimed under no known namespace could
+   not be deleted after), "Log in", sign in (the mock's form as any user,
+   or Auth0 as `e2e@txpipe.io`; nothing is typed unless the form is on the
+   environment's sign-in origin), "Claim project" with the project name as
+   the page offers it once it has loaded, and land on `/<namespace>/ports`,
+   which must then answer the test user's session `200` outside the
+   browser, within 30 s, as fabric may take a moment to show the claim: a
+   failed claim can land there on an error page. A claim that stays on its
+   page names how the claim's post answered (production's form posts by
+   fetch). A step of its own then checks the name offered was the
+   namespace, so a wrong default fails that step without stopping the
+   claim;
+5. once "Claim project" was pressed, the same request with the same key
+   still answers 2xx, confirmed claim or not (the step says which);
 6. on production, delete the claimed project through the Console, pass or
    fail. A claim whose landing failed may still have gone through, so once
    "Claim project" was pressed, the step waits up to 30 s for the project's
@@ -357,9 +366,10 @@ It takes `--alert`, `--force-fail` and `--results` as `pnpm check` does, and
    posts the settings page's form without following its redirect to `/`,
    which would create "My First Project" for a user left with none. Only a
    redirect counts as the delete, as fabric has taken it by then; a redirect
-   to `/login` fails the step (the session was refused). A 200, a 5xx or a
-   lost answer is tried again, up to 3 times 5 s apart, and then fails the
-   step as unconfirmed. After the redirect the step waits until the
+   to `/login` fails the step (the session was refused). A 200, a 5xx, a
+   redirect back into the project (where the settings page sends a user who
+   is not its owner after a refused delete) or a lost answer is tried
+   again, up to 3 times 5 s apart, and then fails the step as unconfirmed. After the redirect the step waits until the
    project's page fails to load twice in a row, 3 s apart, which is how a
    deleted namespace answers; a lost answer counts for neither. What it
    cannot delete it names, with whether it may be on the test user's
@@ -513,20 +523,29 @@ a renamed or reordered dotenv line, a body in another form, a cacheable
 answer, an error's status or code alone, a non-JSON error, a moved docs link,
 an echoed key, a short claim token, a wrong expiry or `Retry-After`, a
 catalog that lost or gained a kind, and a credential that reaches a result,
-which the leak step must fail. Each makes the suite fail. So does each value,
-header and line the contract fixes, drifting alone. J0's delete runs against
-a stand-in Console answering each way production may (a redirect, `/login`,
-an error page, a lost answer, a fabric outage on both routes), and J0 itself
-up to the browser against registrations that fail or are cut short. So no
-unit test reaches production.
+which the leak step must fail. Each makes the suite fail. A table of single
+drifts adds the rest of what the suite checks, each failing it alone: every
+value format of register (project id, namespace, key, claim URL, user-code
+alphabet, an expiry with no zone, `+0000`, a space for its `T`, or a day
+that does not exist), both dotenv headers on register and on ports, a
+`_URL` that is missing, not a URL or of another scheme, an empty `_KEY`, an
+error with no message, an unknown kind's list that names no kind or lost
+one, and `retry_after_seconds`. J0's delete runs against a stand-in Console
+answering each way production may (a redirect, a redirect back into the
+project, `/login`, an error page, a lost answer, a fabric outage on both
+routes), and J0 itself up to the browser against registrations and ports
+that fail or are cut short, or name no namespace. The CLI's tests name
+production where nothing listens. So no unit test reaches production.
 
 `pnpm test:browser` (`test/browser/`) drives Chromium: J0 against a stand-in
 Console (the mock behind a proxy that adds the settings form's delete),
 whole and with one thing broken at a time (a claim page that answers 500, a
-claim that lands without ownership, an empty default name, a reset on the
-check after the landing, `SIGTERM` while Chromium runs), and the sign-in form
-filler against Auth0's two screens and forms on another origin. `j0-mock.yml`
-runs them, and J0 on the mock.
+claim that lands without ownership, a claim refused by a fetch post, a
+default name emptied as the page finishes loading, one and every lost answer
+on the check after the landing, `SIGTERM` and `SIGINT` while Chromium runs),
+`pnpm j0 --env mock` typing `mock` whatever `E2E_USER_PASSWORD` holds, and
+the sign-in form filler against Auth0's two screens and forms on another
+origin. `j0-mock.yml` runs them, after J0 on the mock.
 
 ## Workflows
 
@@ -569,10 +588,11 @@ without failing, so no alert would say that day went unchecked.
   what failed.
 
 `.github/workflows/j0-mock.yml` runs on `pull_request` and on `push` to
-`main`: it runs `pnpm test:browser`, starts the mock, runs `pnpm j0 --env
-mock --contract all`, uploads the results and the mock's (redacted) call
-log, and prints the mock's log, failing the job when it holds a handler
-error. Nothing in it reaches production.
+`main`: it starts the mock, runs `pnpm j0 --env mock --contract all`, saves
+the mock's (redacted) call log, runs `pnpm test:browser` whatever the run on
+the mock did, prints the mock's log, failing the job when it holds a handler
+error, and uploads the results and the call log. Nothing in it reaches
+production.
 
 `.github/workflows/agent-j0-probe.yml` runs `pnpm j0 --env production
 --contract prod-safe`:
@@ -590,11 +610,14 @@ error. Nothing in it reaches production.
 
 When the probe reports nothing, a `curl` and `jq` job posts one alert, as
 `contracts.yml` does: `e2e-agent-j0-setup` when the job failed before J0
-reported (its set-up or runner, the checkout, install or Chromium, or J0
-exiting with no result: a usage error, or a break outside its steps), and
-`e2e-agent-j0-cancelled` when the job was cancelled (its 30 minutes ran out,
-another job of the concurrency group took its place, or someone cancelled
-it), since a claimed project may then be left on the test user's account.
+reported (the checkout, install or Chromium, or J0 exiting with no result: a
+usage error, or a break outside its steps), and `e2e-agent-j0-cancelled` when
+the job was cancelled before J0 reported (its 30 minutes ran out, another job
+of the concurrency group took its place, or someone cancelled it). A job
+that failed naming no step (its set-up failed, or its runner was lost, which
+leaves no word of whether J0 reported) also posts `e2e-agent-j0-setup`. A
+cancelled job, or a lost runner, may leave a claimed project on the test
+user's account, and their alerts say so.
 
 Any job that signs in as the standing test user sets the concurrency group
 `production-test-user` (`cancel-in-progress: false`, `queue: max`), so no two

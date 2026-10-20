@@ -6,9 +6,11 @@ name: j0-mock
 # every pull request and push to main. Nothing here reaches production or
 # signs in as the test user. Report-only: nothing here is a required status.
 #
-# The same contract tests run against production in agent-j0-probe.yml, so a
-# mock that drifts from the contract fails here, and a production that drifts
-# from the mock fails there.
+# The prod-safe contract tests also run against production in
+# agent-j0-probe.yml, so on those rules a mock that drifts from the contract
+# fails here, and a production that drifts from the mock fails there. The
+# mock-only rules (the caps, the kill switch, expiry) are held to the
+# contract alone: nothing compares them with production.
 
 on:
   pull_request:
@@ -35,12 +37,9 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Install Chromium
+      - id: chromium
+        name: Install Chromium
         run: pnpm exec playwright install --with-deps --only-shell chromium
-
-      # The unit job installs no browser.
-      - name: Browser tests
-        run: pnpm test:browser
 
       # The mock keeps running for the job's later steps.
       - name: Start the mock
@@ -63,11 +62,22 @@ jobs:
           mkdir -p results
           curl -sf http://127.0.0.1:4010/__mock/calls > results/mock-calls.json || echo "the mock did not answer"
 
+      # After the run on the mock, so a browser failure leaves the mock's
+      # result standing, and whatever the mock steps did, once Chromium is in.
+      # The unit job installs no browser.
+      - name: Browser tests
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
+        run: pnpm test:browser
+
       # A handler error answers 500 mock_error, which says nothing of why: the
       # mock writes the error to its log, and the job fails on one.
       - name: Print the mock's log, and fail on a handler error
         if: always()
         run: |
+          if [[ ! -f "$RUNNER_TEMP/mock.log" ]]; then
+            echo "the mock was never started"
+            exit 0
+          fi
           cat "$RUNNER_TEMP/mock.log"
           if grep -q '^mock error: ' "$RUNNER_TEMP/mock.log"; then
             echo "::error::the mock logged a handler error"

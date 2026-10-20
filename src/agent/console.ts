@@ -14,7 +14,7 @@ import type { Secrets } from './client.ts'
 
 /** How long the Console steps wait, and how often they try again; the tests shorten them. */
 export interface ConsoleWaits {
-  /** For a claim whose landing failed to show on the project's page. */
+  /** For the project's page to load for the user after the claim: fabric's projection may lag it. */
   landingMs: number
   /** Delete posts, at most, and the wait between them. */
   deleteAttempts: number
@@ -75,6 +75,20 @@ export async function pageAnswer(session: APIRequestContext, url: string, secret
   }
 }
 
+/**
+ * Looks at `url` with the session until it answers 200, `everyMs` apart for
+ * `withinMs`, and returns the last answer: 200, or what it answered instead.
+ * Nothing but a 200 counts as the page loading, a redirect included.
+ */
+export async function pageLoads(session: APIRequestContext, url: string, secrets: Secrets, withinMs: number, everyMs: number): Promise<PageAnswer> {
+  const t0 = performance.now()
+  for (;;) {
+    const page = await pageAnswer(session, url, secrets)
+    if (page.status === 200 || performance.now() - t0 > withinMs) return page
+    await sleep(everyMs)
+  }
+}
+
 export interface Claimed {
   /** The Console's origin. */
   console: string
@@ -111,18 +125,13 @@ async function deleteOnce({ console: origin, namespace, expiresAt, user, session
   const look = () => pageAnswer(session, portsPage, secrets)
 
   // The project must be the user's to be deleted. A claim whose landing
-  // failed may still have gone through: it gets the landing's time.
+  // failed may still have gone through: it gets the landing's time again.
   if (!landed) {
-    const t0 = performance.now()
-    for (;;) {
-      const page = await look()
-      if (page.status === 200) break
-      if (performance.now() - t0 > waits.landingMs) {
-        fail(
-          `the claim was sent, but /${namespace}/ports answered ${said(page)} for the next ${seconds(waits.landingMs)}: if the claim went through, ${namespace} is on ${user}'s account and needs deleting by hand; if not, it expires unclaimed at ${expiresAt}`,
-        )
-      }
-      await sleep(waits.pageEveryMs)
+    const page = await pageLoads(session, portsPage, secrets, waits.landingMs, waits.pageEveryMs)
+    if (page.status !== 200) {
+      fail(
+        `the claim was sent, but /${namespace}/ports answered ${said(page)} for the next ${seconds(waits.landingMs)}: if the claim went through, ${namespace} is on ${user}'s account and needs deleting by hand; if not, it expires unclaimed at ${expiresAt}`,
+      )
     }
   }
 
@@ -156,7 +165,11 @@ async function deleteOnce({ console: origin, namespace, expiresAt, user, session
   // was refused. Nothing else counts as the delete: a 200 is the action
   // reporting an error, a 5xx one of its own (fabric's projection may lag the
   // claim, or fabric be down, when the project's page fails too), and a lost
-  // answer says nothing. Each is tried again, and the last one fails the step.
+  // answer says nothing. Nor does a redirect back into the project: after an
+  // action that reported an error, the settings loader runs again and sends a
+  // user who is not the owner to the project's ports, while the action's own
+  // redirect leaves the deleted project out. Each is tried again, and the
+  // last one fails the step.
   const settings = `${origin}/${namespace}/settings`
   const answers: string[] = []
   for (let attempt = 1; attempt <= waits.deleteAttempts; attempt++) {
@@ -166,8 +179,9 @@ async function deleteOnce({ console: origin, namespace, expiresAt, user, session
       if (to.startsWith('/login')) {
         fail(`POST /${namespace}/settings redirected to ${to}: the Console refused the session, so ${namespace} is still on ${user}'s account`)
       }
-      if (to) return await gone(`${answer.status()} to ${to}${attempt > 1 ? ` on attempt ${attempt}` : ''}`)
-      answers.push(String(answer.status()))
+      const intoProject = to === `/${namespace}` || to.startsWith(`/${namespace}/`)
+      if (to && !intoProject) return await gone(`${answer.status()} to ${to}${attempt > 1 ? ` on attempt ${attempt}` : ''}`)
+      answers.push(intoProject ? `${answer.status()} back to ${to}` : String(answer.status()))
     } catch (error) {
       if (error instanceof Failure) throw error
       answers.push(`no answer (${firstLine(secrets, error)})`)

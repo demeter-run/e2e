@@ -209,6 +209,30 @@ describe('the mock: control routes', () => {
     assert.equal(json.status, 200)
     assert.deepEqual((await mockState(env)).errors, {})
   })
+
+  it('answers only under its own name or a loopback one, so a page that rebinds its name to the mock reaches nothing', async () => {
+    await setMockState(env, { route: 'register', error: 'ip_cap' })
+    const port = new URL(mock.url).port
+    const as = (host: string, method: string, path: string) =>
+      call(method, `${mock.url}${path}`, { headers: { host, 'content-type': 'application/json' }, ...(method === 'POST' ? { body: '{}' } : {}) })
+    for (const [method, path] of [['POST', '/__mock/reset'], ['POST', '/__mock/state'], ['GET', '/__mock/calls'], ['GET', '/__mock/state']] as const) {
+      assert.equal((await as(`rebound.example:${port}`, method, path)).status, 403, `${method} ${path}`)
+    }
+    assert.deepEqual((await mockState(env)).errors, { register: { error: 'ip_cap' } })
+    assert.equal((await as(`localhost:${port}`, 'POST', '/__mock/reset')).status, 200)
+    assert.deepEqual((await mockState(env)).errors, {})
+  })
+
+  it('answers under the name of its base URL', async () => {
+    const other = await startMock({ port: 0, baseUrl: 'http://mock.example:4020' })
+    try {
+      const at = `http://127.0.0.1:${(other.server.address() as AddressInfo).port}/__mock/calls`
+      assert.equal((await call('GET', at, { headers: { host: 'mock.example:4020' } })).status, 200)
+      assert.equal((await call('GET', at, { headers: { host: 'mock.example.attacker:4020' } })).status, 403)
+    } finally {
+      await other.close()
+    }
+  })
 })
 
 describe('the mock: claim pages', () => {

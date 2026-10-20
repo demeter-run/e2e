@@ -20,7 +20,7 @@ import {
   register,
   type Secrets,
 } from './client.ts'
-import { addCookieSecrets, type ConsoleWaits, consoleWaits, deleteClaimed, firstLine, pageAnswer, said } from './console.ts'
+import { addCookieSecrets, type ConsoleWaits, consoleWaits, deleteClaimed, firstLine, pageLoads, said } from './console.ts'
 
 /**
  * J0, the coding agent's main journey (`solution/devex/contracts/
@@ -194,6 +194,8 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
 
     await run.step(`claim in the browser as ${onMock ? 'a mock user' : user}`, async () => {
       const claimUrl = (await vars()).get('DEMETER_CLAIM_URL') ?? fail('.env.demeter has no DEMETER_CLAIM_URL: register failed')
+      // A project claimed under no known namespace could not be deleted after.
+      if (!namespace) fail('not run: register named no namespace, so a claimed project could not be found to delete')
       // The browser goes only to the Console: the claim page leads to the
       // sign-in, where the test user's password is typed.
       const claimOrigin = URL.canParse(claimUrl) ? new URL(claimUrl).origin : '(not a URL)'
@@ -204,12 +206,18 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
       const session = context
       const page = await context.newPage()
       page.setDefaultTimeout(waits.browserMs)
-      // How the last page the browser loaded answered, for an error: a page
-      // that answers 500 shows no button, and the wait for one says only that.
+      // How the last page the browser loaded answered, and the claim's post,
+      // for an error: a page that answers 500 shows no button, and the wait
+      // for one says only that. The Console's claim form posts by fetch once
+      // the page has hydrated, so its answer is no page load: a claim fabric
+      // refuses answers 500 and leaves the browser on the claim page.
+      const claimPath = new URL(claimUrl).pathname
       let loaded: number | undefined
+      let posted: number | undefined
       page.on('response', (response) => {
         try {
-          if (response.request().isNavigationRequest() && response.frame() === page.mainFrame()) loaded = response.status()
+          if (response.request().method() === 'POST' && new URL(response.url()).pathname === claimPath) posted = response.status()
+          else if (response.request().isNavigationRequest() && response.frame() === page.mainFrame()) loaded = response.status()
         } catch {
           // A service worker's response has no frame.
         }
@@ -232,9 +240,12 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
         await claim.click()
         await page.waitForURL((url) => url.pathname === `/${namespace}/ports`)
         // Reaching the page is not owning the project: a claim that failed
-        // can land there on an error page. Its loader must answer the user.
-        const landing = await pageAnswer(session.request, `${env.console}/${namespace}/ports`, secrets)
-        if (landing.status !== 200) fail(`landed on /${namespace}/ports, but it answered ${said(landing)} to ${user}'s session, wanted 200: the claim is unconfirmed`)
+        // can land there on an error page. Its loader must answer the user,
+        // within the time fabric's projection may take to show the claim.
+        const landing = await pageLoads(session.request, `${env.console}/${namespace}/ports`, secrets, waits.landingMs, waits.pageEveryMs)
+        if (landing.status !== 200) {
+          fail(`landed on /${namespace}/ports, but it answered ${said(landing)} to ${user}'s session for the next ${seconds(waits.landingMs)}, wanted 200: the claim is unconfirmed`)
+        }
         claimed = true
       } catch (error) {
         if (error instanceof Failure) throw error
@@ -242,7 +253,8 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
         // (Auth0's state); the first line and where the browser was are enough.
         await addCookieSecrets(session, secrets).catch(() => {})
         const last = loaded === undefined ? '' : `, where the last page it loaded answered ${loaded}`
-        fail(`${firstLine(secrets, error)} (the browser was at ${secrets.scrub(browserAt(page.url()))}${last})`)
+        const post = posted === undefined ? '' : `, and the claim's post answered ${posted}`
+        fail(`${firstLine(secrets, error)} (the browser was at ${secrets.scrub(browserAt(page.url()))}${last}${post})`)
       }
       return `claimed ${namespace} and landed on /${namespace}/ports, which answers ${user} 200, in ${seconds(performance.now() - t0)}`
     })
@@ -253,13 +265,15 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
       return `"${offeredName}"`
     })
 
+    // Whether or not the claim is confirmed, the key must work once it was sent.
     await run.step('after the claim, the same request with the same key still answers 2xx', async () => {
-      if (!claimed) fail('not run: the claim did not land, so no request comes after it')
+      if (!claimSent) fail('not run: no claim was sent, so no request comes after it')
       const { url, key } = await port()
       // The port is up: only a missing or 5xx answer is worth another try.
       const { answer, statuses, elapsed } = await request(url, key, 30_000, waits.requestEveryMs, (a) => a.status === null || a.status >= 500)
       laterStatuses.push(...statuses)
-      return `${answer.status} after ${seconds(elapsed)} and ${statuses.length} attempt${statuses.length === 1 ? '' : 's'}`
+      const unconfirmed = claimed ? '' : ' (the claim is unconfirmed)'
+      return `${answer.status} after ${seconds(elapsed)} and ${statuses.length} attempt${statuses.length === 1 ? '' : 's'}${unconfirmed}`
     })
   } finally {
     if (onMock) {
@@ -294,9 +308,15 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
             ? `register answered ${describe(registered)}: nothing was registered, so nothing is left behind`
             : `register answered ${describe(registered)}: a project may have been registered without this run learning it, and if so it expires unclaimed within 7 days`
         }
-        if (!namespace) fail('register answered 200 but named no namespace: its project cannot be found, and expires unclaimed within 7 days')
-        if (!claimSent || !context) fail(`${namespace} was never claimed: it expires unclaimed at ${expiresAt}`)
-        return deleteClaimed({ console: env.console, namespace, expiresAt, user, session: context!.request, secrets, landed: claimed }, waits)
+        // The claim step claims nothing without a namespace.
+        if (!claimSent || !context) {
+          return fail(
+            namespace
+              ? `${namespace} was never claimed: it expires unclaimed at ${expiresAt}`
+              : 'register answered 200 but named no namespace: its project cannot be found, and expires unclaimed within 7 days',
+          )
+        }
+        return deleteClaimed({ console: env.console, namespace, expiresAt, user, session: context.request, secrets, landed: claimed }, waits)
       })
     }
     await browser?.close()
