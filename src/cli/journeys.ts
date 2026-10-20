@@ -21,6 +21,12 @@ export interface Journey {
 
 export const journeys: Journey[] = [
   {
+    name: 'j2',
+    summary: "a person's path from demeter.run to a first request, its usage, cost and Console price; then 401, 429 and a legacy cookie",
+    spec: 'journeys/j2.spec.ts',
+    results: ['j2', 'j2-401', 'j2-429', 'j2-legacy-cookie'],
+  },
+  {
     name: 'sign-in',
     summary: 'the standing test user signs in to the Console from /login, then leaves no project behind',
     spec: 'journeys/sign-in.spec.ts',

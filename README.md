@@ -10,8 +10,8 @@ product repository, and it gates no other repository's pull requests. Each
 product repository keeps its own static checks. Drift between surfaces is
 caught here, afterwards, against production.
 
-Today it holds the harness and three contract checks. The journeys (a person's
-path from `demeter.run` to a first request, and an agent's) build on the same
+Today it holds the harness, three contract checks and J2, a person's path from
+`demeter.run` to a first request. The agent's journey builds on the same
 harness.
 
 Every check is **report-only**: a failure shows on this repository's pull
@@ -20,12 +20,14 @@ requests or alerts from a scheduled run, but nothing here is a required status.
 ## Setup
 
 Node 22 (`.nvmrc`) and pnpm (the version in `package.json`'s
-`packageManager`; `corepack enable` provides it). No credentials: every
-surface the checks read is public.
+`packageManager`; `corepack enable` provides it). The checks need no
+credentials: every surface they read is public. The journeys sign in as the
+standing test user, `e2e@txpipe.io` (decision 0047), whose password is
+`E2E_USER_PASSWORD`.
 
 ```sh
 pnpm install
-pnpm exec playwright install chromium   # for intent's last two steps
+pnpm exec playwright install chromium   # for intent's last two steps and the journeys
 ```
 
 ## Running a check
@@ -197,6 +199,9 @@ Every check and journey writes `results/<name>.json`:
 }
 ```
 
+A journey's result also carries `elapsed_seconds` when it has a stopwatch: J2's
+seconds from landing on the site to the first successful request.
+
 The run is printed to the terminal and, in GitHub Actions, appended to the job
 summary. With `--alert` and `IRM_E2E_WEBHOOK_URL` set, each failed result posts
 one IRM alert, `{alert_uid: "e2e-<name>", title, message, state: "alerting",
@@ -205,11 +210,90 @@ link_to_upstream_details}`, the shape fabric's `send_irm_alert` uses.
 Nothing secret goes in a result, a summary or an alert: URLs are reduced to
 origin and path (`src/http.ts`), and the webhook URL is never printed.
 
-The harness for later pieces is `src/env.ts` (environments), `src/report.ts`
-(`Run`, result files, the summary, alerts), `src/http.ts` (requests that never
-follow a redirect), `src/html.ts` (server-rendered pages as text) and
-`src/surfaces/` (the card, its comparator and each surface's reader). Browser
-journeys go under `journeys/`, run by `playwright.config.ts`.
+The harness for later pieces is `src/env.ts` (environments and their test
+user), `src/report.ts` (`Run`, result files, the summary, alerts),
+`src/secrets.ts` (what is redacted), `src/http.ts` (requests that never
+follow a redirect), `src/html.ts` (server-rendered pages as text),
+`src/surfaces/` (the card, its comparator and each surface's reader) and
+`src/journeys/` (Auth0's sign-in, the Console's pages, requests to a port,
+and the step runner a spec shares). Browser journeys go under `journeys/`,
+run by `pnpm journey` through `playwright.config.ts`.
+
+## Journeys
+
+A journey drives Chromium through production as a person does, signed in as
+the standing test user:
+
+```sh
+read -s E2E_USER_PASSWORD && export E2E_USER_PASSWORD   # typed, never in the shell history
+pnpm j2 --env production                                # pnpm journey j2 --env production
+```
+
+It takes the same `--env`, `--alert`, `--force-fail` and `--results` options
+as `pnpm check`. `pnpm journey <name>` runs the spec under `journeys/` with
+Playwright, then prints its results, appends the job summary and alerts as
+the checks do. A journey's results are its verdict: each test records its
+steps and does not throw, because Playwright replaces its worker, and the
+signed-in browser the tests share, after any failed test. The spec fails the
+Playwright run once, last, naming the results that failed.
+
+**What it costs and leaves behind.** J2 deletes every project the test user
+owns before it starts and after it ends, pass or fail, so it must not overlap
+another run signed in as the user (the concurrency group below, and fabric's
+daily e2e, which runs as the same user around midday UTC). In between it
+creates "My First Project" and one Free Blockfrost port on preprod: about $0
+a run. The request, its usage and its cost appear in production data under
+the test user.
+
+**Secrets.** The password and the port's key never reach a result, a log, a
+summary or an alert: they are kept secret (`src/secrets.ts`), every step's
+detail is redacted, a browser error is cut to its first line, and the key
+travels only in the `dmtr-api-key` header. A failed step leaves a screenshot
+(`results/<name>-<step>.png`) with the password field and the port's key
+painted over. Playwright's traces stay off: they record what is typed, the
+cookies sent (the Console's session is a signed Auth0 access token) and every
+response body, the key included, and none of that can be masked.
+
+### `j2`
+
+`demeter.run` to a first successful request, then its usage and cost in the
+Console. The test user signs in where a person would sign up (decision 0047),
+so the elapsed time is a lower bound for a person: it leaves out filling the
+signup form.
+
+| # | Step | Passes when |
+| --- | --- | --- |
+| 1 | Clean slate | the user signs in at the Console's `/login`, every project it owns is deleted, and it signs out. Before the stopwatch. |
+| 2 | Land | `https://demeter.run/` answers 200 (the stopwatch starts) and its "Pricing" link opens `/pricing` |
+| 3 | Price | `/pricing` renders a Blockfrost Flexible "PER 100K REQUESTS" price, recorded in the detail |
+| 4 | Sign up | the page's sign-up CTA requests `console.demeter.run/login?intent=signup` and lands on Auth0's signup screen; its "Log in" link leads to the login form, where the user signs in |
+| 5 | First project | the Console lands on `/{namespace}/ports` of "My First Project" |
+| 6 | Port | "ADD PRODUCTS" → Blockfrost → `cardano-preprod` (Free) → "DEPLOY" shows the success toast; the port's page shows its endpoint and key |
+| 7 | First request | `GET <endpoint>/epochs/latest` answers 2xx within 3 minutes. The stopwatch stops: `elapsed_seconds` in the result and the summary |
+| 8 | Usage, then cost | the port's usage view counts a request within 5 minutes, then the billing page's "Project Usage" lists the port within 75 (fabric's daemon reads Prometheus every 3600 s) |
+| 9 | Console price | the port's pricing page quotes Blockfrost as fabric bills it, through the `pricing` check's comparator |
+| 10 | Clean up | pass or fail, every project the user owns is deleted, and the Console then names none |
+
+Steps 1 and 10 delete through the form behind the project settings' "DELETE"
+button, reading the Console's redirect rather than following it: after the
+last project the Console redirects to `/`, which creates "My First Project"
+for a user with none.
+
+Step 9 fails while fabric publishes no prices, as `pricing` does, and still
+reports the Console's quote.
+
+Three edge cases ride on J2's signed-in session, each a result of its own:
+
+- **`j2-401`:** the port's key with its last character changed answers `401`.
+  The proxies' meters drop `401`, `429` and `503` from billing.
+- **`j2-429`:** bursts of 30 concurrent requests answer at least one `429`,
+  and no 5xx. Free allows 60 requests a minute, shared among the proxy's
+  replicas, so the bursts repeat (up to five) until one answers `429`.
+- **`j2-legacy-cookie`:** the legacy app still serves `/auth` and
+  `/callbacks/auth0` on the apex with its own Auth0 client, and names its
+  session cookie as the Console does, `_session-v2` on the `demeter.run`
+  zone. After signing in there, the browser still reaches the Console's ports
+  page. The detail lists the browser's `_session-v2` cookies by domain.
 
 ## Unit tests
 
@@ -224,8 +308,12 @@ where each came from. A variant is a copy of a captured page with one edit.
 Requests, alerts and the `pricing` check end to end run against local servers
 serving those captures (an HTTP/2 one for fabric), `apex` against a local apex
 answering as production does, intent's browser steps against a stand-in page,
-and `pnpm check` itself against stand-in checks, so no unit test reaches
-production.
+and `pnpm check` itself against stand-in checks. The Console's pricing grid is
+read from its cells as webui renders them (the page renders only signed in, so
+no capture of it is committed), `pnpm journey` runs against a stand-in
+Playwright, the project deletion against a stand-in Console and the port
+requests against a local server. No unit test reaches production or needs a
+browser.
 
 ## Workflows
 
@@ -247,13 +335,28 @@ production.
   job posts it with `curl` and `jq`, needing no checkout or Node, which may be
   what failed.
 
-Any job that signs in as the standing test user sets the concurrency group
+`.github/workflows/j2.yml` runs `pnpm j2 --env production`:
+
+- daily at 06:00 UTC and on `workflow_dispatch`, with `--alert`. The dispatch
+  takes the same `force_fail` input, and only runs of `main` receive the
+  webhook. A failure before the journey starts posts one `e2e-j2-setup`
+  alert, as `contracts.yml` does for the checks;
+- on pull requests that change a journey, no alert: GitHub dispatches only
+  workflows on the default branch, so this is how a branch walks J2 before it
+  merges. The sign-in proof (`pnpm journey sign-in`) runs first, and J2 only
+  when the test user could sign in.
+
+The job's timeout is 120 minutes, for the 75-minute wait on the cost. It
+uploads `results/`: the result files and the masked screenshots.
+
+Every job that signs in as the standing test user sets the concurrency group
 `production-test-user` (`cancel-in-progress: false`), so no two runs use the
-user at once. None does yet.
+user at once.
 
 ### Secrets
 
 | Name | Used by | For |
 | --- | --- | --- |
 | `IRM_E2E_WEBHOOK_URL` | scheduled and dispatched runs of `main` | the IRM integration alerts post to |
-| `E2E_USER_PASSWORD`, `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET` | the journeys | signing in as the standing test user |
+| `E2E_USER_PASSWORD` | `j2.yml` | signing in as the standing test user through Auth0's form |
+| `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET` | suites that sign in with a password grant | signing in as the standing test user |

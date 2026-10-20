@@ -28,14 +28,19 @@ export async function where(page: Page): Promise<string> {
   return `${safeUrl(page.url())}${title ? ` ("${title}")` : ''}`
 }
 
-/** Waits for `locator` to show, failing with `what` was missing, where, and after how long. */
+/**
+ * The first visible element `locator` matches, once there is one, failing with
+ * `what` was missing, where, and after how long. Hidden matches (a link the
+ * layout shows only at another width) are passed over.
+ */
 export async function visible(page: Page, locator: Locator, what: string, timeoutMs = 30_000): Promise<Locator> {
+  const shown = locator.filter({ visible: true }).first()
   try {
-    await locator.first().waitFor({ state: 'visible', timeout: timeoutMs })
+    await shown.waitFor({ state: 'visible', timeout: timeoutMs })
   } catch {
     throw new Failure(`no ${what} on ${await where(page)} after ${timeoutMs / 1000} s`)
   }
-  return locator.first()
+  return shown
 }
 
 /** Waits for the page's URL to satisfy `test`, failing with `what` was expected and where the browser is instead. */

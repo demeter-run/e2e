@@ -3,7 +3,7 @@ import { Failure, Run } from '../src/report.ts'
 import { auth0Screens } from '../src/checks/intent.ts'
 import { signIn, testUser } from '../src/journeys/auth0.ts'
 import { deleteProjects, landOnPorts, signOut } from '../src/journeys/console.ts'
-import { browserSteps, journeyEnvironment, report, verdict } from '../src/journeys/spec.ts'
+import { browserSteps, journeyEnvironment, NotRun, report, verdict } from '../src/journeys/spec.ts'
 
 /**
  * The sign-in proof: before J2 is built on it, the standing test user signs in
@@ -25,7 +25,7 @@ test('sign-in', async ({ browser }) => {
   const context = await browser.newContext()
   const page = await context.newPage()
   let namespace: string | undefined
-  const step = browserSteps(run, page, (p) => [p.locator('input[type="password"]')])
+  const step = browserSteps(run, () => page, (p) => [p.locator('input[type="password"]')])
 
   try {
     await step(`${env.console}/login shows Auth0's login form`, async () => {
@@ -39,17 +39,17 @@ test('sign-in', async ({ browser }) => {
     const user = testUser(env)
     const signedIn = await step(`sign in as ${user.email}`, async () => `through the ${await signIn(page, env, user)}`)
     await step("land on a project's ports page", async () => {
-      if (!signedIn) throw new Failure('not run: the sign-in failed')
+      if (!signedIn) throw new NotRun('the sign-in failed')
       namespace = await landOnPorts(page, env)
       return `/${namespace}/ports`
     })
     await step('delete every project the user owns', async () => {
-      if (!namespace) throw new Failure('not run: no project page was reached')
+      if (!namespace) throw new NotRun('no project page was reached')
       const deleted = await deleteProjects(context, env, namespace)
       return `deleted ${deleted.length}: ${deleted.join(', ')}; the Console then names no project`
     })
     await step('sign out', async () => {
-      if (!signedIn) throw new Failure('not run: never signed in')
+      if (!signedIn) throw new NotRun('never signed in')
       return signOut(page, env)
     })
   } finally {

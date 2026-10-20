@@ -24,13 +24,21 @@ export function journeyEnvironment(): Environment {
 
 export const resultsDir = (): string => process.env[specEnv.results] || 'results'
 
+/** Fails a step that could not run because an earlier one failed: it says why, and leaves no screenshot. */
+export class NotRun extends Failure {
+  constructor(why: string) {
+    super(`not run: ${why}`)
+  }
+}
+
 /**
- * A step runner for `run` that drives `page`. A step fails with its `Failure`
- * message whole, and with only the first line of any other error: a
- * Playwright error's call log quotes the elements it met. A failed step leaves
- * a screenshot of the page with `masks` painted over, named in its detail.
+ * A step runner for `run` that drives the browser `page()` returns. A step
+ * fails with its `Failure` message whole, and with only the first line of any
+ * other error: a Playwright error's call log quotes the elements it met. A
+ * failed step leaves a screenshot of the page with `masks` painted over, named
+ * in its detail.
  */
-export function browserSteps(run: Run, page: Page, masks: (page: Page) => Locator[]) {
+export function browserSteps(run: Run, page: () => Page | undefined, masks: (page: Page) => Locator[]) {
   let n = 0
   return (name: string, fn: () => string | void | Promise<string | void>): Promise<boolean> => {
     const shot = `${run.name}-${String((n += 1)).padStart(2, '0')}`
@@ -38,8 +46,10 @@ export function browserSteps(run: Run, page: Page, masks: (page: Page) => Locato
       try {
         return await fn()
       } catch (error) {
+        if (error instanceof NotRun) throw error
         const message = error instanceof Failure ? error.message : firstLine(error)
-        throw new Failure(`${message}\nscreenshot: ${await maskedScreenshot(page, resultsDir(), shot, masks(page))}`)
+        const current = page()
+        throw new Failure(current ? `${message}\nscreenshot: ${await maskedScreenshot(current, resultsDir(), shot, masks(current))}` : message)
       }
     })
   }
