@@ -1,4 +1,5 @@
-import { unary } from './grpc.ts'
+import { fetchNamingCause } from '../http.ts'
+import { type Call, unary } from './grpc.ts'
 import { encodeStrings, encodeVarints, messages, string } from './proto.ts'
 
 /**
@@ -11,15 +12,27 @@ export class Fabric {
   constructor(
     readonly address: string,
     readonly token: string,
+    readonly call: (call: Call) => Promise<Uint8Array> = unary,
   ) {}
 
-  #call(method: string, request: Uint8Array) {
-    return unary({ address: this.address, method: `/demeter.ops.v1alpha.${method}`, request, headers: { authorization: `Bearer ${this.token}` } })
+  #call(method: string, request: Uint8Array, timeoutMs?: number) {
+    return this.call({
+      address: this.address,
+      method: `/demeter.ops.v1alpha.${method}`,
+      request,
+      headers: { authorization: `Bearer ${this.token}` },
+      timeoutMs,
+    })
   }
 
-  /** `CreateProject { name = 1 }` → `{ id = 1, name = 2, namespace = 3 }`. */
+  /**
+   * `CreateProject { name = 1 }` → `{ id = 1, name = 2, namespace = 3 }`. A
+   * minute's deadline, not 15 s: a project fabric commits after the client
+   * gave up is one the run never learns the id of, so cannot delete. It
+   * answers in about a second.
+   */
   async createProject(name: string): Promise<{ id: string; namespace: string }> {
-    const response = await this.#call('ProjectService/CreateProject', encodeStrings({ 1: name }))
+    const response = await this.#call('ProjectService/CreateProject', encodeStrings({ 1: name }), 60_000)
     const id = string(response, 1)
     if (!id) throw new Error('CreateProject answered no project id')
     return { id, namespace: string(response, 3) }
@@ -52,7 +65,12 @@ export class Fabric {
     const response = await this.#call('ResourceService/FetchResourcesById', encodeStrings({ 1: id }))
     const [record] = messages(response, 1)
     if (!record) return null
-    return JSON.parse(string(record, 4)) as Record<string, unknown>
+    // A parse error quotes the text around it, which would hold part of the key.
+    try {
+      return JSON.parse(string(record, 4)) as Record<string, unknown>
+    } catch {
+      throw new Error('FetchResourcesById answered a spec that is not JSON')
+    }
   }
 }
 
@@ -64,7 +82,7 @@ export async function signIn(
   auth0: string,
   { username, password, clientId, clientSecret, audience }: { username: string; password: string; clientId: string; clientSecret: string; audience: string },
 ): Promise<string> {
-  const response = await fetch(`${auth0}/oauth/token`, {
+  const response = await fetchNamingCause(`${auth0}/oauth/token`, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({

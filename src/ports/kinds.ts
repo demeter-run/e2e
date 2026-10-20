@@ -1,4 +1,5 @@
 import type { PortSuiteTarget } from '../env.ts'
+import { fetchNamingCause } from '../http.ts'
 import { unary } from './grpc.ts'
 import { queryTip, syncProgress } from './node.ts'
 import { messages, varint } from './proto.ts'
@@ -58,9 +59,17 @@ async function attempt<T>(
   throw new Error(`after ${attempts} attempts: ${last instanceof Error ? last.message : String(last)}`)
 }
 
+/** What the checks reach the ports with; tests replace them. `now` is unix seconds. */
+export interface Reach {
+  fetch: typeof fetch
+  queryTip: typeof queryTip
+  unary: typeof unary
+  now: () => number
+}
+
 /** GET a port's JSON, as `curl -H 'Accept: application/json' --location`. */
-async function getJson(url: string): Promise<unknown> {
-  const response = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) })
+async function getJson(send: typeof fetch, url: string): Promise<unknown> {
+  const response = await fetchNamingCause(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) }, send)
   const text = await response.text()
   if (!response.ok) throw new Error(`answered HTTP ${response.status}`)
   try {
@@ -82,99 +91,108 @@ function slotOf(value: unknown, what: string): number {
   return value
 }
 
-const httpSlot = (label: string, url: (p: Probe) => string, read: (body: any) => unknown, what: string): Kind['check'] =>
+const httpSlot =
+  (send: typeof fetch, label: string, url: (p: Probe) => string, read: (body: any) => unknown, what: string): Kind['check'] =>
   async (probe) => {
-    const slot = await attempt(probe, async () => slotOf(read(await getJson(url(probe))), what))
+    const slot = await attempt(probe, async () => slotOf(read(await getJson(send, url(probe))), what))
     return atTip(label, slot, probe.tip)
   }
 
-export const kinds: Kind[] = [
-  {
-    kind: 'CardanoNodePort',
-    label: 'Node',
-    claim: 'synced: syncProgress within 99–100',
-    spec: { network: 'mainnet', version: 'stable', throughputTier: '0' },
-    // fabric's `node_port_expect`: sleeps of 3 s doubling, `syncProgress` within 99–100.
-    async check(probe) {
-      let last = ''
-      const tip = await attempt(
-        probe,
-        async () => {
-          const tip = await queryTip(`${probe.key}.${probe.hosts.node}`)
-          const progress = syncProgress(tip.slot)
-          last = `syncProgress ${progress.toFixed(2)} at slot ${tip.slot}`
-          if (progress < 99 || progress > 100) throw new Error(`${last}, not within 99–100`)
-          return tip
-        },
-        { sleepMs: (n) => budget.sleepMs * 2 ** (n - 1) },
-      )
-      return { detail: `${last}, block ${tip.block}`, slot: tip.slot }
+export function portKinds({
+  fetch: send = fetch,
+  queryTip: tipOf = queryTip,
+  unary: call = unary,
+  now = () => Date.now() / 1000,
+}: Partial<Reach> = {}): Kind[] {
+  return [
+    {
+      kind: 'CardanoNodePort',
+      label: 'Node',
+      claim: 'synced: syncProgress within 99–100',
+      spec: { network: 'mainnet', version: 'stable', throughputTier: '0' },
+      // fabric's `node_port_expect`: sleeps of 3 s doubling, `syncProgress` within 99–100.
+      async check(probe) {
+        let last = ''
+        const tip = await attempt(
+          probe,
+          async () => {
+            const tip = await tipOf(`${probe.key}.${probe.hosts.node}`)
+            const progress = syncProgress(tip.slot, now())
+            last = `syncProgress ${progress.toFixed(2)} at slot ${tip.slot}`
+            if (progress < 99 || progress > 100) throw new Error(`${last}, not within 99–100`)
+            return tip
+          },
+          { sleepMs: (n) => budget.sleepMs * 2 ** (n - 1) },
+        )
+        return { detail: `${last}, block ${tip.block}`, slot: tip.slot }
+      },
     },
-  },
-  {
-    kind: 'BlockfrostPort',
-    label: 'Blockfrost',
-    claim: 'answers at the chain tip',
-    spec: { network: 'mainnet', throughputTier: '0', operatorVersion: '1' },
-    check: httpSlot('/blocks/latest', (p) => `https://${p.key}.${p.hosts.blockfrost}/blocks/latest`, (b) => b?.slot, 'slot'),
-  },
-  {
-    kind: 'KupoPort',
-    label: 'Kupo',
-    claim: 'answers at the chain tip',
-    spec: { network: 'mainnet', throughputTier: '0', pruneUtxo: true, operatorVersion: '1' },
-    check: httpSlot('/health', (p) => `https://${p.key}.${p.hosts.kupo}/health`, (b) => b?.most_recent_checkpoint, 'most_recent_checkpoint'),
-  },
-  {
-    kind: 'OgmiosPort',
-    label: 'Ogmios',
-    claim: 'answers at the chain tip',
-    spec: { network: 'mainnet', throughputTier: '0', version: 6 },
-    check: httpSlot('/health', (p) => `https://${p.key}.${p.hosts.ogmios}/health`, (b) => b?.lastKnownTip?.slot, 'lastKnownTip.slot'),
-  },
-  {
-    kind: 'UtxoRpcPort',
-    label: 'UTxO RPC',
-    claim: 'answers at the chain tip',
-    spec: { network: 'mainnet', throughputTier: '0', operatorVersion: '1' },
-    // `QueryService.ReadParams` → `ReadParamsResponse { ledger_tip = 2 }`, `ChainPoint { slot = 1 }`.
-    async check(probe) {
-      const slot = await attempt(probe, async () => {
-        const response = await unary({
-          address: probe.hosts.utxorpc,
-          method: '/utxorpc.v1alpha.query.QueryService/ReadParams',
-          request: new Uint8Array(),
-          headers: { 'dmtr-api-key': probe.key },
-        })
-        const [ledgerTip] = messages(response, 2)
-        return slotOf(ledgerTip ? varint(ledgerTip, 1) : null, 'ledger tip')
-      })
-      return atTip('ReadParams', slot, probe.tip)
+    {
+      kind: 'BlockfrostPort',
+      label: 'Blockfrost',
+      claim: 'answers at the chain tip',
+      spec: { network: 'mainnet', throughputTier: '0', operatorVersion: '1' },
+      check: httpSlot(send, '/blocks/latest', (p) => `https://${p.key}.${p.hosts.blockfrost}/blocks/latest`, (b) => b?.slot, 'slot'),
     },
-  },
-  {
-    kind: 'SubmitApiPort',
-    label: 'Submit API',
-    claim: 'refuses an empty transaction with 400',
-    spec: { network: 'mainnet', throughputTier: '0', operatorVersion: '1' },
-    // fabric's `submit_api_port_expect`: an empty CBOR body is refused with 400 by the
-    // submit API itself, past the proxy's key check. It sleeps between tries, not before the first.
-    async check(probe) {
-      await attempt(
-        probe,
-        async () => {
-          const response = await fetch(`https://${probe.key}.${probe.hosts.submitapi}/api/submit/tx`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/cbor' },
-            body: '',
-            signal: AbortSignal.timeout(15_000),
+    {
+      kind: 'KupoPort',
+      label: 'Kupo',
+      claim: 'answers at the chain tip',
+      spec: { network: 'mainnet', throughputTier: '0', pruneUtxo: true, operatorVersion: '1' },
+      check: httpSlot(send, '/health', (p) => `https://${p.key}.${p.hosts.kupo}/health`, (b) => b?.most_recent_checkpoint, 'most_recent_checkpoint'),
+    },
+    {
+      kind: 'OgmiosPort',
+      label: 'Ogmios',
+      claim: 'answers at the chain tip',
+      spec: { network: 'mainnet', throughputTier: '0', version: 6 },
+      check: httpSlot(send, '/health', (p) => `https://${p.key}.${p.hosts.ogmios}/health`, (b) => b?.lastKnownTip?.slot, 'lastKnownTip.slot'),
+    },
+    {
+      kind: 'UtxoRpcPort',
+      label: 'UTxO RPC',
+      claim: 'answers at the chain tip',
+      spec: { network: 'mainnet', throughputTier: '0', operatorVersion: '1' },
+      // `QueryService.ReadParams` → `ReadParamsResponse { ledger_tip = 2 }`, `ChainPoint { slot = 1 }`.
+      async check(probe) {
+        const slot = await attempt(probe, async () => {
+          const response = await call({
+            address: probe.hosts.utxorpc,
+            method: '/utxorpc.v1alpha.query.QueryService/ReadParams',
+            request: new Uint8Array(),
+            headers: { 'dmtr-api-key': probe.key },
           })
-          await response.body?.cancel()
-          if (response.status !== 400) throw new Error(`POST /api/submit/tx with an empty body answered HTTP ${response.status}, wanted 400`)
-        },
-        { sleepMs: (n) => (n === 1 ? 0 : budget.sleepMs) },
-      )
-      return { detail: 'POST /api/submit/tx with an empty body answered 400' }
+          const [ledgerTip] = messages(response, 2)
+          return slotOf(ledgerTip ? varint(ledgerTip, 1) : null, 'ledger tip')
+        })
+        return atTip('ReadParams', slot, probe.tip)
+      },
     },
-  },
-]
+    {
+      kind: 'SubmitApiPort',
+      label: 'Submit API',
+      claim: 'refuses an empty transaction with 400',
+      spec: { network: 'mainnet', throughputTier: '0', operatorVersion: '1' },
+      // fabric's `submit_api_port_expect`: an empty CBOR body is refused with 400 by the
+      // submit API itself, past the proxy's key check. It sleeps between tries, not before the first.
+      async check(probe) {
+        await attempt(
+          probe,
+          async () => {
+            const response = await fetchNamingCause(
+              `https://${probe.key}.${probe.hosts.submitapi}/api/submit/tx`,
+              { method: 'POST', headers: { 'content-type': 'application/cbor' }, body: '', signal: AbortSignal.timeout(15_000) },
+              send,
+            )
+            await response.body?.cancel()
+            if (response.status !== 400) throw new Error(`POST /api/submit/tx with an empty body answered HTTP ${response.status}, wanted 400`)
+          },
+          { sleepMs: (n) => (n === 1 ? 0 : budget.sleepMs) },
+        )
+        return { detail: 'POST /api/submit/tx with an empty body answered 400' }
+      },
+    },
+  ]
+}
+
+export const kinds = portKinds()

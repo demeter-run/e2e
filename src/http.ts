@@ -95,3 +95,17 @@ export function safeUrl(url: string | null, keep: string[] = []): string {
   const kept = keep.filter((k) => u.searchParams.has(k)).map((k) => `${k}=${u.searchParams.get(k)}`)
   return `${u.origin}${u.pathname}${kept.length ? `?${kept.join('&')}` : ''}`
 }
+
+/**
+ * `fetch`, failing as `probe` does: Node's `fetch` rejects with a bare "fetch
+ * failed" and keeps what went wrong (DNS, a refused connection, TLS) in its
+ * `cause`, so the failure names the cause instead.
+ */
+export async function fetchNamingCause(url: string, init: RequestInit, send: typeof fetch = fetch): Promise<Response> {
+  try {
+    return await send(url, init)
+  } catch (error) {
+    const root = ((error as Error).cause instanceof Error ? (error as Error).cause : error) as Error & { code?: string }
+    throw new Error(`${root.code ?? root.name} (${root.message})`)
+  }
+}

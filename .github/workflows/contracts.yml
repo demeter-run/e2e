@@ -21,9 +21,13 @@ name: contracts
 #     concurrency:
 #       group: production-test-user
 #       cancel-in-progress: false
+#       queue: max
 #
-# so no two runs use the user at once. No job here signs in; ports.yml's
-# does, and the J2 journey and the agent probe will.
+# so no two runs use the user at once. `queue: max` keeps every waiting run:
+# without it the group holds one pending run, and a newer one cancels it
+# silently (no failure, so no alert), as happened to a ports run on PR #2.
+# No job here signs in; ports.yml's does, and the J2 journey and the agent
+# probe will.
 
 on:
   pull_request:

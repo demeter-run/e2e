@@ -5,9 +5,11 @@ import { describe, it, mock } from 'node:test'
 import { main } from '../src/cli/main.ts'
 import { environments } from '../src/env.ts'
 import { type Cbor, decode, encode, Incomplete, Tagged } from '../src/ports/cbor.ts'
+import { Fabric } from '../src/ports/fabric.ts'
+import type { Call } from '../src/ports/grpc.ts'
 import { portSuite, type Seams } from '../src/ports/index.ts'
-import type { Kind } from '../src/ports/kinds.ts'
-import { mainnet, queryTip, syncProgress } from '../src/ports/node.ts'
+import { type Kind, type Probe, portKinds, type Reach } from '../src/ports/kinds.ts'
+import { mainnet, queryTip, slotTime, syncProgress } from '../src/ports/node.ts'
 import { decode as decodeProto, encodeStrings, encodeVarints, messages, string, varint } from '../src/ports/proto.ts'
 import { type Result, Run } from '../src/report.ts'
 import { withEnv } from './helpers.ts'
@@ -111,8 +113,14 @@ describe('the node check', () => {
   })
 })
 
-/** A fabric that keeps its projects in memory; `fail` makes one of its calls throw. */
-function fakeFabric(fail: Partial<Record<'createProject' | 'deleteProject' | 'createResource', string>> = {}) {
+/**
+ * A fabric that keeps its projects in memory; `fail` makes one of its calls
+ * throw, and `quirks` keeps a created project out of the list or a deleted one in it.
+ */
+function fakeFabric(
+  fail: Partial<Record<'createProject' | 'deleteProject' | 'createResource', string>> = {},
+  quirks: { neverListed?: boolean; staysListed?: boolean } = {},
+) {
   const state = { projects: new Set<string>(['someone-elses']), deleted: [] as string[], created: [] as string[] }
   const fabric: Seams['fabric'] = (address, token) => {
     assert.equal(address, 'rpc.demeter.run:443')
@@ -120,13 +128,13 @@ function fakeFabric(fail: Partial<Record<'createProject' | 'deleteProject' | 'cr
     return {
       async createProject() {
         if (fail.createProject) throw new Error(fail.createProject)
-        state.projects.add('p-1')
+        if (!quirks.neverListed) state.projects.add('p-1')
         return { id: 'p-1', namespace: 'prj-e2e' }
       },
       async deleteProject(id) {
         if (fail.deleteProject) throw new Error(fail.deleteProject)
         state.deleted.push(id)
-        state.projects.delete(id)
+        if (!quirks.staysListed) state.projects.delete(id)
       },
       async projectIds() {
         return [...state.projects]
@@ -175,6 +183,7 @@ describe('the port suite', () => {
       [
         'sign in as e2e@txpipe.io',
         'create a project',
+        'the project is listed',
         'CardanoNodePort: create CardanoNodePort',
         'CardanoNodePort: answers',
         'KupoPort: create KupoPort',
@@ -187,6 +196,48 @@ describe('the port suite', () => {
     assert.deepEqual(state.created, ['p-1/CardanoNodePort', 'p-1/KupoPort'])
     assert.deepEqual(state.deleted, ['p-1'])
     assert.deepEqual([...state.projects], ['someone-elses'])
+  })
+
+  it('takes the tip from the node alone, not from a kind after it that reads a slot', async () => {
+    const { fabric } = fakeFabric()
+    const tips: (number | null)[] = []
+    const result = await runSuite({
+      fabric,
+      kinds: [
+        kind('CardanoNodePort', async () => ({ detail: 'synced', slot: 1_000 })),
+        kind('KupoPort', async ({ tip }) => {
+          tips.push(tip)
+          return { detail: 'at tip', slot: 5_000 }
+        }),
+        kind('OgmiosPort', async ({ tip }) => {
+          tips.push(tip)
+          return { detail: 'at tip' }
+        }),
+      ],
+    })
+    assert.equal(result.ok, true, JSON.stringify(result.steps))
+    assert.deepEqual(tips, [880, 880])
+  })
+
+  it('fails when the deleted project is still listed', async () => {
+    const { state, fabric } = fakeFabric({}, { staysListed: true })
+    const result = await runSuite({ fabric, kinds: [] })
+    assert.equal(result.ok, false)
+    assert.deepEqual(state.deleted, ['p-1'])
+    const last = result.steps.at(-1)!
+    assert.deepEqual([last.name, last.ok, last.detail], ['the project is no longer listed', false, 'FetchProjects still lists p-1 after 5 reads'])
+  })
+
+  it('fails when the created project is never listed, and still checks the kinds and deletes it', async () => {
+    const { state, fabric } = fakeFabric({}, { neverListed: true })
+    const result = await runSuite({ fabric, kinds: [kind('KupoPort', async () => ({ detail: 'at tip' }))] })
+    assert.equal(result.ok, false)
+    assert.deepEqual(
+      result.steps.filter((s) => !s.ok).map((s) => [s.name, s.detail]),
+      [['the project is listed', 'FetchProjects does not list p-1 after 5 reads']],
+    )
+    assert.ok(result.steps.some((s) => s.name === 'KupoPort: answers' && s.ok))
+    assert.deepEqual(state.deleted, ['p-1'])
   })
 
   it('checks every kind after one fails, and still deletes the project', async () => {
@@ -268,5 +319,222 @@ describe('pnpm ports', () => {
     } finally {
       error.mock.restore()
     }
+  })
+})
+
+/** A fabric whose calls are recorded and answered by `answer`. */
+function recordedFabric(answer: (call: Call) => Uint8Array) {
+  const calls: Call[] = []
+  const fabric = new Fabric('rpc.demeter.run:443', 'token-abc', async (call) => {
+    calls.push(call)
+    return answer(call)
+  })
+  return { calls, fabric }
+}
+
+/** A length-delimited field holding `message`, as protobuf nests one. */
+const nested = (number: number, message: Uint8Array) => Uint8Array.from([(number << 3) | 2, message.length, ...message])
+
+describe('fabric', () => {
+  it('lists project ids from FetchProjects records', async () => {
+    const project = (id: string) => nested(2, encodeStrings({ 1: id, 2: `name of ${id}`, 3: `prj-${id}` }))
+    const { calls, fabric } = recordedFabric(() => Uint8Array.from([...project('p-1'), ...project('p-2')]))
+    assert.deepEqual(await fabric.projectIds(), ['p-1', 'p-2'])
+    const [call] = calls
+    assert.equal(call!.method, '/demeter.ops.v1alpha.ProjectService/FetchProjects')
+    assert.deepEqual(call!.headers, { authorization: 'Bearer token-abc' })
+    // FetchProjectsRequest { page = 1, page_size = 2 }: one page of 100.
+    assert.equal(varint(call!.request, 2), 100)
+    assert.equal(varint(call!.request, 1), null)
+  })
+
+  it('deletes the project by its id', async () => {
+    const { calls, fabric } = recordedFabric(() => new Uint8Array())
+    await fabric.deleteProject('p-1')
+    assert.deepEqual(
+      calls.map((c) => [c.method, string(c.request, 1)]),
+      [['/demeter.ops.v1alpha.ProjectService/DeleteProject', 'p-1']],
+    )
+  })
+
+  it('gives CreateProject a minute, so a slow commit is not a project the run cannot delete', async () => {
+    const { calls, fabric } = recordedFabric(() => encodeStrings({ 1: 'p-1', 2: 'e2e project', 3: 'prj-e2e' }))
+    assert.deepEqual(await fabric.createProject('e2e project'), { id: 'p-1', namespace: 'prj-e2e' })
+    assert.equal(calls[0]!.timeoutMs, 60_000)
+    assert.equal(string(calls[0]!.request, 1), 'e2e project')
+  })
+
+  it('reports a spec that is not JSON without quoting it', async () => {
+    const { fabric } = recordedFabric(() => nested(1, encodeStrings({ 1: 'r-1', 4: '{"authToken":"dmtr_secret' })))
+    await assert.rejects(fabric.resourceSpec('r-1'), (error: Error) => {
+      assert.equal(error.message, 'FetchResourcesById answered a spec that is not JSON')
+      return true
+    })
+  })
+})
+
+describe('the port kinds', () => {
+  const hosts = environments.production.ports!.hosts
+  const now = 1_790_000_000
+  /** The slot at unix time `t`, on mainnet. */
+  const slotAt = (t: number) => mainnet.shelleySlot + (t - mainnet.shelleyStart)
+
+  function probe(tip: number | null = 900) {
+    const sleeps: number[] = []
+    const value: Probe = { key: 'k', hosts, tip, sleep: async (ms) => void sleeps.push(ms) }
+    return { probe: value, sleeps }
+  }
+
+  /** The kinds, with `fetch` answered by `answer` (a Response, or an error to throw) and each request recorded. */
+  function reach(answer: (url: string, n: number) => Response | Error, more: Partial<Reach> = {}) {
+    const requests: { url: string; init: RequestInit }[] = []
+    const fetch = (async (url: string, init: RequestInit) => {
+      requests.push({ url, init })
+      const answered = answer(url, requests.length)
+      if (answered instanceof Error) throw answered
+      return answered
+    }) as typeof globalThis.fetch
+    const kinds = portKinds({ fetch, now: () => now, ...more })
+    return { requests, kind: (name: string) => kinds.find((k) => k.kind === name)! }
+  }
+
+  const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status })
+
+  /** What each HTTP kind answers, and the field its slot is read from. */
+  const httpKinds = [
+    { name: 'BlockfrostPort', url: `https://k.${hosts.blockfrost}/blocks/latest`, body: (slot: number) => ({ slot, height: 1 }) },
+    { name: 'KupoPort', url: `https://k.${hosts.kupo}/health`, body: (slot: number) => ({ most_recent_checkpoint: slot, most_recent_node_tip: 1 }) },
+    { name: 'OgmiosPort', url: `https://k.${hosts.ogmios}/health`, body: (slot: number) => ({ lastKnownTip: { slot, height: 1 } }) },
+  ]
+
+  for (const { name, url, body } of httpKinds) {
+    it(`${name} passes at the tip, reading its own field from its own URL`, async () => {
+      const { requests, kind } = reach(() => json(body(900)))
+      const { slot } = await kind(name).check(probe(900).probe)
+      assert.equal(slot, 900)
+      assert.deepEqual(
+        requests.map((r) => [r.url, (r.init.headers as Record<string, string>).accept]),
+        [[url, 'application/json']],
+      )
+    })
+
+    it(`${name} finds no slot in another kind's answer`, async () => {
+      for (const other of httpKinds.filter((k) => k.name !== name)) {
+        const { kind } = reach(() => json(other.body(900)))
+        await assert.rejects(kind(name).check(probe().probe), /^Error: after 5 attempts: answered no /)
+      }
+    })
+  }
+
+  it('fails a slot behind the tip, and a slot with no tip to compare it with', async () => {
+    const { kind } = reach(() => json({ slot: 899 }))
+    await assert.rejects(kind('BlockfrostPort').check(probe(900).probe), {
+      message: 'is not at the chain tip: slot 899, the node\'s tip less 120 slots is 900',
+    })
+    await assert.rejects(kind('BlockfrostPort').check(probe(null).probe), {
+      message: 'answered at slot 899, but there is no node tip to compare it with: the node check failed',
+    })
+  })
+
+  it('tries five times, three seconds before each, and fails naming the last cause', async () => {
+    const refused = new TypeError('fetch failed', { cause: Object.assign(new Error('getaddrinfo ENOTFOUND k.kupo'), { code: 'ENOTFOUND' }) })
+    const { requests, kind } = reach(() => refused)
+    const { probe: p, sleeps } = probe()
+    await assert.rejects(kind('KupoPort').check(p), { message: 'after 5 attempts: ENOTFOUND (getaddrinfo ENOTFOUND k.kupo)' })
+    assert.equal(requests.length, 5)
+    assert.deepEqual(sleeps, [3_000, 3_000, 3_000, 3_000, 3_000])
+  })
+
+  it('retries a failed answer or one with no integer slot, and passes when one arrives in budget', async () => {
+    const answers = [json({}, 503), new Response('<html>', { status: 200 }), json({ slot: '900' }), json({ slot: 900.5 }), json({ slot: 900 })]
+    const { requests, kind } = reach((_url, n) => answers[n - 1]!)
+    assert.equal((await kind('BlockfrostPort').check(probe().probe)).slot, 900)
+    assert.equal(requests.length, 5)
+    const { kind: never } = reach(() => json({ slot: '900' }))
+    await assert.rejects(never('BlockfrostPort').check(probe().probe), { message: 'after 5 attempts: answered no slot' })
+  })
+
+  describe('the node', () => {
+    function node(slots: number[]) {
+      const asked: string[] = []
+      const queryTip: Reach['queryTip'] = async (address) => {
+        asked.push(address)
+        return { slot: slots[Math.min(asked.length, slots.length) - 1]!, block: 12_000_000 }
+      }
+      return { asked, kind: reach(() => new Error('no fetch'), { queryTip }).kind('CardanoNodePort') }
+    }
+
+    it('passes at the tip, on the key’s host', async () => {
+      const { asked, kind } = node([slotAt(now)])
+      const result = await kind.check(probe().probe)
+      assert.deepEqual(result, { detail: `syncProgress 100.00 at slot ${slotAt(now)}, block 12000000`, slot: slotAt(now) })
+      assert.deepEqual(asked, [`k.${hosts.node}`])
+    })
+
+    it('passes at 99, and fails below it after five tries with doubling waits', async () => {
+      // The slot whose time covers `share` of the time since the system start.
+      const at = (share: number) => slotAt(Math.ceil(mainnet.systemStart + share * (now - mainnet.systemStart)))
+      assert.equal(syncProgress(at(0.99), now), 99)
+      assert.equal(syncProgress(at(0.99) - 3_000, now), 98.99)
+      assert.ok(slotTime(at(0.99)) < now - 600)
+
+      assert.equal((await node([at(0.99)]).kind.check(probe().probe)).slot, at(0.99))
+      const behind = node([at(0.99) - 3_000])
+      const { probe: p, sleeps } = probe()
+      await assert.rejects(behind.kind.check(p), { message: `after 5 attempts: syncProgress 98.99 at slot ${at(0.99) - 3_000}, not within 99–100` })
+      assert.deepEqual(sleeps, [3_000, 6_000, 12_000, 24_000, 48_000])
+      assert.equal(behind.asked.length, 5)
+    })
+  })
+
+  describe('UTxO RPC', () => {
+    function utxorpc(response: Uint8Array) {
+      const calls: Call[] = []
+      const unary: Reach['unary'] = async (call) => {
+        calls.push(call)
+        return response
+      }
+      return { calls, kind: reach(() => new Error('no fetch'), { unary }).kind('UtxoRpcPort') }
+    }
+
+    it('reads ReadParams’ ledger tip with the key in a header', async () => {
+      // ReadParamsResponse { values = 1, ledger_tip = 2 { slot = 1, hash = 2 } }
+      const tip = Uint8Array.from([...encodeVarints({ 1: 900 }), ...encodeStrings({ 2: 'hash' })])
+      const { calls, kind } = utxorpc(Uint8Array.from([...encodeStrings({ 1: 'params' }), ...nested(2, tip)]))
+      assert.equal((await kind.check(probe(900).probe)).slot, 900)
+      assert.deepEqual(
+        calls.map(({ address, method, headers }) => ({ address, method, headers })),
+        [{ address: hosts.utxorpc, method: '/utxorpc.v1alpha.query.QueryService/ReadParams', headers: { 'dmtr-api-key': 'k' } }],
+      )
+    })
+
+    it('fails an answer with no ledger tip', async () => {
+      const { calls, kind } = utxorpc(encodeStrings({ 1: 'params' }))
+      await assert.rejects(kind.check(probe().probe), { message: 'after 5 attempts: answered no ledger tip' })
+      assert.equal(calls.length, 5)
+    })
+  })
+
+  describe('the Submit API', () => {
+    it('passes when an empty transaction is refused with 400, trying at once', async () => {
+      const { requests, kind } = reach(() => new Response('bad tx', { status: 400 }))
+      const { probe: p, sleeps } = probe()
+      assert.deepEqual(await kind('SubmitApiPort').check(p), { detail: 'POST /api/submit/tx with an empty body answered 400' })
+      assert.deepEqual(
+        requests.map(({ url, init }) => [url, init.method, init.body, (init.headers as Record<string, string>)['content-type']]),
+        [[`https://k.${hosts.submitapi}/api/submit/tx`, 'POST', '', 'application/cbor']],
+      )
+      assert.deepEqual(sleeps, [0])
+    })
+
+    it('fails any other answer after five tries, three seconds apart', async () => {
+      const { requests, kind } = reach(() => new Response('', { status: 202 }))
+      const { probe: p, sleeps } = probe()
+      await assert.rejects(kind('SubmitApiPort').check(p), {
+        message: 'after 5 attempts: POST /api/submit/tx with an empty body answered HTTP 202, wanted 400',
+      })
+      assert.equal(requests.length, 5)
+      assert.deepEqual(sleeps, [0, 3_000, 3_000, 3_000, 3_000])
+    })
   })
 })

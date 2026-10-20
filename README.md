@@ -201,8 +201,11 @@ node-to-client protocol instead of `socat` and `cardano-cli`:
    audience `demeter-api`, with `E2E_USER_PASSWORD`, `AUTH0_CLIENT_ID` and
    `AUTH0_CLIENT_SECRET`. Without a token the run ends here.
 2. **Create a project**, `e2e project`, with fabric's
-   `ProjectService/CreateProject` on `rpc.demeter.run:443` (native gRPC).
-   Without one the run ends here.
+   `ProjectService/CreateProject` on `rpc.demeter.run:443` (native gRPC),
+   allowed a minute so a slow commit is not a project the run never learns
+   the id of. Without one the run ends here. The run then reads
+   `FetchProjects`, the Console's list, until it lists the project: a
+   project that never shows there would make step 4's check pass vacuously.
 3. **Create each port kind** in that project, mainnet, tier 0, with
    `ResourceService/CreateResource`, then read it back with
    `FetchResourcesById` until its spec carries its key (`authToken`), and
@@ -228,9 +231,12 @@ node-to-client protocol instead of `socat` and `cardano-cli`:
 
 The retry budget is fabric's: five tries, three seconds before each (the node
 check's waits double from three seconds; the Submit API's come between
-tries). A kind that fails does not stop the others. The run is one result,
+tries). A kind that fails does not stop the others, and a request that gets
+no answer names why (DNS, a refused connection, TLS). The run is one result,
 `results/ports.json`, one step per action above, and alerts once, as
-`e2e-ports`.
+`e2e-ports`. A `--force-fail` run adds the harness's `force-fail` check, so
+it alerts as `e2e-force-fail`, the same alert a forced `pnpm check` run
+posts.
 
 The access token, the three credentials and every port's key are never
 written: a step's detail has each replaced with `***` (`Run.conceal` in
@@ -296,6 +302,11 @@ production.
   dispatches only workflows already on the default branch;
 - when an alerting run fails before the suite starts, one `e2e-ports-setup`
   alert naming the step.
+
+It runs in the `production-test-user` concurrency group with `queue: max`:
+runs that sign in as the test user wait for each other, and every waiting run
+is kept. By default the group keeps one pending run, and a newer one cancels it
+without failing, so no alert would say that day went unchecked.
 
 `.github/workflows/contracts.yml` runs:
 

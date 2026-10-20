@@ -59,7 +59,25 @@ export function portSuite({
       })
       if (!created) return
 
+      // fabric's `FetchProjects`, the Console's list, until the project is in
+      // it or out of it. Its arrival is what makes its departure mean something.
+      const listing = async (listed: boolean) => {
+        let why = ''
+        for (let n = 1; n <= budget.attempts; n++) {
+          await sleep(budget.sleepMs)
+          try {
+            const ids = await api.projectIds()
+            if (ids.includes(project) === listed) return `FetchProjects lists ${ids.length} project(s), ${listed ? 'including' : 'not'} ${project}`
+            why = `FetchProjects ${listed ? 'does not list' : 'still lists'} ${project}`
+          } catch (error) {
+            why = (error as Error).message
+          }
+        }
+        throw new Error(`${why} after ${budget.attempts} reads`)
+      }
+
       try {
+        await run.step('the project is listed', () => listing(true))
         await sleep(budget.sleepMs)
         let tip: number | null = null
         for (const kind of kinds) {
@@ -94,22 +112,7 @@ export function portSuite({
           await api.deleteProject(project)
           return project
         })
-        if (deleted) {
-          await run.step('the project is no longer listed', async () => {
-            let why = ''
-            for (let n = 1; n <= budget.attempts; n++) {
-              await sleep(budget.sleepMs)
-              try {
-                const listed = await api.projectIds()
-                if (!listed.includes(project)) return `FetchProjects lists ${listed.length} project(s), not ${project}`
-                why = `FetchProjects still lists ${project}`
-              } catch (error) {
-                why = (error as Error).message
-              }
-            }
-            throw new Error(`${why} after ${budget.attempts} reads`)
-          })
-        }
+        if (deleted) await run.step('the project is no longer listed', () => listing(false))
       }
     },
   }
