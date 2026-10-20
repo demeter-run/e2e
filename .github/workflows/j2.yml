@@ -33,10 +33,13 @@ name: j2
 # no two runs use the user at once: J2 deletes every project the user owns
 # before it starts and after it ends. `queue: max` keeps every waiting job, but
 # only while every job of the group sets it: by default the group keeps one
-# pending job, and a newer one cancels it without failing it, so no alert
-# would say that day went unwalked. A pull request's newer push replaces its
-# older run instead (the workflow's own concurrency below), so superseded
-# pushes do not queue in the group behind each other.
+# pending job, and a newer one cancels it, so that day goes unwalked. An
+# alerting run of J2 says so (`e2e-j2-cancelled`, above), but the port suite's
+# alert is a step of the job that was cancelled, so it never posts.
+# test/workflows.test.ts fails when a job of the group drops the key, before a
+# run is lost. A pull request's newer push replaces its older run instead (the
+# workflow's own concurrency below), so superseded pushes do not queue in the
+# group behind each other.
 
 on:
   schedule:

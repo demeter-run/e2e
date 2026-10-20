@@ -414,11 +414,14 @@ What outlives the run: each claim makes fabric create a billing (Stripe)
 customer for the test user, which deleting the project does not remove, so
 the test user's billing account gains one customer per run: one a day, and
 one for each pull-request run. A run cancelled after its claim, or whose
-delete fails, leaves the claimed project on the test user's account until
-J2's next run, which deletes every project the user owns (daily at 06:00
-UTC), unless the Console refuses that delete too. Scheduled and dispatched
-runs of main alert on both; a pull request's run has no webhook, so it shows
-only in its checks.
+delete fails, leaves the claimed project on the test user's account.
+Scheduled and dispatched runs of main alert on both; a pull request's run has
+no webhook, so it shows only in its checks. The project stays until a J2 run
+that signs in deletes it: J2 deletes every project the user owns before and
+after its walk (daily at 06:00 UTC). A J2 run deletes nothing when it never
+reaches its clean slate (cancelled, skipped, or a set-up step failed), cannot
+sign in, loses its session partway through a delete, or the Console refuses
+the delete; the project then waits for the next.
 
 The prod-safe contract tests send requests the Console refuses, apart from
 the 65-character name: should production ever accept it, that run leaves one
@@ -808,7 +811,12 @@ J2's two jobs and the agent probe do. That holds only while every job of the
 group sets `queue: max`: by default a newer job in the group cancels the one
 pending, and a job without it cancels every pending one when it comes up (a
 J2 run of an unmerged pull request did so to the agent probe on 2026-10-20),
-losing that day's run to it.
+losing that day's run to it. A J2 or probe run of `main`, scheduled or
+dispatched, says so with its `-cancelled` alert; the port suite's alert is a
+step of the job that was cancelled, so it posts none. A unit test
+(`test/workflows.test.ts`) fails when a job that can read the password sits
+outside the group, or a job of the group drops either key, before a run is
+lost.
 
 The agent probe adds a group of its own around the whole run, one per pull
 request (`agent-j0-probe-<number>`; each scheduled or dispatched run has its
