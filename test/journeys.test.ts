@@ -119,6 +119,40 @@ describe('J3 and J9 on the mock', () => {
     }
   })
 
+  it('stops at its first step, sending no agent-route call, when the control routes do not answer as the mock', async () => {
+    // A server at E2E_MOCK_URL that is not the mock: 404 on /__mock/*, or 200 with something else.
+    for (const control of [404, 200]) {
+      const seen: string[] = []
+      const stranger = await serve((request, response) => {
+        seen.push(`${request.method} ${request.url}`)
+        request.resume()
+        response.writeHead(request.url?.startsWith('/__mock/') ? control : 200, { 'content-type': 'application/json' })
+        response.end('{}')
+      })
+      try {
+        for (const name of ['j3', 'j9'] as const) {
+          seen.length = 0
+          const { code, result } = await journey(name, { ...environments.mock, console: stranger.url })
+          assert.equal(code, 1)
+          assert.deepEqual(
+            result.steps.map((s) => [s.name, s.ok]),
+            [
+              ['start from an empty mock', false],
+              ['no credential in the result or the call log', control === 200],
+            ],
+          )
+          assert.deepEqual(
+            seen.filter((line) => !line.includes(' /__mock/')),
+            [],
+            `${name} with control routes answering ${control}`,
+          )
+        }
+      } finally {
+        await stranger.close()
+      }
+    }
+  })
+
   it('refuses any environment but the mock, and a missing one, touching nothing', async () => {
     const dead = await refusedUrl()
     const production = { ...environments.production, website: dead, console: dead, legacy: dead, rpc: dead, auth0: dead }

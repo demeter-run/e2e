@@ -1,6 +1,7 @@
 import type { Environment } from '../env.ts'
-import { DOCS_URL } from '../mock/server.ts'
-import { Failure } from '../report.ts'
+import { mockState, resetMock } from '../mock/control.ts'
+import { DOCS_URL, defaultLimits } from '../mock/server.ts'
+import { Failure, type Run } from '../report.ts'
 import {
   type AgentAnswer,
   addPortSecrets,
@@ -28,6 +29,26 @@ import {
 
 export const fail = (message: string): never => {
   throw new Failure(message)
+}
+
+/**
+ * A journey's first step: reset the mock, then read back the state an empty
+ * mock answers. Returns whether that held; the journey stops when it did not,
+ * before any agent-route call reaches whatever else answers at the URL.
+ */
+export async function startFromEmptyMock(env: Environment, run: Run): Promise<boolean> {
+  return run.step('start from an empty mock', async () => {
+    await resetMock(env)
+    const state = await mockState(env)
+    const empty =
+      Array.isArray(state.expired) &&
+      !state.expired.length &&
+      state.provisional_enabled === true &&
+      JSON.stringify(state.limits) === JSON.stringify(defaultLimits) &&
+      !Number.isNaN(Date.parse(state.now))
+    if (!empty) fail(`after POST /__mock/reset, GET /__mock/state answered ${JSON.stringify(state).slice(0, 200)}, not an empty mock's state`)
+    return 'POST /__mock/reset, then GET /__mock/state: empty'
+  })
 }
 
 /** The Blockfrost call J0 makes on a port. */

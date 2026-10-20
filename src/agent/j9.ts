@@ -1,9 +1,9 @@
 import type { Environment } from '../env.ts'
-import { advanceMockClock, resetMock, setMockState } from '../mock/control.ts'
+import { advanceMockClock, setMockState } from '../mock/control.ts'
 import { defaultLimits } from '../mock/server.ts'
 import type { Run } from '../report.ts'
 import { describe, type Secrets } from './client.ts'
-import { Agent, answers, claimPath, createdPort, expectError, expectIpCap, fail, type Port, type Project, portOn, signedIn } from './mock-journey.ts'
+import { Agent, answers, claimPath, createdPort, expectError, expectIpCap, fail, type Port, type Project, portOn, signedIn, startFromEmptyMock } from './mock-journey.ts'
 
 /**
  * J9, abuse (`solution/devex/contracts/journey-matrix.md`), as scripted calls
@@ -38,7 +38,7 @@ export async function j9({ env, run, secrets }: { env: Environment; run: Run; se
 
   const project = (i: number) => projects[i] ?? fail(`not run: registration ${i + 1} failed`)
 
-  await run.step('start from an empty mock', () => resetMock(env).then(() => 'POST /__mock/reset'))
+  if (!(await startFromEmptyMock(env, run))) return
 
   await run.step(`from ${IP.busy}, three registrations an hour apart from the first succeed`, async () => {
     projects.push(await busy.registered())

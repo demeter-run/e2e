@@ -84,7 +84,7 @@ const onError =
     answer.body.startsWith('{"error"') ? edit(answer, request) : answer
 
 async function contractOn(target: Environment) {
-  // From an empty mock, as \`pnpm contract\` starts: the mock counts each
+  // From an empty mock, as `pnpm contract` starts: the mock counts each
   // run's registrations against one client IP's cap.
   await resetMock(env)
   const secrets = new Secrets()

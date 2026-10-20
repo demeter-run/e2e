@@ -1,8 +1,8 @@
 import type { Environment } from '../env.ts'
-import { advanceMockClock, mockState, resetMock } from '../mock/control.ts'
+import { advanceMockClock, mockState } from '../mock/control.ts'
 import type { Run } from '../report.ts'
 import { describe, type Secrets } from './client.ts'
-import { Agent, answers, claimPath, createdPort, dataRequest, expectError, fail, type Port, type Project, portOn, signedIn } from './mock-journey.ts'
+import { Agent, answers, claimPath, createdPort, dataRequest, expectError, fail, type Port, type Project, portOn, signedIn, startFromEmptyMock } from './mock-journey.ts'
 
 /**
  * J3, expiry (`solution/devex/contracts/journey-matrix.md`), as scripted
@@ -27,7 +27,7 @@ export async function j3({ env, run, secrets }: { env: Environment; run: Run; se
 
   const needFirst = () => first ?? fail('not run: the first registration failed')
 
-  await run.step('start from an empty mock', () => resetMock(env).then(() => 'POST /__mock/reset'))
+  if (!(await startFromEmptyMock(env, run))) return
 
   await run.step(`register as agent ${AGENT_NAME} from ${IP}: expires 7 days later on the mock's clock`, async () => {
     const now = Date.parse((await mockState(env)).now)

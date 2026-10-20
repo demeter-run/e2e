@@ -24,14 +24,15 @@ import * as pages from './pages.ts'
  *   | null, "retry_after_seconds"?: <int>}` makes every call to that route
  *   answer that error (any code in the contract's table), or stops it; with
  *   `{"project": <id or namespace>, "expired": true | false}` it expires a
- *   project or revives it; with `{"provisional_enabled": true | false}` it
+ *   project or revives it (with a fresh 7 days when its expiry has passed, so
+ *   the next sweep leaves it); with `{"provisional_enabled": true | false}` it
  *   turns the kill switch; with `{"limits": {"ip_cap"?, "global_cap"?,
  *   "port_cap"?}}` it sets the caps it enforces. It answers the state after,
  *   as `GET /__mock/state` does: `{"errors": {<route>: {"error",
  *   "retry_after_seconds"?}}, "expired": [<project id>], "provisional_enabled",
  *   "limits": {"ip_cap", "global_cap", "port_cap"}, "now"}`.
  * - `POST /__mock/clock` with `{"advance_seconds": <int>}` moves the mock's
- *   clock forward, then sweeps: every unclaimed project whose expiry has
+ *   clock forward, at most 100 years ahead of this machine's in all, then sweeps: every unclaimed project whose expiry has
  *   passed expires, as fabric's sweep does (every 10 minutes; the mock's at
  *   each move). It answers the state after.
  * - `GET /__mock/calls`: every other call so far, `{method, path, status,
@@ -88,6 +89,9 @@ export const rules = ['ip_cap', 'ip_window', 'global_cap', 'port_cap', 'kill_swi
 export type Rule = (typeof rules)[number]
 
 const TTL_DAYS = 7
+const TTL_MS = TTL_DAYS * 86_400_000
+/** How far ahead of this machine's the mock's clock may run: far past any journey, and well inside what a `Date` holds. */
+const MAX_CLOCK_AHEAD_SECONDS = 100 * 365 * 86_400
 const IP_CAP_WINDOW_MS = 86_400_000
 /** The `ip_cap` wait when none is switched on: the whole window, as when fabric reports none. */
 const IP_CAP_RETRY_AFTER_SECONDS = 86400
@@ -313,7 +317,7 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl, brok
       apiKey: `dmtr_apikey1${random(BECH32_ALPHABET, 58)}`,
       claimToken: randomBytes(32).toString('base64url'),
       userCode: `${random(USER_CODE_ALPHABET, 4)}-${random(USER_CODE_ALPHABET, 4)}`,
-      expiresAt: rfc3339(new Date(at + TTL_DAYS * 86_400_000)),
+      expiresAt: rfc3339(new Date(at + TTL_MS)),
       agent: {
         name,
         ...(typeof agent.version === 'string' ? { version: agent.version } : {}),
@@ -478,12 +482,14 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl, brok
   }
 
   /**
-   * The client IP registration counts by: the first `X-Forwarded-For` entry,
-   * which a run sets to act as several sources, or the connection's address,
-   * as the Console's Fastify takes it behind its proxy.
+   * The client IP registration counts by, as the Console's Fastify takes it
+   * behind its one trusted proxy (`TRUST_PROXY_HOPS`, 1 by default): the last
+   * `X-Forwarded-For` entry, the one that proxy wrote, so an entry the client
+   * put before it is ignored; or the connection's address. A run sets the
+   * header to act as several sources.
    */
   const clientIp = (request: IncomingMessage): string =>
-    request.headers['x-forwarded-for']?.toString().split(',')[0]?.trim() || request.socket.remoteAddress || ''
+    request.headers['x-forwarded-for']?.toString().split(',').at(-1)?.trim() || request.socket.remoteAddress || ''
 
   /** Whether a request names the mock as its host: its base URL's name, or a loopback one. */
   const ownHost = (request: IncomingMessage) => {
@@ -518,6 +524,9 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl, brok
     if (path === '/__mock/clock') {
       const seconds = body.advance_seconds
       if (!Number.isInteger(seconds) || (seconds as number) < 0) return sendJson(response, 400, { error: 'send {"advance_seconds": <whole seconds, at least 0>}' })
+      if (state.clockMs / 1000 + (seconds as number) > MAX_CLOCK_AHEAD_SECONDS) {
+        return sendJson(response, 400, { error: `the mock's clock runs at most ${MAX_CLOCK_AHEAD_SECONDS} seconds (100 years) ahead; reset it to start again` })
+      }
       state.clockMs += (seconds as number) * 1000
       sweep()
       return sendJson(response, 200, snapshot())
@@ -535,6 +544,8 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl, brok
       const project = state.projects.find((p) => p.id === body.project || p.namespace === body.project)
       if (!project) return sendJson(response, 404, { error: 'no such project' })
       project.expired = body.expired
+      // A revived project gets a fresh 7 days if its expiry has passed, or the next sweep would expire it again.
+      if (!body.expired && Date.parse(project.expiresAt) <= now()) project.expiresAt = rfc3339(new Date(now() + TTL_MS))
     } else if (typeof body.provisional_enabled === 'boolean') {
       state.enabled = body.provisional_enabled
     } else if (typeof body.limits === 'object' && body.limits !== null && !Array.isArray(body.limits)) {

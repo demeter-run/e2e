@@ -244,8 +244,8 @@ describe('the mock: caps, kill switch and clock', () => {
     return { apiKey: vars.get('DEMETER_API_KEY')!, projectId: vars.get('DEMETER_PROJECT_ID')! }
   }
 
-  it("counts registrations by the first X-Forwarded-For address, or the connection's, three in 24 hours", async () => {
-    for (let i = 0; i < 3; i++) assert.equal((await from('192.0.2.1, 10.0.0.1')).status, 200)
+  it("counts registrations by the last X-Forwarded-For address, as the Console's one trusted hop does, or the connection's, three in 24 hours", async () => {
+    for (let i = 0; i < 3; i++) assert.equal((await from(`198.51.100.${i}, 192.0.2.1`)).status, 200)
     const fourth = await from('192.0.2.1')
     assert.deepEqual(codeOf(fourth), [429, 'ip_cap'])
     const wait = errorBody(fourth)!.retry_after_seconds!
@@ -272,6 +272,56 @@ describe('the mock: caps, kill switch and clock', () => {
     assert.ok(next.retry_after_seconds! > 2 * 3600 - 60 && next.retry_after_seconds! <= 2 * 3600, `retry_after_seconds ${next.retry_after_seconds}`)
   })
 
+  it('counts every registration from an address against its cap, claimed and expired ones too, as fabric does', async () => {
+    const first = await from('192.0.2.1')
+    const second = await from('192.0.2.1')
+    assert.equal((await from('192.0.2.1')).status, 200)
+    const visit = browser()
+    await visit('POST', '/login', { username: 'alice', password: 'x' })
+    assert.equal((await visit('POST', new URL(dotenvVars(first.body).get('DEMETER_CLAIM_URL')!).pathname, { name: '' })).status, 302)
+    await setMockState(env, { project: credentialsOf(second).projectId, expired: true })
+    assert.deepEqual(codeOf(await from('192.0.2.1')), [429, 'ip_cap'])
+  })
+
+  it('rounds the wait up to the whole second, as fabric does', async () => {
+    const start = Date.now()
+    mocks.timers.enable({ apis: ['Date'], now: start })
+    try {
+      for (let i = 0; i < 3; i++) assert.equal((await from('192.0.2.1')).status, 200)
+      mocks.timers.tick(400)
+      const fourth = await from('192.0.2.1')
+      assert.equal(errorBody(fourth)!.retry_after_seconds, DAY)
+      assert.equal(fourth.headers['retry-after'], String(DAY))
+    } finally {
+      mocks.timers.reset()
+    }
+  })
+
+  it('waits, past a cap lowered under its burst, until enough registrations leave the window, not the oldest alone', async () => {
+    assert.equal((await from('192.0.2.1')).status, 200)
+    await advanceMockClock(env, 3600)
+    assert.equal((await from('192.0.2.1')).status, 200)
+    await advanceMockClock(env, 3600)
+    assert.equal((await from('192.0.2.1')).status, 200)
+    await setMockState(env, { limits: { ip_cap: 1 } })
+    // Down to one, the newest must leave: 24 hours, not the oldest's 22.
+    const wait = errorBody(await from('192.0.2.1'))!.retry_after_seconds!
+    assert.ok(wait > DAY - 60 && wait <= DAY, `retry_after_seconds ${wait}`)
+    await setMockState(env, { limits: { ip_cap: 2 } })
+    const middle = errorBody(await from('192.0.2.1'))!.retry_after_seconds!
+    assert.ok(middle > 23 * 3600 - 60 && middle <= 23 * 3600, `retry_after_seconds ${middle}`)
+  })
+
+  it("checks registration in fabric's order: the kill switch, the address's cap, then the global cap", async () => {
+    for (let i = 0; i < 3; i++) assert.equal((await from('192.0.2.1')).status, 200)
+    await setMockState(env, { limits: { global_cap: 3 } })
+    assert.deepEqual(codeOf(await from('192.0.2.1')), [429, 'ip_cap'])
+    assert.deepEqual(codeOf(await from('192.0.2.2')), [503, 'global_cap'])
+    await setMockState(env, { provisional_enabled: false })
+    assert.deepEqual(codeOf(await from('192.0.2.1')), [503, 'registration_disabled'])
+    assert.deepEqual(codeOf(await from('192.0.2.2')), [503, 'registration_disabled'])
+  })
+
   it('refuses registration past the global limit of live unclaimed projects; an expired or claimed one is not live', async () => {
     await setMockState(env, { limits: { global_cap: 2 } })
     const first = await from('192.0.2.1')
@@ -295,6 +345,13 @@ describe('the mock: caps, kill switch and clock', () => {
     await visit('POST', '/login', { username: 'alice', password: 'x' })
     await visit('POST', new URL(vars.get('DEMETER_CLAIM_URL')!).pathname, { name: '' })
     assert.equal((await createPort(env, credentials, BLOCKFROST)).status, 200)
+  })
+
+  it('answers a project that expired holding its port cap 410 expired, not 429 port_cap', async () => {
+    const { credentials } = await registered()
+    for (let i = 0; i < 3; i++) assert.equal((await createPort(env, credentials, BLOCKFROST)).status, 200)
+    await advanceMockClock(env, 7 * DAY + 60)
+    assert.deepEqual(codeOf(await createPort(env, credentials, BLOCKFROST)), [410, 'expired'])
   })
 
   it('stops registration with the kill switch, and nothing else: ports, the data plane and claims go on', async () => {
@@ -333,10 +390,34 @@ describe('the mock: caps, kill switch and clock', () => {
     assert.ok(Math.abs(Date.parse(later) - (Date.parse(state.now) + 7 * DAY * 1000)) < 5_000, later)
   })
 
+  it('keeps a revived project live through later clock moves, with a fresh 7 days', async () => {
+    const { credentials } = await registered()
+    await advanceMockClock(env, 7 * DAY + 60)
+    await setMockState(env, { project: credentials.projectId, expired: false })
+    assert.deepEqual((await advanceMockClock(env, 0)).expired, [])
+    assert.equal((await createPort(env, credentials, BLOCKFROST)).status, 200)
+    assert.deepEqual((await advanceMockClock(env, 7 * DAY - 60)).expired, [])
+    assert.deepEqual((await advanceMockClock(env, 120)).expired, [credentials.projectId])
+  })
+
+  it('moves the clock up to 100 years ahead in all, refuses past that with 400, and keeps answering', async () => {
+    const limit = 100 * 365 * DAY
+    const clock = (seconds: number) => call('POST', `${mock.url}/__mock/clock`, { body: JSON.stringify({ advance_seconds: seconds }) })
+    assert.equal((await clock(1e13)).status, 400)
+    assert.equal((await clock(limit - 10)).status, 200)
+    assert.equal((await clock(11)).status, 400)
+    const before = (await mockState(env)).now
+    assert.equal((await clock(10)).status, 200)
+    assert.ok(Date.parse((await mockState(env)).now) - Date.parse(before) >= 10_000)
+    const answer = await from('192.0.2.1')
+    assert.equal(answer.status, 200)
+    assert.ok(Date.parse(dotenvVars(answer.body).get('DEMETER_EXPIRES_AT')!) > Date.now() + (limit - DAY) * 1000)
+  })
+
   it('refuses a clock move or a limit it does not know with 400, and changes nothing', async () => {
     const clock = (body: unknown) => call('POST', `${mock.url}/__mock/clock`, { body: JSON.stringify(body) })
     const state = (body: unknown) => call('POST', `${mock.url}/__mock/state`, { body: JSON.stringify(body) })
-    for (const body of [{}, { advance_seconds: -1 }, { advance_seconds: 1.5 }, { advance_seconds: '60' }]) assert.equal((await clock(body)).status, 400, JSON.stringify(body))
+    for (const body of [{}, { advance_seconds: -1 }, { advance_seconds: 1.5 }, { advance_seconds: '60' }, { advance_seconds: 1e13 }]) assert.equal((await clock(body)).status, 400, JSON.stringify(body))
     for (const body of [{ limits: { ip_cap: -1 } }, { limits: { ip_cap: 2.5 } }, { limits: { ttl_days: 1 } }, { limits: [] }, { provisional_enabled: 'no' }]) {
       assert.equal((await state(body)).status, 400, JSON.stringify(body))
     }
