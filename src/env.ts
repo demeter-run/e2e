@@ -15,6 +15,11 @@ export interface Environment {
   rpc: string
   /** The Auth0 tenant the Console and the legacy app sign in through. */
   auth0: string
+  /**
+   * The standing test user journeys sign in as (decision 0047), whose password
+   * is `E2E_USER_PASSWORD`; absent where nothing signs in.
+   */
+  testUser?: string
 }
 
 export const environments = {
@@ -25,6 +30,7 @@ export const environments = {
     legacy: 'https://legacy.demeter.run',
     rpc: 'https://rpc.demeter.run',
     auth0: 'https://txpipe.us.auth0.com',
+    testUser: 'e2e@txpipe.io',
   },
 } satisfies Record<string, Environment>
 

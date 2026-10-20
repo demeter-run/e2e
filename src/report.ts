@@ -1,5 +1,6 @@
 import { appendFile, mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { redact } from './secrets.ts'
 
 /**
  * What every check and journey reports: one result file per run, a GitHub job
@@ -7,7 +8,9 @@ import { join } from 'node:path'
  *
  * Nothing secret goes in a step's detail. A detail is written to the result
  * file, the job summary and the alert as-is, so the code producing it is where
- * a URL loses its query string (see `safeUrl` in `http.ts`).
+ * a URL loses its query string (see `safeUrl` in `http.ts`). A secret a
+ * journey holds (`keepSecret` in `secrets.ts`) is redacted from every detail
+ * as well.
  */
 
 export interface Step {
@@ -25,6 +28,8 @@ export interface Result {
   finished_at: string
   ok: boolean
   steps: Step[]
+  /** A journey's stopwatch: J2's seconds from landing on the site to the first successful request. */
+  elapsed_seconds?: number
 }
 
 /** Thrown inside a step to fail it; its message becomes the step's detail. */
@@ -34,6 +39,8 @@ export class Failure extends Error {}
 export class Run {
   readonly #steps: Step[] = []
   readonly #started = new Date()
+  /** Set by a journey when its stopwatch stops; written to the result as `elapsed_seconds`. */
+  elapsedSeconds?: number
 
   constructor(
     readonly name: string,
@@ -43,7 +50,8 @@ export class Run {
   /**
    * Runs `fn` as one step. It passes when `fn` returns, with the returned text
    * as its detail, and fails when `fn` throws. A failed step does not stop the
-   * run; the return value says whether it passed.
+   * run; the return value says whether it passed. The detail is redacted
+   * (`redact` in `secrets.ts`) before it is recorded.
    */
   async step(name: string, fn: () => string | void | Promise<string | void>): Promise<boolean> {
     const t0 = performance.now()
@@ -55,7 +63,7 @@ export class Run {
       ok = false
       detail = error instanceof Error ? error.message : String(error)
     }
-    this.#steps.push({ name, ok, ms: Math.round(performance.now() - t0), detail })
+    this.#steps.push({ name: redact(name), ok, ms: Math.round(performance.now() - t0), detail: redact(detail) })
     return ok
   }
 
@@ -67,6 +75,7 @@ export class Run {
       finished_at: new Date().toISOString(),
       ok: this.#steps.length > 0 && this.#steps.every((s) => s.ok),
       steps: this.#steps,
+      ...(this.elapsedSeconds === undefined ? {} : { elapsed_seconds: this.elapsedSeconds }),
     }
   }
 }
@@ -84,6 +93,7 @@ export function formatText(results: Result[]): string {
   for (const r of results) {
     const passed = r.steps.filter((s) => s.ok).length
     lines.push(`${r.ok ? 'PASS' : 'FAIL'}  ${r.name} (${r.env}): ${passed}/${r.steps.length} steps`)
+    if (r.elapsed_seconds !== undefined) lines.push(`      elapsed: ${r.elapsed_seconds} s`)
     for (const s of r.steps) {
       const [first = '', ...rest] = s.detail.split('\n')
       lines.push(`  ${s.ok ? 'ok  ' : 'FAIL'}  ${s.name} (${s.ms} ms)${first ? `: ${first}` : ''}`)
@@ -102,6 +112,7 @@ export function formatMarkdown(results: Result[]): string {
   }
   for (const r of results) {
     lines.push('', `### \`${r.name}\``, '')
+    if (r.elapsed_seconds !== undefined) lines.push(`**Elapsed:** ${r.elapsed_seconds} s`, '')
     for (const s of r.steps) {
       lines.push(`- ${s.ok ? '✅' : '❌'} ${s.name} (${s.ms} ms)`)
       if (s.detail) lines.push('', '  ```', ...s.detail.split('\n').map((l) => `  ${l}`), '  ```', '')

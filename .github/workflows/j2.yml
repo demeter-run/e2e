@@ -1,0 +1,54 @@
+name: j2
+
+# The browser journeys that sign in to production as the standing test user
+# (e2e@txpipe.io, decision 0047). Report-only: nothing here is a required
+# status.
+#
+# Every job here signs in, so each sets the concurrency group
+# production-test-user: no two runs use the user at once.
+
+on:
+  pull_request:
+    paths:
+      - journeys/**
+      - src/journeys/**
+      - src/cli/journey*.ts
+      - .github/workflows/j2.yml
+
+permissions:
+  contents: read
+
+jobs:
+  sign-in:
+    name: Sign-in proof against production
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: production-test-user
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps --only-shell chromium
+
+      - name: Sign in as the test user
+        env:
+          E2E_USER_PASSWORD: ${{ secrets.E2E_USER_PASSWORD }}
+        run: pnpm journey sign-in --env production
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sign-in-results
+          path: results/
+          if-no-files-found: ignore

@@ -9,6 +9,7 @@
   },
   "scripts": {
     "check": "tsx src/cli/check.ts",
+    "journey": "tsx src/cli/journey.ts",
     "test": "tsx --test \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
