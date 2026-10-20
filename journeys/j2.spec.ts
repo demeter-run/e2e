@@ -4,7 +4,6 @@ import { safeUrl } from '../src/http.ts'
 import { signIn, type TestUser, testUser } from '../src/journeys/auth0.ts'
 import {
   billingRow,
-  type BillingRow,
   type ConsolePort,
   cookiesNamed,
   dailyRequests,
@@ -208,9 +207,12 @@ test('j2', async ({ browser }) => {
   })
 
   // 8. After the stopwatch: usage within minutes (Prometheus), cost within the
-  // hour (fabric's daemon reads Prometheus every 3600 s). Fabric lists the port
-  // before its daemon has counted the request (0 units 4 minutes after it, run
-  // 39411503584), so the cost waits for the count.
+  // hour (fabric's daemon reads Prometheus every 3600 s) once the port
+  // appears in "Project Usage". The detail says how many units fabric counted:
+  // none for J2's one request. The proxies' metering counts increases of
+  // their request counter, and a new port's counter is born holding its first
+  // request, so that request is never billed (run 39414503862: the counter
+  // stayed at 1 for 75 minutes and the port at 0 units).
   await step('usage, then cost: the Console shows the request', async () => {
     if (!port || !namespace || j2.elapsedSeconds === undefined) throw new NotRun('no successful request')
     const [n, at] = [namespace, port]
@@ -219,15 +221,11 @@ test('j2', async ({ browser }) => {
       return count >= 1 ? `${count} daily requests` : null
     })
     if (!usage.value) throw new Failure(`the usage view showed no request within 5 minutes`)
-    let last = null as BillingRow | null
     const cost = await poll(75 * 60_000, 60_000, async () => {
-      last = await billingRow(p, env, n, at)
-      return last && last.units >= 1 ? last.cells.join(' · ') : null
+      const row = await billingRow(p, env, n, at)
+      return row ? `${row.cells.join(' · ')} (${row.units} units counted)` : null
     })
-    if (!cost.value) {
-      const seen = last ? `listed ${at.name} at ${last.units} units (${last.cells.join(' · ')})` : `did not list ${at.name}`
-      throw new Failure(`usage: ${usage.value} after ${usage.seconds} s; cost: "Project Usage" ${seen} after 75 minutes, wanted the request counted`)
-    }
+    if (!cost.value) throw new Failure(`usage: ${usage.value} after ${usage.seconds} s; cost: "Project Usage" did not list ${at.name} within 75 minutes`)
     return `usage: ${usage.value} after ${usage.seconds} s; cost: "Project Usage" lists ${cost.value} after ${Math.round(cost.seconds / 60)} min`
   })
 

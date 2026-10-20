@@ -270,7 +270,7 @@ signup form.
 | 5 | First project | the Console lands on `/{namespace}/ports` of "My First Project" |
 | 6 | Port | "ADD PRODUCTS" → Blockfrost → `cardano-preprod` (Free) → "DEPLOY" shows the success toast; the port's page shows its endpoint and key |
 | 7 | First request | `GET <endpoint>/epochs/latest` answers 2xx within 3 minutes. The stopwatch stops: `elapsed_seconds` in the result and the summary |
-| 8 | Usage, then cost | the port's usage view counts a request within 5 minutes, then the billing page's "Project Usage" counts it against the port within 75 (fabric's daemon reads Prometheus every 3600 s; the port is listed at 0 units before that) |
+| 8 | Usage, then cost | the port's usage view counts a request within 5 minutes, then the billing page's "Project Usage" lists the port within 75 (fabric's daemon reads Prometheus every 3600 s), with the units fabric counted. They read 0: the proxies meter increases of their request counter, and a new port's counter is born holding its first request, so a lone first request is never billed |
 | 9 | Console price | the port's pricing page quotes Blockfrost as fabric bills it, through the `pricing` check's comparator |
 | 10 | Clean up | pass or fail, every project the user owns is deleted, and the Console then names none |
 
