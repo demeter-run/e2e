@@ -263,7 +263,7 @@ signup form.
 
 | # | Step | Passes when |
 | --- | --- | --- |
-| 1 | Clean slate | the user signs in at the Console's `/login`, every project it owns is deleted, and it signs out. Before the stopwatch. |
+| 1 | Clean slate | the user signs in at the Console's `/login`, every project it owns is deleted, and it signs out with the sidebar's sign-out link, through Auth0's `/v2/logout` (loading the Console's `/logout` as a page loops). Before the stopwatch. |
 | 2 | Land | `https://demeter.run/` answers 200 (the stopwatch starts) and its "Pricing" link opens `/pricing` |
 | 3 | Price | `/pricing` renders a Blockfrost Flexible "PER 100K REQUESTS" price, recorded in the detail |
 | 4 | Sign up | the page's sign-up CTA requests `console.demeter.run/login?intent=signup` and lands on Auth0's signup screen; its "Log in" link leads to the login form, where the user signs in |

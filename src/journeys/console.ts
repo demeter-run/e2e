@@ -1,8 +1,8 @@
-import type { BrowserContext, Page } from '@playwright/test'
+import type { BrowserContext, Page, Request } from '@playwright/test'
 import type { Environment } from '../env.ts'
 import { safeUrl } from '../http.ts'
 import { Failure } from '../report.ts'
-import { arrives, visible } from './browser.ts'
+import { arrives, visible, where } from './browser.ts'
 
 /**
  * The Console as a signed-in person meets it, read from webui's routes on
@@ -81,15 +81,49 @@ export async function cookiesNamed(context: BrowserContext, name: string): Promi
 }
 
 /**
- * Signs out through the Console's `/logout`, which clears its session and then
- * Auth0's (`routes/logout.tsx`, `routes/logout.auth0.tsx`), and checks that
+ * Signs out as a person does, with the sidebar's sign-out link on the Console
+ * page the browser is on (`<Link to="/logout">`, `components/Sidebar.tsx`),
+ * and checks that Auth0 ended its session and sent the browser back, and that
  * the Console's cookie is gone.
+ *
+ * The link is the only way through. `/logout` clears the Console's session and
+ * redirects to `/logout/auth0`, which redirects to Auth0's `/v2/logout`
+ * (`routes/logout.tsx`, `routes/logout.auth0.tsx`). But the second route
+ * nests under the first, so loading `/logout/auth0` as a page runs both
+ * loaders and the server answers the parent's redirect, to `/logout/auth0`
+ * again, until the browser gives up with ERR_TOO_MANY_REDIRECTS (seen
+ * 2026-10-20). The link navigates within the page instead, where Remix's
+ * router follows the deepest route's redirect, to Auth0.
  */
-export async function signOut(page: Page, env: Environment): Promise<string> {
-  await page.goto(`${env.console}/logout`, { waitUntil: 'load', timeout: 60_000 })
+export async function signOut(page: Page, env: Environment, timeoutMs = 30_000): Promise<string> {
+  const link = await visible(page, page.locator('a[href="/logout"]'), 'sign-out link in the sidebar', timeoutMs)
+  // A page load that fails, as the loop does, leaves Chromium's error page,
+  // whose URL says nothing: the failed request names the page and the error.
+  let failed = ''
+  const onFailed = (r: Request) => {
+    if (r.isNavigationRequest()) failed = `loading ${safeUrl(r.url())} failed with ${r.failure()?.errorText ?? 'an error'}`
+  }
+  page.on('requestfailed', onFailed)
+  let request: Request | null
+  try {
+    // Caught here so that a click that fails leaves no rejection unhandled.
+    const sent = page.waitForRequest((r) => r.isNavigationRequest() && r.url().startsWith(`${env.auth0}/v2/logout`), { timeout: timeoutMs }).catch(() => null)
+    await link.click()
+    request = await sent
+  } finally {
+    page.off('requestfailed', onFailed)
+  }
+  if (!request) throw new Failure(`the sign-out link sent the browser to no ${env.auth0}/v2/logout within ${timeoutMs / 1000} s; ${failed || `it is on ${await where(page)}`}`)
+  const answer = await request.response()
+  const location = answer?.headers().location
+  if (!answer || answer.status() < 300 || answer.status() > 399 || !location) {
+    throw new Failure(`Auth0's /v2/logout answered ${answer?.status() ?? 'nothing'}, wanted a redirect out of the tenant`)
+  }
+  const back = new URL(location, env.auth0)
+  await arrives(page, (u) => u.origin === back.origin, `${safeUrl(back.toString())}, where Auth0 sends a signed-out browser`, timeoutMs)
   const left = (await page.context().cookies(env.console)).filter((c) => c.name === sessionCookie)
-  if (left.length) throw new Failure(`the browser still sends ${sessionCookie} to ${env.console} after /logout (now on ${safeUrl(page.url())})`)
-  return `signed out, now on ${safeUrl(page.url())}`
+  if (left.length) throw new Failure(`the browser still sends ${sessionCookie} to ${env.console} after signing out (now on ${await where(page)})`)
+  return `signed out through Auth0's /v2/logout, now on ${safeUrl(page.url())}`
 }
 
 /** A port as the Console shows it on its detail page. The key is the caller's to keep secret. */
