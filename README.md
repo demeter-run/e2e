@@ -25,9 +25,10 @@ requests or alerts from a scheduled run, but nothing here is a required status.
 
 Node 22 (`.nvmrc`) and pnpm (the version in `package.json`'s
 `packageManager`; `corepack enable` provides it). `pnpm test` also runs the
-J2 workflow's scripts as the runner does, so it needs `bash`, `curl` and
-`jq` on `PATH`; without `curl` or `jq`, the alert script's test fails
-naming the missing tool. The checks need no
+J2 workflow's scripts as the runner does (bash with `-e` and `pipefail`, the
+workflow's `shell: bash`), so it needs `bash`, `curl` and `jq` on `PATH`;
+without `curl` or `jq`, the alert script's test fails naming the missing
+tool. The checks need no
 credentials: every surface they read is public. The journeys sign in as the
 standing test user, `e2e@txpipe.io` (decision 0047), whose password is
 `E2E_USER_PASSWORD`. The port suite signs in too (see
@@ -474,10 +475,12 @@ without failing, so no alert would say that day went unchecked.
   it), and `e2e-j2-setup` when it failed with no result or was skipped. The
   message says whether J2 was walked: not when a set-up step failed (it
   names the step), `pnpm j2` exited 2 on a usage error such as a missing
-  `E2E_USER_PASSWORD`, or the job was skipped (the run was cancelled before
-  J2 started); maybe partway when it exited 3 on a break outside the
-  journey; maybe not at all, or partway, when the job failed with no step to
-  name (GitHub could not set it up, or its runner was lost). Those that may
+  `E2E_USER_PASSWORD`, or the job was skipped (the run was cancelled as it
+  started, before GitHub evaluated J2's job; a run cancelled once J2 waits
+  its turn for the test user ends it cancelled, as above); maybe partway
+  when it exited 3 on a break outside the journey; maybe not at all, or
+  partway, when the job failed with no step to name (GitHub could not set it
+  up, or its runner was lost). Those that may
   have cut a walk short, and a cancelled job, may leave a project on the
   test user's account until the next run, and say so. `pnpm journey` exits
   0 or 1 only once it has reported the run. A unit test runs the workflow's

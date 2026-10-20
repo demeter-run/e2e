@@ -69,7 +69,9 @@ describe('signing out', () => {
     })
 
     // A request whose answer never comes would hold the clean slate until J2's
-    // 100-minute test timeout, and so would a click left waiting for it.
+    // 100-minute test timeout. A click left waiting for the navigation it
+    // starts would fail the step after the runner's 30-second action limit
+    // (playwright.config.ts) instead of saying that Auth0 never answered.
     it(`fails within its limit when Auth0 never answers, and the link navigates ${how}`, { timeout: 30_000 }, async () => {
       logout = 'never'
       const page = await browser.newPage()

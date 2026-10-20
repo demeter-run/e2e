@@ -21,10 +21,11 @@ name: j2
 #   cancelled it), and `e2e-j2-setup` when it failed with no result or was
 #   skipped. Its message says whether J2 was walked: not when a set-up step
 #   failed, J2 refused its arguments (exit 2, a missing password, say) or its
-#   job was skipped (the run was cancelled before J2 started); maybe partway
-#   when J2 broke outside the journey (exit 3); maybe not at all, or partway,
-#   when the job failed with no step to name (GitHub could not set it up, or
-#   its runner was lost). A walk that may have been cut short may leave a
+#   job was skipped (the run was cancelled as it started, before GitHub
+#   evaluated J2's job; once J2 waits its turn for the test user, a cancelled
+#   run ends it cancelled); maybe partway when J2 broke outside the journey
+#   (exit 3); maybe not at all, or partway, when the job failed with no step
+#   to name (GitHub could not set it up, or its runner was lost). A walk that may have been cut short may leave a
 #   project on the test user's account until the next run, and the message
 #   says so.
 #
@@ -68,6 +69,13 @@ on:
 
 permissions:
   contents: read
+
+# Every script runs as test/journeys.test.ts runs it: bash with -e and
+# pipefail. Left unset, GitHub runs bash with -e alone, and a failure early in
+# a pipeline would go unseen.
+defaults:
+  run:
+    shell: bash
 
 # One run per pull request: a newer push cancels the older run, waiting or
 # walking (J2's `if:` below lets it), and the next run's clean slate deletes
@@ -240,7 +248,7 @@ jobs:
             title="e2e j2 cancelled (production)"
             message="J2 was cancelled before it reported: its timeout ran out, another job of production-test-user took its place, or someone cancelled it. $left"
           elif [[ "$RESULT" == skipped ]]; then
-            message="J2's job was skipped, as it is when the run is cancelled before J2 starts, so J2 was not walked."
+            message="J2's job was skipped, as it is when the run is cancelled as it starts, before GitHub evaluates J2's job, so J2 was not walked."
           elif [[ -n "$FAILED" ]]; then
             message="$FAILED, so J2 was not walked."
           elif [[ "$STATUS" == 2 ]]; then

@@ -295,6 +295,14 @@ describe('the j2 workflow', () => {
     assert.equal(stepOf('failed').if, 'failure()')
   })
 
+  // Left unset, GitHub runs a script with bash -e alone, and the tests below
+  // run them with pipefail too: a pipeline whose first command fails would
+  // pass here and not on the runner.
+  it('runs every script as the tests run them, with bash -e and pipefail', () => {
+    assert.match(workflow, /\ndefaults:\n {2}run:\n {4}shell: bash\n/)
+    assert.equal([...workflow.matchAll(/^\s*shell:/gm)].length, 1, 'no job or step sets a shell of its own')
+  })
+
   /**
    * The step of j2.yml with `id`: its `run` script, its `env` as written by
    * name, its `if:`, and the ids of the steps of its job that come before it.
@@ -331,8 +339,9 @@ describe('the j2 workflow', () => {
   }
 
   /**
-   * Runs a step's script as GitHub runs it (bash, -e, pipefail) with `env`,
-   * and a stand-in `pnpm` that records its arguments and exits `PNPM_EXIT`.
+   * Runs a step's script as GitHub runs it under the workflow's `shell: bash`
+   * (bash --noprofile --norc -eo pipefail) with `env`, and a stand-in `pnpm`
+   * that records its arguments and exits `PNPM_EXIT`.
    */
   async function runStep(script: string, env: Record<string, string>) {
     const tmp = await mkdtemp(join(tmpdir(), 'e2e-step-'))
@@ -416,7 +425,7 @@ describe('the j2 workflow', () => {
       }
       const cases: [Record<string, string>, string, RegExp][] = [
         [{ RESULT: 'cancelled' }, 'e2e-j2-cancelled', /^J2 was cancelled before it reported: its timeout ran out, /],
-        [{ RESULT: 'skipped' }, 'e2e-j2-setup', /^J2's job was skipped, as it is when the run is cancelled before J2 starts, so J2 was not walked\.$/],
+        [{ RESULT: 'skipped' }, 'e2e-j2-setup', /^J2's job was skipped, as it is when the run is cancelled as it starts, before GitHub evaluates J2's job, so J2 was not walked\.$/],
         [{ FAILED: 'the install failed' }, 'e2e-j2-setup', /^the install failed, so J2 was not walked\.$/],
         [{ STATUS: '2' }, 'e2e-j2-setup', /^J2 exited 2 on a usage error .+, so it was not walked\.$/],
         [{ STATUS: '3' }, 'e2e-j2-setup', /^J2 exited 3 with no result: it broke outside the journey, maybe partway through its walk or after it, so none of its results alerted/],
