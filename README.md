@@ -415,8 +415,10 @@ customer for the test user, which deleting the project does not remove, so
 the test user's billing account gains one customer per run: one a day, and
 one for each pull-request run. A run cancelled after its claim, or whose
 delete fails, leaves the claimed project on the test user's account until
-someone deletes it. Scheduled and dispatched runs of main alert on both; a
-pull request's run has no webhook, so it shows only in its checks.
+J2's next run, which deletes every project the user owns (daily at 06:00
+UTC), unless the Console refuses that delete too. Scheduled and dispatched
+runs of main alert on both; a pull request's run has no webhook, so it shows
+only in its checks.
 
 The prod-safe contract tests send requests the Console refuses, apart from
 the 65-character name: should production ever accept it, that run leaves one
@@ -782,8 +784,8 @@ production.
   `e2e-agent-contract`). Only runs of `main` receive the webhook;
 - on pull requests from this repository that change the probe (its
   workflow, `src/agent/`, the agent CLI, `src/mock/catalog.ts`,
-  `src/signin.ts`, `src/env.ts`, `src/report.ts`, `.nvmrc`, the package and
-  workspace files), with
+  `src/signin.ts`, `src/env.ts`, `src/report.ts`, `src/secrets.ts`, `.nvmrc`,
+  the package and workspace files), with
   no alert, so a change is proven against production before it merges. A
   dispatch needs the workflow on `main`: GitHub dispatches no workflow that
   the default branch does not have.

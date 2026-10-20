@@ -2,9 +2,10 @@ name: j0-mock
 
 # J0 and the whole agent contract suite against the agent-route mock
 # (src/mock/), and the tests that need a browser (test/browser/: J0's claim
-# and delete against a stand-in Console, and the sign-in form filler), on
-# every pull request and push to main. Nothing here reaches production or
-# signs in as the test user. Report-only: nothing here is a required status.
+# and delete against a stand-in Console, the sign-in form filler, the masks
+# over a failed J2 step's screenshot and the sign-out), on every pull request
+# and push to main. Nothing here reaches production or signs in as the test
+# user. Report-only: nothing here is a required status.
 #
 # The prod-safe contract tests also run against production in
 # agent-j0-probe.yml, so on those rules a mock that drifts from the contract
@@ -64,7 +65,8 @@ jobs:
 
       # After the run on the mock, so a browser failure leaves the mock's
       # result standing, and whatever the mock steps did, once Chromium is in.
-      # The unit job installs no browser.
+      # contracts.yml's unit job runs them too, before its checks; here they
+      # also stand beside J0's run on the mock.
       - name: Browser tests
         if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
         run: pnpm test:browser

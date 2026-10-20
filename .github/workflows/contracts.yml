@@ -76,7 +76,8 @@ jobs:
         run: pnpm test
 
       # The browser tests (test/browser/: the masks a failed journey step
-      # paints over its screenshot) need Chromium.
+      # paints over its screenshot, the sign-out, the sign-in form filler, and
+      # J0's claim and delete against a stand-in Console) need Chromium.
       - id: chromium
         name: Install Chromium
         run: pnpm exec playwright install --with-deps --only-shell chromium

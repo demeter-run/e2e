@@ -168,6 +168,13 @@ describe('pnpm journey', () => {
     assert.match(String(error.mock.calls.at(-1)?.arguments[0]), /^set E2E_USER_PASSWORD to e2e@txpipe\.io's password/)
     assert.deepEqual(await readdir(dir), [])
   })
+
+  it('refuses the mock, which has no test user, before starting Playwright', async () => {
+    const pw = playwright([])
+    assert.equal(await cli(['walk', '--env', 'mock'], pw.run), 2)
+    assert.equal(pw.calls.length, 0)
+    assert.match(String(error.mock.calls.at(-1)?.arguments[0]), /^the mock environment has no test user to sign in as/)
+  })
 })
 
 describe('the pnpm journey entry point', () => {
