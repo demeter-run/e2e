@@ -11,7 +11,8 @@
     "check": "tsx src/cli/check.ts",
     "journey": "tsx src/cli/journey.ts",
     "j2": "tsx src/cli/journey.ts j2",
-    "test": "tsx --test \"test/**/*.test.ts\"",
+    "test": "tsx --test \"test/*.test.ts\"",
+    "test:browser": "tsx --test \"test/browser/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

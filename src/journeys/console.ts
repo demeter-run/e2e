@@ -148,7 +148,8 @@ export async function signOut(page: Page, env: Environment, timeoutMs = 30_000):
     }
   }
   if (!request) throw new Failure(`the sign-out link sent the browser to no ${env.auth0}/v2/logout; ${missed.join('; ')}`)
-  const answer = await request.response()
+  // A request whose answer never comes resolves to no response, not never.
+  const answer = await Promise.race([request.response(), new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs))])
   const location = answer?.headers().location
   if (!answer || answer.status() < 300 || answer.status() > 399 || !location) {
     throw new Failure(`Auth0's /v2/logout answered ${answer?.status() ?? 'nothing'}, wanted a redirect out of the tenant`)
@@ -247,6 +248,31 @@ export interface ConsolePort {
 
 /** The section of a resource's detail page under `heading` ("About", "Instance info"). */
 export const detailSection = (page: Page, heading: string) => page.getByRole('heading', { name: heading, exact: true }).locator('xpath=..')
+
+/**
+ * A port's key as fabric writes it: bech32m with the port kind's prefix
+ * (`blockfrost1…` for a `BlockfrostPort`; `encode_key` in fabric's
+ * `src/domain/resource/command.rs`), and the legacy `dmtr_` keys.
+ */
+export const keyShape = /[a-z_]+1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{19,}/
+
+/**
+ * What a screenshot of a Console page paints over so that no port's key
+ * shows. The detail page writes the key in the "Auth Token" row and inside the
+ * "Authenticated Endpoint URL" (fabric's `bootstrap/rpc/crds/blockfrostport.hbs`),
+ * both under "Instance info". Each mask is found on its own, so a heading, a
+ * label or the key's shape that drifts loses one mask, never the key: any text
+ * of the key's shape, the "Auth Token" row's value wherever it is, the
+ * "Instance info" section, and the `key` itself once it is known.
+ */
+export function keyMasks(page: Page, key?: string): Locator[] {
+  return [
+    page.getByText(keyShape),
+    page.getByText('Auth Token', { exact: true }).locator('xpath=../following-sibling::*[1]'),
+    detailSection(page, 'Instance info'),
+    ...(key ? [page.getByText(key)] : []),
+  ]
+}
 
 /**
  * One row's value on a resource's detail page (`ServiceInformation.tsx`): each
