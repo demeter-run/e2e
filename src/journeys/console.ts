@@ -1,4 +1,4 @@
-import type { BrowserContext, ConsoleMessage, Page, Request } from '@playwright/test'
+import type { BrowserContext, ConsoleMessage, Locator, Page, Request, Response } from '@playwright/test'
 import type { Environment } from '../env.ts'
 import { safeUrl } from '../http.ts'
 import { Failure } from '../report.ts'
@@ -127,41 +127,27 @@ export async function cookiesNamed(context: BrowserContext, name: string): Promi
  * 2026-10-20). The link navigates within the page instead, where Remix's
  * router follows the deepest route's redirect, to Auth0, but only once the
  * app has started: clicked before, it loads `/logout` as a page too.
+ *
+ * A click that goes nowhere, as two of eleven did on 2026-10-20 (runs
+ * 39412617330 and 39414035093, the second with the app started and nothing
+ * logged), is clicked once more, as a person would. The step's detail says
+ * so, with what the first click left behind.
  */
 export async function signOut(page: Page, env: Environment, timeoutMs = 30_000): Promise<string> {
-  const link = await visible(page, page.locator('a[href="/logout"]'), 'sign-out link in the sidebar', timeoutMs)
-  await started(page, timeoutMs)
-  // A page load that fails, as the loop does, leaves Chromium's error page,
-  // whose URL says nothing: the failed request names the page and the error.
-  // A click that goes nowhere leaves the app's own errors to say why.
-  let failed = ''
-  const logged = new Set<string>()
-  const onFailed = (r: Request) => {
-    if (r.isNavigationRequest()) failed = `loading ${safeUrl(r.url())} failed with ${r.failure()?.errorText ?? 'an error'}`
+  const missed: string[] = []
+  let request: Request | null = null
+  for (let click = 1; click <= 2 && !request; click += 1) {
+    const link = await visible(page, page.locator('a[href="/logout"]'), 'sign-out link in the sidebar', timeoutMs)
+    await started(page, timeoutMs)
+    const attempt = await clickToSignOut(page, env, link, timeoutMs / 2)
+    if ('request' in attempt) request = attempt.request
+    else {
+      missed.push(`click ${click}: ${attempt.missed}`)
+      // A page load that failed, as the loop does, leaves no link to click.
+      if (attempt.pageLoadFailed) break
+    }
   }
-  const onConsole = (m: ConsoleMessage) => {
-    if (m.type() === 'error') logged.add(firstLine(m.text()).slice(0, 200))
-  }
-  const onPageError = (e: Error) => logged.add(`uncaught ${firstLine(e)}`.slice(0, 200))
-  page.on('requestfailed', onFailed)
-  page.on('console', onConsole)
-  page.on('pageerror', onPageError)
-  let request: Request | null
-  try {
-    // Caught here so that a click that fails leaves no rejection unhandled.
-    const sent = page.waitForRequest((r) => r.isNavigationRequest() && r.url().startsWith(`${env.auth0}/v2/logout`), { timeout: timeoutMs }).catch(() => null)
-    await link.click()
-    request = await sent
-  } finally {
-    page.off('requestfailed', onFailed)
-    page.off('console', onConsole)
-    page.off('pageerror', onPageError)
-  }
-  if (!request) {
-    const errors = [...logged].slice(0, 3)
-    const said = errors.length ? `; the page logged ${errors.map((e) => `"${e}"`).join(', ')}` : '; the page logged no error'
-    throw new Failure(`the sign-out link sent the browser to no ${env.auth0}/v2/logout within ${timeoutMs / 1000} s; ${failed || `it is on ${await where(page)}${said}`}`)
-  }
+  if (!request) throw new Failure(`the sign-out link sent the browser to no ${env.auth0}/v2/logout; ${missed.join('; ')}`)
   const answer = await request.response()
   const location = answer?.headers().location
   if (!answer || answer.status() < 300 || answer.status() > 399 || !location) {
@@ -171,7 +157,79 @@ export async function signOut(page: Page, env: Environment, timeoutMs = 30_000):
   await arrives(page, (u) => u.origin === back.origin, `${safeUrl(back.toString())}, where Auth0 sends a signed-out browser`, timeoutMs)
   const left = (await page.context().cookies(env.console)).filter((c) => c.name === sessionCookie)
   if (left.length) throw new Failure(`the browser still sends ${sessionCookie} to ${env.console} after signing out (now on ${await where(page)})`)
-  return `signed out through Auth0's /v2/logout, now on ${safeUrl(page.url())}`
+  const again = missed.length ? ` on the second click (${missed.join('; ')})` : ''
+  return `signed out through Auth0's /v2/logout${again}, now on ${safeUrl(page.url())}`
+}
+
+/**
+ * Clicks the sign-out link and waits up to `waitMs` for the browser to request
+ * Auth0's `/v2/logout`. When it does not, says what happened instead: a page
+ * load that failed (Chromium's error page has a URL that says nothing), or
+ * where the browser stayed, the router's state, the requests the click made
+ * to the Console and Auth0, and the errors the page logged.
+ */
+async function clickToSignOut(
+  page: Page,
+  env: Environment,
+  link: Locator,
+  waitMs: number,
+): Promise<{ request: Request } | { missed: string; pageLoadFailed: boolean }> {
+  let failed = ''
+  const logged = new Set<string>()
+  const requests = new Map<Request, string>()
+  const ours = (r: Request) => r.url().startsWith(env.console) || r.url().startsWith(env.auth0)
+  const label = (r: Request) => `${r.method()} ${safeUrl(r.url(), ['_data'])}`
+  const onRequest = (r: Request) => {
+    if (ours(r)) requests.set(r, `${label(r)} (no answer)`)
+  }
+  const onResponse = (response: Response) => {
+    if (requests.has(response.request())) requests.set(response.request(), `${label(response.request())} ${response.status()}`)
+  }
+  const onFailed = (r: Request) => {
+    if (r.isNavigationRequest()) failed = `loading ${safeUrl(r.url())} failed with ${r.failure()?.errorText ?? 'an error'}`
+    if (requests.has(r)) requests.set(r, `${label(r)} ${r.failure()?.errorText ?? 'failed'}`)
+  }
+  const onConsole = (m: ConsoleMessage) => {
+    if (m.type() === 'error') logged.add(firstLine(m.text()).slice(0, 200))
+  }
+  const onPageError = (e: Error) => logged.add(`uncaught ${firstLine(e)}`.slice(0, 200))
+  page.on('request', onRequest)
+  page.on('response', onResponse)
+  page.on('requestfailed', onFailed)
+  page.on('console', onConsole)
+  page.on('pageerror', onPageError)
+  let request: Request | null
+  try {
+    // Caught here so that a click that fails leaves no rejection unhandled.
+    const sent = page.waitForRequest((r) => r.isNavigationRequest() && r.url().startsWith(`${env.auth0}/v2/logout`), { timeout: waitMs }).catch(() => null)
+    await link.click()
+    request = await sent
+  } finally {
+    page.off('request', onRequest)
+    page.off('response', onResponse)
+    page.off('requestfailed', onFailed)
+    page.off('console', onConsole)
+    page.off('pageerror', onPageError)
+  }
+  if (request) return { request }
+  if (failed) return { missed: failed, pageLoadFailed: true }
+  const router = await page
+    .evaluate(() => {
+      const state = (window as { __remixRouter?: { state: { navigation: { state: string; location?: { pathname: string } } } } }).__remixRouter?.state
+      return state ? `${state.navigation.state}${state.navigation.location ? ` to ${state.navigation.location.pathname}` : ''}` : 'gone'
+    })
+    .catch(() => 'unreadable')
+  const made = [...requests.values()]
+  const errors = [...logged].slice(0, 3)
+  return {
+    missed: [
+      `nothing within ${waitMs / 1000} s, still on ${await where(page)}`,
+      `the router ${router}`,
+      made.length ? `the click requested ${made.join(', ')}` : 'the click requested nothing from the Console or Auth0',
+      errors.length ? `the page logged ${errors.map((e) => `"${e}"`).join(', ')}` : 'the page logged no error',
+    ].join(', '),
+    pageLoadFailed: false,
+  }
 }
 
 /** A port as the Console shows it on its detail page. The key is the caller's to keep secret. */
