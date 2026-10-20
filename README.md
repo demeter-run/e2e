@@ -287,7 +287,10 @@ rules fabric does (`src/domain/provisional/` in fabric):
   so an entry a client puts before it is ignored; or else the connection's.
   As Fastify's parser does, it skips empty entries and, when the header has a
   comma, strips only the spaces around each entry (a tab stays in the
-  address, which fabric then counts as another source). A run
+  address, which fabric then counts as another source). An entry left with
+  only whitespace, such as `198.51.100.0,\t,`, is refused with 400
+  `invalid_request`, as fabric refuses a client IP that is blank once Rust's
+  `trim` has run (its whitespace includes U+0085, which JS `\s` does not). A run
   sets the header so one runner acts as several sources. The refusal's
   `retry_after_seconds` and `Retry-After` are the whole seconds, rounded up,
   until enough of the address's registrations leave the window (normally

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { request as httpRequest } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { after, before, beforeEach, describe, it, mock as mocks } from 'node:test'
 import { type AgentAnswer, call, createPort, type Credentials, dotenvVars, errorBody, names, register } from '../src/agent/client.ts'
@@ -260,11 +261,53 @@ describe('the mock: caps, kill switch and clock', () => {
   it("keeps a tab in a comma-separated X-Forwarded-For entry, as the Console's parser does, so it counts as another source", async () => {
     for (let i = 0; i < 3; i++) assert.equal((await from('192.0.2.1')).status, 200)
     assert.deepEqual(codeOf(await from('198.51.100.0, 192.0.2.1')), [429, 'ip_cap'])
+    // The spaces after an entry go too; Node trims only the ends of the whole header.
+    assert.deepEqual(codeOf(await from('198.51.100.0, 192.0.2.1 , ')), [429, 'ip_cap'])
     assert.equal((await from('198.51.100.0,\t192.0.2.1')).status, 200)
   })
 
+  /**
+   * A registration whose `X-Forwarded-For` goes out byte for byte, as latin1:
+   * a Buffer body makes Node write the header block so, where a string body
+   * would write it as UTF-8 (0xA0 as C2 A0).
+   */
+  const fromBytes = (header: string) =>
+    new Promise<AgentAnswer>((resolve, reject) => {
+      const sent = httpRequest(`${env.console}/api/agent/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-forwarded-for': header },
+      })
+      sent.on('response', (answer) => {
+        const chunks: Buffer[] = []
+        answer.on('data', (chunk: Buffer) => chunks.push(chunk))
+        answer.on('end', () =>
+          resolve({
+            status: answer.statusCode ?? null,
+            headers: Object.fromEntries(Object.entries(answer.headers).map(([name, value]) => [name, String(value)])),
+            body: Buffer.concat(chunks).toString('utf8'),
+          }),
+        )
+      })
+      sent.on('error', reject)
+      sent.end(Buffer.from(JSON.stringify({ agent: { name: 'test-agent' } })))
+    })
+
+  it("trims a header with no comma whole, as the Console's parser does", async () => {
+    for (let i = 0; i < 3; i++) assert.equal((await from('192.0.2.1')).status, 200)
+    // A leading NBSP reaches the server, unlike a space or a tab, and only trim() strips it.
+    assert.deepEqual(codeOf(await fromBytes('\u00a0192.0.2.1')), [429, 'ip_cap'])
+  })
+
+  it('refuses an X-Forwarded-For entry of only whitespace, as fabric refuses a blank client IP', async () => {
+    assert.deepEqual(codeOf(await from('198.51.100.0,\t,')), [400, 'invalid_request'])
+    // Rust's trim strips U+0085 (NEL), which JS \s does not.
+    assert.deepEqual(codeOf(await fromBytes('198.51.100.0,\u0085,')), [400, 'invalid_request'])
+    assert.equal((await from('198.51.100.0')).status, 200)
+  })
+
   it("counts an X-Forwarded-For header that leaves no entry against the connection's address", async () => {
-    for (const header of [', ', ',,', '   ']) assert.equal((await from(header)).status, 200)
+    // The explicit loopback address shares a count only with the socket's own.
+    for (const header of [', ', ',,', '127.0.0.1']) assert.equal((await from(header)).status, 200)
     assert.deepEqual(codeOf(await register(env, { name: 'test-agent' })), [429, 'ip_cap'])
   })
 
