@@ -1,9 +1,10 @@
-import type { Page } from '@playwright/test'
+import type { Page, Request } from '@playwright/test'
 import { auth0Screens } from '../checks/intent.ts'
 import type { Environment } from '../env.ts'
+import { safeUrl } from '../http.ts'
 import { Failure } from '../report.ts'
 import { keepSecret } from '../secrets.ts'
-import { visible, where } from './browser.ts'
+import { firstLine, visible, where } from './browser.ts'
 
 /**
  * Signing in on Auth0's New Universal Login, as the standing test user
@@ -60,6 +61,13 @@ export async function auth0Refusal(page: Page): Promise<string> {
  * Signs in on Auth0's login screen, where `page` has arrived, and returns once
  * the browser has left the tenant. A browser Auth0 already holds a session for
  * is redirected straight back without a form; that counts as signed in too.
+ *
+ * A page load that never answers (the Console's callback, it seems, in
+ * sign-in proof run 39414682199) held Playwright's click, which waits for the
+ * page it loads with no limit under the test runner, until the test timed
+ * out. The click no longer waits, so `timeoutMs` bounds it. The pending load
+ * also leaves the page unreadable, so reading what Auth0 showed gives up
+ * after 10 s and names that page load instead.
  */
 export async function signIn(page: Page, env: Environment, user: TestUser, timeoutMs = 60_000): Promise<'form' | 'session'> {
   const url = new URL(page.url())
@@ -67,11 +75,22 @@ export async function signIn(page: Page, env: Environment, user: TestUser, timeo
   if (url.pathname !== auth0Screens.login.path) throw new Failure(await auth0Refusal(page))
   await (await visible(page, page.locator('#username'), 'email field')).fill(user.email)
   await (await visible(page, page.locator('#password'), 'password field')).fill(user.password)
-  await page.getByRole('button', { name: 'Continue', exact: true }).click()
+  let loading = ''
+  const onRequest = (r: Request) => {
+    if (r.isNavigationRequest() && r.frame() === page.mainFrame()) loading = safeUrl(r.url())
+  }
+  page.on('request', onRequest)
   try {
-    await page.waitForURL((u) => !onTenant(env, u), { timeout: timeoutMs, waitUntil: 'commit' })
-  } catch {
-    throw new Failure(await auth0Refusal(page))
+    await page.getByRole('button', { name: 'Continue', exact: true }).click({ noWaitAfter: true })
+    try {
+      await page.waitForURL((u) => !onTenant(env, u), { timeout: timeoutMs, waitUntil: 'commit' })
+    } catch {
+      const stalled = `no page answered within ${timeoutMs / 1000} s of "Continue"; the browser was still loading ${loading || 'nothing'}`
+      const read = auth0Refusal(page).catch((error) => `${stalled} (${firstLine(error)})`)
+      throw new Failure(await Promise.race([read, new Promise<string>((resolve) => setTimeout(() => resolve(stalled), 10_000))]))
+    }
+  } finally {
+    page.off('request', onRequest)
   }
   return 'form'
 }
