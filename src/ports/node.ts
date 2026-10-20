@@ -1,5 +1,6 @@
 import { connect } from 'node:tls'
 import type { Duplex } from 'node:stream'
+import { describeError } from '../http.ts'
 import { type Cbor, decode, encode, Incomplete } from './cbor.ts'
 
 /**
@@ -36,15 +37,29 @@ export function slotTime(slot: number): number {
 }
 
 /**
- * `cardano-cli query tip`'s `syncProgress`: the share of time since the
- * system start that the tip covers, as a percentage to two decimals, and 100
- * when the tip is within 600 s of now.
+ * `cardano-cli query tip`'s `syncProgress`, as cardano-cli 10.1.1.0's
+ * `percentage` computes it: the tip's and now's whole seconds since the
+ * system start, each plus one; the tip's moved 600 s forward, but not past
+ * now's; their ratio as a percentage, printed `%.2f`. So a tip within 600 s
+ * of now is 100.
  */
 export function syncProgress(slot: number, now = Date.now() / 1000): number {
-  const behind = now - slotTime(slot)
-  if (behind < 600) return 100
-  const share = (slotTime(slot) - mainnet.systemStart) / (now - mainnet.systemStart)
-  return Math.floor(share * 10_000) / 100
+  const sa = Math.floor(slotTime(slot) - mainnet.systemStart) + 1
+  const sb = Math.floor(now - mainnet.systemStart) + 1
+  return twoDecimals((Math.min(sa + 600, sb) / sb) * 100)
+}
+
+/**
+ * `printf "%.2f"` of a positive Double, as GHC renders it: its shortest
+ * decimal digits, rounded at the second decimal, half to even.
+ */
+export function twoDecimals(x: number): number {
+  const [whole = '0', fraction = ''] = String(x).split('.')
+  const cents = Number(whole) * 100 + Number(fraction.slice(0, 2).padEnd(2, '0'))
+  const [next = '0', ...rest] = fraction.slice(2)
+  const half = next === '5' && rest.every((d) => d === '0')
+  const up = next > '5' || (next === '5' && !half) || (half && cents % 2 === 1)
+  return (cents + (up ? 1 : 0)) / 100
 }
 
 /** One SDU from the initiator: timestamp, mini-protocol (mode bit clear), length, payload. */
@@ -95,7 +110,7 @@ export function queryTip(
         pending.set(protocol, buffer)
       }
     })
-    socket.on('error', (error: NodeJS.ErrnoException) => fail(`${error.code ?? error.name} (${error.message})`))
+    socket.on('error', (error) => fail(describeError(error)))
     socket.on('close', () => fail('the connection closed before the node sent its tip'))
 
     const receive = (protocol: number, message: Cbor) => {

@@ -81,6 +81,7 @@ export class Fabric {
 export async function signIn(
   auth0: string,
   { username, password, clientId, clientSecret, audience }: { username: string; password: string; clientId: string; clientSecret: string; audience: string },
+  send: typeof fetch = fetch,
 ): Promise<string> {
   const response = await fetchNamingCause(`${auth0}/oauth/token`, {
     method: 'POST',
@@ -95,7 +96,7 @@ export async function signIn(
       client_secret: clientSecret,
     }),
     signal: AbortSignal.timeout(15_000),
-  })
+  }, send)
   const body = (await response.json().catch(() => ({}))) as { access_token?: unknown; error?: unknown; error_description?: unknown }
   if (response.ok && typeof body.access_token === 'string' && body.access_token) return body.access_token
   // Auth0's error and description name the problem (`invalid_grant`, "Wrong

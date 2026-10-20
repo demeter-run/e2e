@@ -221,11 +221,13 @@ node-to-client protocol instead of `socat` and `cardano-cli`:
    | `SubmitApiPort` | `operatorVersion: 1` | `POST https://<key>.submitapi-m1.demeter.run/api/submit/tx` with an empty CBOR body answers 400 |
 
    The node goes first: "at the chain tip" means at or past the node's slot
-   less 120. When the node check fails, the others report the slot they
-   answered and fail, as there is no tip to compare it with. fabric's Mumak
+   less 120. When the node's port is not created or not synced, the others
+   report the slot they answered and fail, as there is no tip to compare it
+   with. fabric's Mumak
    and DbSync checks were commented out, and are not here.
 4. **Delete the project**, pass or fail, with `DeleteProject` on the id step 2
-   returned, and only that one: deleting it deletes its ports. fabric deletes
+   returned, and only that one: deleting it deletes its ports. A failed delete
+   names the project it left behind. fabric deletes
    by an event, so the run then reads `FetchProjects`, the Console's list,
    until the project is gone.
 
@@ -296,8 +298,9 @@ production.
   the `ports-results` artifact. fabric's `0 12 * * *` run has started between
   15:18 and 16:42 UTC, as GitHub delays scheduled runs, so 10:00 keeps clear
   of it while both exist;
-- on pull requests from this repository that change the suite (its code, the
-  CLI, `env.ts`, `report.ts`, the workflow or the dependencies): the same run,
+- on pull requests from this repository that change what the suite runs
+  (anything under `src/`, the workflow, `.nvmrc` or the dependencies,
+  `package.json`, `pnpm-lock.yaml` and `pnpm-workspace.yaml`): the same run,
   no alert, so a change is proven against production before it merges. GitHub
   dispatches only workflows already on the default branch;
 - when an alerting run fails before the suite starts, one `e2e-ports-setup`
@@ -327,8 +330,9 @@ without failing, so no alert would say that day went unchecked.
   what failed.
 
 Any job that signs in as the standing test user sets the concurrency group
-`production-test-user` (`cancel-in-progress: false`), so no two runs use the
-user at once. The `ports` job does; J2 and the agent probe will.
+`production-test-user` (`cancel-in-progress: false`, `queue: max`), so no two
+runs use the user at once and no waiting run is dropped. The `ports` job does;
+J2 and the agent probe will.
 
 ### Secrets
 

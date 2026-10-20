@@ -5,11 +5,12 @@ import { describe, it, mock } from 'node:test'
 import { main } from '../src/cli/main.ts'
 import { environments } from '../src/env.ts'
 import { type Cbor, decode, encode, Incomplete, Tagged } from '../src/ports/cbor.ts'
-import { Fabric } from '../src/ports/fabric.ts'
+import { fetchNamingCause } from '../src/http.ts'
+import { Fabric, signIn } from '../src/ports/fabric.ts'
 import type { Call } from '../src/ports/grpc.ts'
 import { portSuite, type Seams } from '../src/ports/index.ts'
-import { type Kind, type Probe, portKinds, type Reach } from '../src/ports/kinds.ts'
-import { mainnet, queryTip, slotTime, syncProgress } from '../src/ports/node.ts'
+import { type Kind, kinds, type Probe, portKinds, type Reach } from '../src/ports/kinds.ts'
+import { mainnet, queryTip, slotTime, syncProgress, twoDecimals } from '../src/ports/node.ts'
 import { decode as decodeProto, encodeStrings, encodeVarints, messages, string, varint } from '../src/ports/proto.ts'
 import { type Result, Run } from '../src/report.ts'
 import { withEnv } from './helpers.ts'
@@ -53,9 +54,21 @@ describe('the node check', () => {
   it('reads cardano-cli’s syncProgress from a slot', () => {
     const now = mainnet.shelleyStart + 200_000_000 - mainnet.shelleySlot
     assert.equal(syncProgress(200_000_000, now), 100)
-    assert.equal(syncProgress(200_000_000 - 599, now), 100)
-    const progress = syncProgress(200_000_000 - 86_400 * 40, now)
-    assert.ok(progress > 98 && progress < 99, String(progress))
+    // Within 600 s of now is 100: the tip's seconds are moved 600 forward.
+    assert.equal(syncProgress(200_000_000 - 600, now), 100)
+    // Byron's first slot, 1000 s after the system start: (0 + 1 + 600) / (1000 + 1) = 60.04 %.
+    assert.equal(syncProgress(0, mainnet.systemStart + 1_000), 60.04)
+    assert.equal(syncProgress(0, mainnet.systemStart + 1_000.9), 60.04)
+  })
+
+  it('prints two decimals as GHC’s printf does, half to even on the shortest digits', () => {
+    assert.equal(twoDecimals(98.994999), 98.99)
+    assert.equal(twoDecimals(98.995), 99)
+    assert.equal(twoDecimals(98.985), 98.98)
+    assert.equal(twoDecimals(98.9851), 98.99)
+    assert.equal(twoDecimals(99.999), 100)
+    assert.equal(twoDecimals(100), 100)
+    assert.equal(twoDecimals(0.0004), 0)
   })
 
   /** A node that answers the handshake and FindIntersect as cardano-node does, in SDUs split one byte at a time. */
@@ -111,6 +124,40 @@ describe('the node check', () => {
       fake.close()
     }
   })
+
+  it('gives up on a node that never answers', async () => {
+    const fake = await node(() => undefined)
+    try {
+      await assert.rejects(queryTip('unused:9443', { open: fake.open, timeoutMs: 50 }), { message: 'no tip within 0.05 s' })
+      assert.equal(fake.received.length, 1)
+    } finally {
+      fake.close()
+    }
+  })
+
+  it('fails naming a refused connection', async () => {
+    const server = createServer().listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const { port } = server.address() as AddressInfo
+    server.close()
+    await once(server, 'close')
+    await assert.rejects(queryTip('unused:9443', { open: () => connect(port, '127.0.0.1') }), {
+      message: `ECONNREFUSED (connect ECONNREFUSED 127.0.0.1:${port})`,
+    })
+  })
+
+  it('fails when the connection closes before the tip', async () => {
+    const server = createServer((socket) => socket.end()).listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const { port } = server.address() as AddressInfo
+    try {
+      await assert.rejects(queryTip('unused:9443', { open: () => connect(port, '127.0.0.1') }), {
+        message: 'the connection closed before the node sent its tip',
+      })
+    } finally {
+      server.close()
+    }
+  })
 })
 
 /**
@@ -121,7 +168,7 @@ function fakeFabric(
   fail: Partial<Record<'createProject' | 'deleteProject' | 'createResource', string>> = {},
   quirks: { neverListed?: boolean; staysListed?: boolean } = {},
 ) {
-  const state = { projects: new Set<string>(['someone-elses']), deleted: [] as string[], created: [] as string[] }
+  const state = { projects: new Set<string>(['someone-elses']), deleted: [] as string[], created: [] as string[], specs: [] as object[] }
   const fabric: Seams['fabric'] = (address, token) => {
     assert.equal(address, 'rpc.demeter.run:443')
     assert.equal(token, 'token-abc')
@@ -139,9 +186,10 @@ function fakeFabric(
       async projectIds() {
         return [...state.projects]
       },
-      async createResource(projectId, kind) {
+      async createResource(projectId, kind, spec) {
         if (fail.createResource === kind) throw new Error(`CreateResource: INTERNAL (${kind})`)
         state.created.push(`${projectId}/${kind}`)
+        state.specs.push(spec)
         return { id: `r-${kind}`, name: kind.toLowerCase() }
       },
       async resourceSpec(id) {
@@ -152,7 +200,7 @@ function fakeFabric(
   return { state, fabric }
 }
 
-const kind = (name: string, check: Kind['check']): Kind => ({ kind: name, label: name, claim: 'answers', spec: {}, check })
+const kind = (name: string, check: Kind['check']): Kind => ({ kind: name, label: name, claim: 'answers', spec: { of: name }, check })
 
 async function runSuite(seams: Seams, env: Record<string, string | undefined> = {}): Promise<Result> {
   return withEnv({ E2E_USER_PASSWORD: 'pw', AUTH0_CLIENT_ID: 'cid', AUTH0_CLIENT_SECRET: 'csecret', GITHUB_ACTIONS: undefined, ...env }, async () => {
@@ -194,6 +242,7 @@ describe('the port suite', () => {
     )
     assert.deepEqual(tips, [1_000 - 120])
     assert.deepEqual(state.created, ['p-1/CardanoNodePort', 'p-1/KupoPort'])
+    assert.deepEqual(state.specs, [{ of: 'CardanoNodePort' }, { of: 'KupoPort' }])
     assert.deepEqual(state.deleted, ['p-1'])
     assert.deepEqual([...state.projects], ['someone-elses'])
   })
@@ -249,7 +298,7 @@ describe('the port suite', () => {
         kind(name, async ({ tip }) => {
           checked.push(name)
           if (name === 'CardanoNodePort') throw new Error('syncProgress 97.00 at slot 1, not within 99–100')
-          if (tip === null) throw new Error('answered at slot 5, but there is no node tip to compare it with: the node check failed')
+          if (tip === null) throw new Error('answered at slot 5, but there is no node tip to compare it with')
           return { detail: '' }
         }),
       ),
@@ -305,7 +354,97 @@ describe('the port suite', () => {
     const { fabric } = fakeFabric({ deleteProject: 'DeleteProject: UNAVAILABLE' })
     const result = await runSuite({ fabric, kinds: [] })
     assert.equal(result.ok, false)
-    assert.deepEqual(result.steps.at(-1), { ...result.steps.at(-1)!, name: 'delete the project', ok: false, detail: 'DeleteProject: UNAVAILABLE' })
+    assert.deepEqual(result.steps.at(-1), {
+      ...result.steps.at(-1)!,
+      name: 'delete the project',
+      ok: false,
+      detail: 'p-1 is left behind: DeleteProject: UNAVAILABLE',
+    })
+  })
+
+  /**
+   * A suite of one kind whose sleeps and fabric calls are logged in order;
+   * `lists` and `specs` answer the nth `FetchProjects` and `FetchResourcesById`.
+   */
+  async function polled(lists: (n: number) => string[] | Error, specs: (n: number) => Record<string, unknown> | null | Error) {
+    const log: string[] = []
+    const counts = { lists: 0, specs: 0 }
+    const answer = <T>(a: T | Error): T => {
+      if (a instanceof Error) throw a
+      return a
+    }
+    const result = await runSuite({
+      sleep: async (ms) => void log.push(`sleep ${ms}`),
+      kinds: [kind('KupoPort', async () => ({ detail: 'at tip' }))],
+      fabric: () => ({
+        async createProject() {
+          log.push('CreateProject')
+          return { id: 'p-1', namespace: 'prj-e2e' }
+        },
+        async deleteProject() {
+          log.push('DeleteProject')
+        },
+        async projectIds() {
+          log.push('FetchProjects')
+          return answer(lists(++counts.lists))
+        },
+        async createResource() {
+          log.push('CreateResource')
+          return { id: 'r-1', name: 'kupo' }
+        },
+        async resourceSpec() {
+          log.push('FetchResourcesById')
+          return answer(specs(++counts.specs))
+        },
+      }),
+    })
+    return { result, log, counts }
+  }
+
+  it('reads until the project and the key arrive, sleeping before each read and riding out a failed one', async () => {
+    const unavailable = (call: string) => new Error(`${call}: UNAVAILABLE (connection reset)`)
+    const lists = [unavailable('FetchProjects'), [], ['p-1'], ['p-1'], unavailable('FetchProjects'), []]
+    const specs = [unavailable('FetchResourcesById'), null, {}, { authToken: 'key-1' }]
+    const { result, log } = await polled(
+      (n) => lists[n - 1]!,
+      (n) => specs[n - 1]!,
+    )
+    assert.equal(result.ok, true, JSON.stringify(result.steps))
+    const wait = 'sleep 3000'
+    assert.deepEqual(log, [
+      'CreateProject',
+      ...[wait, 'FetchProjects', wait, 'FetchProjects', wait, 'FetchProjects'],
+      wait,
+      'CreateResource',
+      ...[wait, 'FetchResourcesById', wait, 'FetchResourcesById', wait, 'FetchResourcesById', wait, 'FetchResourcesById'],
+      'DeleteProject',
+      ...[wait, 'FetchProjects', wait, 'FetchProjects', wait, 'FetchProjects'],
+    ])
+    assert.equal(
+      result.steps.find((s) => s.name === 'the project is listed')!.detail,
+      'FetchProjects lists 1 project(s), including p-1',
+    )
+    assert.equal(result.steps.find((s) => s.name === 'KupoPort: create KupoPort')!.detail, 'kupo (r-1)')
+  })
+
+  it('stops after five reads, failing with what the last one said', async () => {
+    const { result, counts } = await polled(
+      () => [],
+      (n) => (n < 5 ? null : new Error('FetchResourcesById: UNAVAILABLE (connection reset)')),
+    )
+    assert.deepEqual(counts, { lists: 6, specs: 5 })
+    assert.deepEqual(
+      result.steps.filter((s) => !s.ok).map((s) => [s.name, s.detail]),
+      [
+        ['the project is listed', 'FetchProjects does not list p-1 after 5 reads'],
+        ['KupoPort: create KupoPort', 'kupo (r-1): FetchResourcesById: UNAVAILABLE (connection reset) after 5 reads'],
+      ],
+    )
+    const { result: noKey } = await polled(
+      (n) => (n <= 1 ? ['p-1'] : []),
+      () => ({ network: 'mainnet' }),
+    )
+    assert.equal(noKey.steps.find((s) => s.name === 'KupoPort: create KupoPort')!.detail, 'kupo (r-1): no authToken in its spec after 5 reads')
   })
 })
 
@@ -348,6 +487,30 @@ describe('fabric', () => {
     assert.equal(varint(call!.request, 1), null)
   })
 
+  it('creates a resource with its kind and its spec as JSON, and reads the key back from its spec', async () => {
+    const { calls, fabric } = recordedFabric((call) =>
+      call.method.endsWith('/CreateResource')
+        ? encodeStrings({ 1: 'r-1', 2: 'kupo-abc' })
+        : nested(1, encodeStrings({ 1: 'r-1', 4: '{"network":"mainnet","authToken":"dmtr_kupo1"}' })),
+    )
+    assert.deepEqual(await fabric.createResource('p-1', 'KupoPort', { network: 'mainnet', pruneUtxo: true }), { id: 'r-1', name: 'kupo-abc' })
+    assert.deepEqual(await fabric.resourceSpec('r-1'), { network: 'mainnet', authToken: 'dmtr_kupo1' })
+    assert.deepEqual(
+      calls.map((c) => [c.method, c.headers, string(c.request, 1), string(c.request, 2), string(c.request, 3)]),
+      [
+        ['/demeter.ops.v1alpha.ResourceService/CreateResource', { authorization: 'Bearer token-abc' }, 'p-1', 'KupoPort', '{"network":"mainnet","pruneUtxo":true}'],
+        ['/demeter.ops.v1alpha.ResourceService/FetchResourcesById', { authorization: 'Bearer token-abc' }, 'r-1', '', ''],
+      ],
+    )
+  })
+
+  it('fails a resource with no id, and reads no record as null', async () => {
+    const { fabric } = recordedFabric(() => encodeStrings({ 2: 'kupo-abc' }))
+    await assert.rejects(fabric.createResource('p-1', 'KupoPort', {}), { message: 'CreateResource answered no resource id' })
+    const { fabric: empty } = recordedFabric(() => new Uint8Array())
+    assert.equal(await empty.resourceSpec('r-1'), null)
+  })
+
   it('deletes the project by its id', async () => {
     const { calls, fabric } = recordedFabric(() => new Uint8Array())
     await fabric.deleteProject('p-1')
@@ -373,7 +536,90 @@ describe('fabric', () => {
   })
 })
 
+describe('sign-in', () => {
+  const credentials = { username: 'e2e@txpipe.io', password: 'pw', clientId: 'cid', clientSecret: 'csecret', audience: 'demeter-api' }
+
+  function auth0(answer: Response | Error) {
+    const requests: { url: string; init: RequestInit }[] = []
+    const send = (async (url: string, init: RequestInit) => {
+      requests.push({ url, init })
+      if (answer instanceof Error) throw answer
+      return answer
+    }) as typeof fetch
+    return { requests, send }
+  }
+
+  it('asks Auth0 for a password grant, the secrets in the body only', async () => {
+    const { requests, send } = auth0(Response.json({ access_token: 'token-abc', token_type: 'Bearer' }))
+    assert.equal(await signIn('https://txpipe.us.auth0.com', credentials, send), 'token-abc')
+    const [{ url, init }] = requests as [{ url: string; init: RequestInit }]
+    assert.equal(url, 'https://txpipe.us.auth0.com/oauth/token')
+    assert.equal(init.method, 'POST')
+    assert.deepEqual(init.headers, { 'content-type': 'application/x-www-form-urlencoded' })
+    assert.deepEqual(Object.fromEntries(init.body as URLSearchParams), {
+      grant_type: 'password',
+      username: 'e2e@txpipe.io',
+      password: 'pw',
+      audience: 'demeter-api',
+      scope: 'profile openid email',
+      client_id: 'cid',
+      client_secret: 'csecret',
+    })
+  })
+
+  it('fails naming what Auth0 said', async () => {
+    const refused = Response.json({ error: 'unauthorized_client', error_description: "Grant type 'password' not allowed for the client." }, { status: 403 })
+    await assert.rejects(signIn('https://txpipe.us.auth0.com', credentials, auth0(refused).send), {
+      message: "Auth0 answered HTTP 403 with no access token: unauthorized_client (Grant type 'password' not allowed for the client.)",
+    })
+    await assert.rejects(signIn('https://txpipe.us.auth0.com', credentials, auth0(Response.json({}, { status: 200 })).send), {
+      message: 'Auth0 answered HTTP 200 with no access token',
+    })
+    const unreachable = new TypeError('fetch failed', { cause: Object.assign(new Error('getaddrinfo ENOTFOUND txpipe.us.auth0.com'), { code: 'ENOTFOUND' }) })
+    await assert.rejects(signIn('https://txpipe.us.auth0.com', credentials, auth0(unreachable).send), {
+      message: 'ENOTFOUND (getaddrinfo ENOTFOUND txpipe.us.auth0.com)',
+    })
+  })
+})
+
+describe('fetchNamingCause', () => {
+  const failing = (error: Error) => (async () => {
+    throw error
+  }) as unknown as typeof fetch
+
+  it('names a timeout by its name, not its legacy numeric code', async () => {
+    const timeout = new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+    assert.equal(timeout.code, 23)
+    await assert.rejects(fetchNamingCause('https://example.invalid', {}, failing(timeout)), {
+      message: 'TimeoutError (The operation was aborted due to timeout)',
+    })
+  })
+
+  it('names each address a dual-stack connection was refused on', async () => {
+    const refused = (address: string) => Object.assign(new Error(`connect ECONNREFUSED ${address}`), { code: 'ECONNREFUSED' })
+    const cause = Object.assign(new AggregateError([refused('::1:443'), refused('127.0.0.1:443')], ''), { code: 'ECONNREFUSED' })
+    await assert.rejects(fetchNamingCause('https://localhost', {}, failing(new TypeError('fetch failed', { cause }))), {
+      message: 'ECONNREFUSED (connect ECONNREFUSED ::1:443; connect ECONNREFUSED 127.0.0.1:443)',
+    })
+  })
+})
+
 describe('the port kinds', () => {
+  it('are fabric’s, in its order, each with the spec its script sends', () => {
+    // fabric's test/e2e, each `create_port` call's spec as it is written there.
+    assert.deepEqual(
+      kinds.map((k) => [k.kind, JSON.stringify(k.spec)]),
+      [
+        ['CardanoNodePort', '{"network":"mainnet","version":"stable","throughputTier":"0"}'],
+        ['BlockfrostPort', '{"network":"mainnet","throughputTier":"0","operatorVersion":"1"}'],
+        ['KupoPort', '{"network":"mainnet","throughputTier":"0","pruneUtxo":true,"operatorVersion":"1"}'],
+        ['OgmiosPort', '{"network":"mainnet","throughputTier":"0","version":6}'],
+        ['UtxoRpcPort', '{"network":"mainnet","throughputTier":"0","operatorVersion":"1"}'],
+        ['SubmitApiPort', '{"network":"mainnet","throughputTier":"0","operatorVersion":"1"}'],
+      ],
+    )
+  })
+
   const hosts = environments.production.ports!.hosts
   const now = 1_790_000_000
   /** The slot at unix time `t`, on mainnet. */
@@ -432,7 +678,7 @@ describe('the port kinds', () => {
       message: 'is not at the chain tip: slot 899, the node\'s tip less 120 slots is 900',
     })
     await assert.rejects(kind('BlockfrostPort').check(probe(null).probe), {
-      message: 'answered at slot 899, but there is no node tip to compare it with: the node check failed',
+      message: 'answered at slot 899, but there is no node tip to compare it with',
     })
   })
 
@@ -471,17 +717,20 @@ describe('the port kinds', () => {
       assert.deepEqual(asked, [`k.${hosts.node}`])
     })
 
-    it('passes at 99, and fails below it after five tries with doubling waits', async () => {
-      // The slot whose time covers `share` of the time since the system start.
-      const at = (share: number) => slotAt(Math.ceil(mainnet.systemStart + share * (now - mainnet.systemStart)))
-      assert.equal(syncProgress(at(0.99), now), 99)
-      assert.equal(syncProgress(at(0.99) - 3_000, now), 98.99)
-      assert.ok(slotTime(at(0.99)) < now - 600)
+    it('passes at 99.00, and fails at 98.99 after five tries with doubling waits', async () => {
+      // cardano-cli's ratio is (tip's seconds + 1 + 600) / (now's seconds + 1),
+      // both since the system start; it prints 99.00 from 98.995 up.
+      const sb = now - mainnet.systemStart + 1
+      const at = (ratio: number) => slotAt(mainnet.systemStart + ratio - 601)
+      const lowest = Math.ceil(0.98995 * sb)
+      assert.equal(syncProgress(at(lowest), now), 99)
+      assert.equal(syncProgress(at(lowest) - 1, now), 98.99)
+      assert.ok(slotTime(at(lowest)) < now - 600)
 
-      assert.equal((await node([at(0.99)]).kind.check(probe().probe)).slot, at(0.99))
-      const behind = node([at(0.99) - 3_000])
+      assert.equal((await node([at(lowest)]).kind.check(probe().probe)).slot, at(lowest))
+      const behind = node([at(lowest) - 1])
       const { probe: p, sleeps } = probe()
-      await assert.rejects(behind.kind.check(p), { message: `after 5 attempts: syncProgress 98.99 at slot ${at(0.99) - 3_000}, not within 99–100` })
+      await assert.rejects(behind.kind.check(p), { message: `after 5 attempts: syncProgress 98.99 at slot ${at(lowest) - 1}, not within 99–100` })
       assert.deepEqual(sleeps, [3_000, 6_000, 12_000, 24_000, 48_000])
       assert.equal(behind.asked.length, 5)
     })
@@ -525,6 +774,15 @@ describe('the port kinds', () => {
         [[`https://k.${hosts.submitapi}/api/submit/tx`, 'POST', '', 'application/cbor']],
       )
       assert.deepEqual(sleeps, [0])
+    })
+
+    it('fails a refusal that is not the submit API’s 400', async () => {
+      for (const status of [401, 403, 404]) {
+        const { kind } = reach(() => new Response('', { status }))
+        await assert.rejects(kind('SubmitApiPort').check(probe().probe), {
+          message: `after 5 attempts: POST /api/submit/tx with an empty body answered HTTP ${status}, wanted 400`,
+        })
+      }
     })
 
     it('fails any other answer after five tries, three seconds apart', async () => {

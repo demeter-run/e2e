@@ -21,7 +21,7 @@ export interface Probe {
   /** The port's key, from its spec's `authToken`. */
   key: string
   hosts: PortSuiteTarget['hosts']
-  /** The node's slot less `tipSlack`, or null when the node check found none. */
+  /** The node's slot less `tipSlack`, or null when the node's steps found none. */
   tip: number | null
   sleep: (ms: number) => Promise<void>
 }
@@ -81,7 +81,7 @@ async function getJson(send: typeof fetch, url: string): Promise<unknown> {
 
 /** A slot read from a port, checked against the node's tip. */
 function atTip(label: string, slot: number, tip: number | null): { detail: string; slot: number } {
-  if (tip === null) throw new Error(`answered at slot ${slot}, but there is no node tip to compare it with: the node check failed`)
+  if (tip === null) throw new Error(`answered at slot ${slot}, but there is no node tip to compare it with`)
   if (slot < tip) throw new Error(`is not at the chain tip: slot ${slot}, the node's tip less ${tipSlack} slots is ${tip}`)
   return { detail: `${label} at slot ${slot}, at or past the node's tip less ${tipSlack} (${tip})`, slot }
 }

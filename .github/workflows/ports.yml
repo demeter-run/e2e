@@ -9,8 +9,9 @@ name: ports
 #   12:00 run has started between 15:18 and 16:42 UTC, as GitHub delays
 #   scheduled runs; 10:00 keeps clear of it while both exist. Only runs of main
 #   hold the webhook, so a dispatch on a branch logs that its alert was skipped.
-# - On pull requests that change the suite, from this repository only: the same
-#   run against production, no alert, so a change is proven before it merges.
+# - On pull requests that change what the suite runs (src/, the toolchain, the
+#   dependencies), from this repository only: the same run against
+#   production, no alert, so a change is proven before it merges.
 #   GitHub dispatches only workflows already on the default branch.
 # - When an alerting run fails before the suite starts (checkout, install), one
 #   `e2e-ports-setup` alert says so: no port was checked, and no suite alert
@@ -23,12 +24,11 @@ on:
   pull_request:
     paths:
       - .github/workflows/ports.yml
-      - src/ports/**
-      - src/cli/**
-      - src/env.ts
-      - src/report.ts
+      - src/**
+      - .nvmrc
       - package.json
       - pnpm-lock.yaml
+      - pnpm-workspace.yaml
   schedule:
     - cron: '0 10 * * *'
   workflow_dispatch:

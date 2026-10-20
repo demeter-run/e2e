@@ -109,7 +109,11 @@ export function portSuite({
         }
       } finally {
         const deleted = await run.step('delete the project', async () => {
-          await api.deleteProject(project)
+          try {
+            await api.deleteProject(project)
+          } catch (error) {
+            throw new Error(`${project} is left behind: ${(error as Error).message}`)
+          }
           return project
         })
         if (deleted) await run.step('the project is no longer listed', () => listing(false))
