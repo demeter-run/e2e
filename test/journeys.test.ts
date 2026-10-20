@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
+import { once } from 'node:events'
 import { readFileSync } from 'node:fs'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -211,14 +212,166 @@ describe('the j2 workflow', () => {
   const glob = (pattern: string) =>
     new RegExp(`^${pattern.split('**').map((part) => part.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*')).join('.*')}$`)
 
+  const workflow = readFileSync(join(root, '.github', 'workflows', 'j2.yml'), 'utf8')
+
   it('runs on a pull request that changes any file J2 runs, the toolchain or the dependencies', () => {
-    const workflow = readFileSync(join(root, '.github', 'workflows', 'j2.yml'), 'utf8')
     const block = /\n {2}pull_request:\n {4}paths:\n((?: {6}- .+\n)+)/.exec(workflow)?.[1]
     assert.ok(block, 'j2.yml has a pull_request paths filter')
     const paths = [...block.matchAll(/- (.+)/g)].map((m) => glob(m[1]!.trim()))
     const specs = journeys.map((j) => j.spec)
     const needed = [...imports([...specs, 'src/cli/journey.ts']), 'playwright.config.ts', '.nvmrc', 'package.json', 'pnpm-lock.yaml', '.github/workflows/j2.yml']
     assert.deepEqual(needed.filter((file) => !paths.some((p) => p.test(file))), [])
+  })
+
+  it("keeps one run per pull request, and never cancels a scheduled or dispatched one", () => {
+    const top = /\nconcurrency:\n {2}group: (.+)\n {2}cancel-in-progress: (.+)\n/.exec(workflow)
+    assert.ok(top, 'j2.yml has a workflow-level concurrency group')
+    assert.equal(top[1], "j2-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}")
+    assert.equal(top[2], "${{ github.event_name == 'pull_request' }}")
+  })
+
+  /**
+   * The step of j2.yml with `id`: its `run` script, its `env` as written by
+   * name, and the ids of the steps of its job that come before it.
+   */
+  const stepOf = (id: string): { run: string; env: Record<string, string>; before: string[] } => {
+    const lines = workflow.split('\n')
+    const at = lines.findIndex((l) => l.trim() === `- id: ${id}`)
+    assert.ok(at >= 0, `j2.yml has a step with id ${id}`)
+    const indent = lines[at]!.indexOf('-') + 2
+    const job = lines.slice(0, at).findLastIndex((l) => /^ {4}steps:$/.test(l))
+    const before = lines.slice(job, at).flatMap((l) => /^ {6}- id: (\S+)$/.exec(l)?.[1] ?? [])
+    const body: string[] = []
+    for (const line of lines.slice(at + 1)) {
+      if (line.trim() && line.search(/\S/) < indent) break
+      body.push(line)
+    }
+    /** The lines of the step's `key`, its own and those indented under it. */
+    const under = (key: string): string[] => {
+      const start = body.findIndex((l) => l.startsWith(`${' '.repeat(indent)}${key}:`))
+      if (start < 0) return []
+      const end = body.findIndex((l, i) => i > start && l.trim() !== '' && l.search(/\S/) <= indent)
+      return body.slice(start, end < 0 ? undefined : end)
+    }
+    const [key = '', ...block] = under('run')
+    const inline = key.slice(indent + 'run:'.length).trim()
+    const deeper = Math.min(...block.filter((l) => l.trim()).map((l) => l.search(/\S/)))
+    const run = inline === '|' ? block.map((l) => l.slice(deeper)).join('\n') : inline
+    const env = Object.fromEntries(
+      under('env')
+        .filter((l) => l.search(/\S/) === indent + 2)
+        .map((l) => [l.trim().split(':')[0]!, l.trim().slice(l.trim().indexOf(':') + 1).trim()]),
+    )
+    return { run, env, before }
+  }
+
+  /**
+   * Runs a step's script as GitHub runs it (bash, -e, pipefail) with `env`,
+   * and a stand-in `pnpm` that records its arguments and exits `PNPM_EXIT`.
+   */
+  async function runStep(script: string, env: Record<string, string>) {
+    const tmp = await mkdtemp(join(tmpdir(), 'e2e-step-'))
+    try {
+      await writeFile(join(tmp, 'step.sh'), script)
+      await writeFile(join(tmp, 'pnpm'), '#!/bin/sh\necho "$@" > "$RUNNER_TEMP/pnpm-args"\nexit "${PNPM_EXIT:-0}"\n', { mode: 0o755 })
+      await writeFile(join(tmp, 'output'), '')
+      const child = spawn('bash', ['--noprofile', '--norc', '-eo', 'pipefail', join(tmp, 'step.sh')], {
+        env: { PATH: `${tmp}:${process.env.PATH}`, GITHUB_OUTPUT: join(tmp, 'output'), RUNNER_TEMP: tmp, ...env },
+      })
+      let [stdout, stderr] = ['', '']
+      child.stdout.on('data', (c) => (stdout += c))
+      child.stderr.on('data', (c) => (stderr += c))
+      const [status] = (await once(child, 'close')) as [number]
+      const args = await readFile(join(tmp, 'pnpm-args'), 'utf8').catch(() => null)
+      return { status, stdout, stderr, outputs: await readFile(join(tmp, 'output'), 'utf8'), args }
+    } finally {
+      await rm(tmp, { recursive: true, force: true })
+    }
+  }
+
+  it("records J2's exit status for the alert, and exits with it", async () => {
+    const { run, env } = stepOf('j2')
+    assert.deepEqual(Object.keys(env).sort(), ['ALERT', 'E2E_USER_PASSWORD', 'FORCE_FAIL', 'IRM_E2E_WEBHOOK_URL'])
+    assert.match(workflow, /\n {6}status: \$\{\{ steps\.j2\.outputs\.status \}\}\n/)
+    for (const [code, alert, force, args] of [
+      [0, 'false', 'false', 'j2 --env production'],
+      [1, 'true', 'false', 'j2 --env production --alert'],
+      [2, 'true', 'true', 'j2 --env production --alert --force-fail'],
+      [3, 'false', 'true', 'j2 --env production --force-fail'],
+    ] as const) {
+      const ran = await runStep(run, { ALERT: alert, FORCE_FAIL: force, PNPM_EXIT: String(code) })
+      assert.equal(ran.status, code, ran.stderr)
+      assert.equal(ran.outputs, `status=${code}\n`)
+      assert.equal(ran.args, `${args}\n`)
+    }
+  })
+
+  it('names the first set-up step that failed, and none when every one passed', async () => {
+    const { run, env, before } = stepOf('failed')
+    assert.deepEqual(Object.keys(env), ['OUTCOMES'])
+    // Every set-up step before J2 is listed, by its outcome.
+    const listed = [...workflow.matchAll(/\|\$\{\{ steps\.(\S+)\.outcome \}\}/g)].map((m) => m[1])
+    assert.deepEqual(listed, before.slice(0, before.indexOf('j2')))
+    const outcomes = (...lines: string[]) => ({ OUTCOMES: lines.join('\n') })
+    const failed = await runStep(run, outcomes('the checkout failed|success', 'the install failed|failure', 'the Chromium install failed|skipped'))
+    assert.equal(failed.outputs, 'step=the install failed\n', failed.stderr)
+    assert.equal((await runStep(run, outcomes('the checkout failed|success', 'the install failed|success'))).outputs, '')
+  })
+
+  it('alerts when J2 reported nothing, saying whether it walked and what it may have left', async () => {
+    const { run, env } = stepOf('alert')
+    assert.deepEqual(Object.keys(env).sort(), ['FAILED', 'IRM_E2E_WEBHOOK_URL', 'RESULT', 'RUN_URL', 'STATUS'])
+    assert.deepEqual([env.RESULT, env.STATUS, env.FAILED], ['${{ needs.j2.result }}', '${{ needs.j2.outputs.status }}', '${{ needs.j2.outputs.failed }}'])
+    assert.match(workflow, /\n {6}failed: \$\{\{ steps\.failed\.outputs\.step \}\}\n/)
+    const posted: { alert_uid: string; title: string; message: string; state: string; link_to_upstream_details: string }[] = []
+    const server = await serve((req, res) => {
+      let body = ''
+      req.on('data', (c) => (body += c))
+      req.on('end', () => {
+        posted.push(JSON.parse(body))
+        res.writeHead(202).end()
+      })
+    })
+    const link = 'https://github.com/demeter-run/e2e/actions/runs/1'
+    const alert = async (vars: Record<string, string>) => {
+      posted.length = 0
+      const ran = await runStep(run, { IRM_E2E_WEBHOOK_URL: server.url, RUN_URL: link, RESULT: 'failure', STATUS: '', FAILED: '', ...vars })
+      assert.equal(ran.status, 0, ran.stderr)
+      return { stdout: ran.stdout, posted: [...posted] }
+    }
+    const left = "A project it deployed may still be on the test user's account until the next run."
+    try {
+      for (const status of ['0', '1']) {
+        const reported = await alert({ STATUS: status })
+        assert.deepEqual(reported.posted, [])
+        assert.match(reported.stdout, new RegExp(`^J2 reported its results \\(exit ${status}\\)`))
+      }
+      const cases: [Record<string, string>, string, RegExp][] = [
+        [{ RESULT: 'cancelled' }, 'e2e-j2-cancelled', /^J2 was cancelled before it reported: /],
+        [{ FAILED: 'the install failed' }, 'e2e-j2-setup', /^the install failed, so J2 was not walked\.$/],
+        [{ STATUS: '2' }, 'e2e-j2-setup', /^J2 exited 2 on a usage error .+, so it was not walked\.$/],
+        [{ STATUS: '3' }, 'e2e-j2-setup', /^J2 exited 3 with no result: it broke outside the journey, maybe partway through its walk or after it, so none of its results alerted/],
+        [{}, 'e2e-j2-setup', /^J2's job failed with no step to name .+: J2 may have stopped partway through its walk\./],
+      ]
+      for (const [vars, uid, message] of cases) {
+        const [sent, ...more] = (await alert(vars)).posted
+        assert.deepEqual(more, [], uid)
+        assert.equal(sent?.alert_uid, uid)
+        assert.match(sent!.message, message)
+        // Only a walk that may have been cut short can have left a project.
+        assert.equal(sent!.message.endsWith(left), !/not walked\.$/.test(sent!.message), sent!.message)
+        assert.deepEqual([sent!.title, sent!.state, sent!.link_to_upstream_details], [
+          uid === 'e2e-j2-cancelled' ? 'e2e j2 cancelled (production)' : 'e2e j2 reported nothing (production)',
+          'alerting',
+          link,
+        ])
+      }
+      const skipped = await alert({ IRM_E2E_WEBHOOK_URL: '', STATUS: '3' })
+      assert.deepEqual(skipped.posted, [])
+      assert.equal(skipped.stdout, 'alert skipped for j2-setup: IRM_E2E_WEBHOOK_URL is not set\n')
+    } finally {
+      await server.close()
+    }
   })
 })
 

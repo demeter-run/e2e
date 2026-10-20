@@ -16,19 +16,23 @@ name: j2
 #   the list whole): the same, no alert. GitHub dispatches only workflows on
 #   the default branch, so this is how a branch runs J2 before it merges.
 # - When an alerting run reports nothing, one alert says so, as no journey
-#   alert would fire: `e2e-j2-setup` when the job failed before J2 reported
-#   (checkout, install or Chromium, or J2 exiting with no result: a usage
-#   error such as a missing password, or a break outside the journey), and
-#   `e2e-j2-cancelled` when the job was cancelled (its timeout ran out,
-#   another job of the group took its place, or someone cancelled it), which
-#   may leave a project on the test user's account until the next run.
+#   alert would fire: `e2e-j2-cancelled` when the job was cancelled (its
+#   timeout ran out, another job of the group took its place, or someone
+#   cancelled it), and `e2e-j2-setup` when it failed with no result. Its
+#   message says whether J2 was walked: not when a set-up step failed or J2
+#   refused its arguments (exit 2, a missing password, say); maybe partway
+#   when J2 broke outside the journey (exit 3) or the job failed with no step
+#   to name (a lost runner). A walk cut short may leave a project on the test
+#   user's account until the next run, and the message says so.
 #
 # Every job that signs in sets the concurrency group production-test-user, so
 # no two runs use the user at once: J2 deletes every project the user owns
 # before it starts and after it ends. `queue: max` keeps every waiting job, but
 # only while every job of the group sets it: by default the group keeps one
 # pending job, and a newer one cancels it without failing it, so no alert
-# would say that day went unwalked.
+# would say that day went unwalked. A pull request's newer push replaces its
+# older run instead (the workflow's own concurrency below), so superseded
+# pushes do not queue in the group behind each other.
 
 on:
   schedule:
@@ -61,6 +65,14 @@ on:
 
 permissions:
   contents: read
+
+# One run per pull request: a newer push cancels the older run, waiting or
+# walking, and the next run's clean slate deletes what it left. Every other run
+# is a group of its own, so a scheduled or dispatched run is never cancelled
+# here.
+concurrency:
+  group: j2-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   sign-in:
@@ -120,7 +132,7 @@ jobs:
       # actionlint 1.7.7 does not know this key yet; GitHub does.
       queue: max
     outputs:
-      reported: ${{ steps.j2.outputs.reported }}
+      status: ${{ steps.j2.outputs.status }}
       failed: ${{ steps.failed.outputs.step }}
     steps:
       - id: checkout
@@ -151,22 +163,22 @@ jobs:
           FORCE_FAIL: ${{ inputs.force_fail == true }}
         # 0 and 1 are verdicts J2 reported, and alerted with --alert; 2 is a
         # usage error (a missing password, say) and 3 a break outside the
-        # journey, and neither reported anything.
+        # journey, and neither reported anything. The alert below reads it.
+        # test/journeys.test.ts runs this script, and the two below.
         run: |
           args=(--env production)
           if [[ "$ALERT" == true ]]; then args+=(--alert); fi
           if [[ "$FORCE_FAIL" == true ]]; then args+=(--force-fail); fi
           status=0
           pnpm j2 "${args[@]}" || status=$?
-          if [[ $status -le 1 ]]; then reported=true; else reported=false; fi
-          { echo "status=$status"; echo "reported=$reported"; } >> "$GITHUB_OUTPUT"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
           exit "$status"
 
-      # Only when J2 reported nothing: a failed result has posted its own
-      # alert, so it names nothing here.
+      # For the alert below: the set-up step that failed, by name. A set-up
+      # step that fails skips J2, so none fails once J2 has started.
       - id: failed
-        name: Name the step that kept J2 from reporting
-        if: failure() && steps.j2.outputs.reported != 'true'
+        name: Name the set-up step that failed
+        if: failure()
         env:
           OUTCOMES: |-
             the checkout failed|${{ steps.checkout.outcome }}
@@ -174,7 +186,6 @@ jobs:
             the Node setup failed|${{ steps.node.outcome }}
             the install failed|${{ steps.install.outcome }}
             the Chromium install failed|${{ steps.chromium.outcome }}
-            J2 exited ${{ steps.j2.outputs.status }} with no result|${{ steps.j2.outputs.reported == 'false' && 'failure' || 'skipped' }}
         run: awk -F'|' '$2 == "failure" { print "step=" $1; exit }' <<<"$OUTCOMES" >> "$GITHUB_OUTPUT"
 
       # The result files, and the masked screenshot each failed step leaves.
@@ -188,33 +199,47 @@ jobs:
   # J2 that reported nothing posts no alert of its own. This posts one, in the
   # shape src/report.ts sends, with curl and jq: it needs no checkout or Node,
   # which may be what failed. The webhook URL goes to curl on stdin, never on a
-  # command line or in the log. `always()`, so a cancelled J2 alerts too. A
-  # failure that set up no step (the job's set-up, a lost runner) names
-  # nothing, so the alert goes on what J2 did not report.
+  # command line or in the log. `always()`, so a cancelled J2 alerts too. The
+  # script decides from J2's exit status, when it has one, and from the set-up
+  # step that failed, when one did; with neither (a lost runner, a timeout) it
+  # says J2 may have stopped partway.
   setup-alert:
     name: Alert when J2 reported nothing
     needs: j2
     if: >-
       always()
       && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-      && (needs.j2.result == 'cancelled' || (needs.j2.result == 'failure' && needs.j2.outputs.reported != 'true'))
+      && needs.j2.result != 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - env:
+      - id: alert
+        env:
           IRM_E2E_WEBHOOK_URL: ${{ github.ref == 'refs/heads/main' && secrets.IRM_E2E_WEBHOOK_URL || '' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          CANCELLED: ${{ needs.j2.result == 'cancelled' }}
+          RESULT: ${{ needs.j2.result }}
+          STATUS: ${{ needs.j2.outputs.status }}
           FAILED: ${{ needs.j2.outputs.failed }}
         run: |
-          if [[ "$CANCELLED" == true ]]; then
+          if [[ "$STATUS" == 0 || "$STATUS" == 1 ]]; then
+            echo "J2 reported its results (exit $STATUS); a failed one alerted on its own"
+            exit 0
+          fi
+          left="A project it deployed may still be on the test user's account until the next run."
+          uid=j2-setup
+          title="e2e j2 reported nothing (production)"
+          if [[ "$RESULT" == cancelled ]]; then
             uid=j2-cancelled
             title="e2e j2 cancelled (production)"
-            message="J2 was cancelled before it finished: its timeout ran out, another job of production-test-user took its place, or someone cancelled it. A project it deployed may still be on the test user's account until the next run."
+            message="J2 was cancelled before it reported: its timeout ran out, another job of production-test-user took its place, or someone cancelled it. $left"
+          elif [[ -n "$FAILED" ]]; then
+            message="$FAILED, so J2 was not walked."
+          elif [[ "$STATUS" == 2 ]]; then
+            message="J2 exited 2 on a usage error (a missing E2E_USER_PASSWORD, say) before it started, so it was not walked."
+          elif [[ -n "$STATUS" ]]; then
+            message="J2 exited $STATUS with no result: it broke outside the journey, maybe partway through its walk or after it, so none of its results alerted; any it wrote are in the run's artifacts. $left"
           else
-            uid=j2-setup
-            title="e2e j2 reported nothing (production)"
-            message="${FAILED:-the job failed before any of its steps ran (its set-up, or a lost runner)}, so J2 was not walked."
+            message="J2's job failed with no step to name (a lost runner, or its timeout) and no result: J2 may have stopped partway through its walk. $left"
           fi
           if [[ -z "$IRM_E2E_WEBHOOK_URL" ]]; then
             echo "alert skipped for $uid: IRM_E2E_WEBHOOK_URL is not set"
