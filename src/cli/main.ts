@@ -4,13 +4,25 @@ import { checks as allChecks } from '../checks/index.ts'
 import { type Environment, environment, environments } from '../env.ts'
 import { alertFailures, formatText, type Result, Run, writeJobSummary, writeResult } from '../report.ts'
 
-const usage = (checks: Check[]) => `usage: pnpm check <name>[,<name>…] | all --env <name> [options]
+/** A command that runs a fixed set of checks, taking no names: `pnpm ports`. */
+export interface Suite {
+  command: string
+  title: string
+}
+
+const usage = (checks: Check[], suite?: Suite) => `${
+  suite
+    ? `usage: pnpm ${suite.command} --env <name> [options]
+
+${checks.map((c) => c.summary).join('\n')}`
+    : `usage: pnpm check <name>[,<name>…] | all --env <name> [options]
 
 Every check reads the deployed surfaces of one environment, and no product
 repository.
 
 checks:
-${checks.map((c) => `  ${c.name.padEnd(10)} ${c.summary}`).join('\n')}
+${checks.map((c) => `  ${c.name.padEnd(10)} ${c.summary}`).join('\n')}`
+}
 
 options:
   --env <name>       the environment to check (${Object.keys(environments).join(', ')})
@@ -25,8 +37,9 @@ class UsageError extends Error {}
  * `pnpm check`: runs the named checks, writes their results, prints the run,
  * appends the job summary and, with `--alert`, alerts on failures. Returns the
  * exit code: 0 when every result passed, 1 when one failed, 2 on a usage error.
+ * With a `suite`, it runs every one of `checks` and takes no names.
  */
-export async function main(argv: string[], { checks = allChecks }: { checks?: Check[] } = {}): Promise<number> {
+export async function main(argv: string[], { checks = allChecks, suite }: { checks?: Check[]; suite?: Suite } = {}): Promise<number> {
   let values: { env?: string; alert: boolean; 'force-fail': boolean; results: string; help: boolean }
   let selected: Check[]
   let env: Environment
@@ -44,10 +57,11 @@ export async function main(argv: string[], { checks = allChecks }: { checks?: Ch
     })
     values = parsed.values
     if (values.help) {
-      console.log(usage(checks))
+      console.log(usage(checks, suite))
       return 0
     }
-    if (parsed.positionals.length !== 1) throw new UsageError('name one check, a comma-separated list, or all')
+    if (suite && parsed.positionals.length > 0) throw new UsageError(`pnpm ${suite.command} takes no check names`)
+    if (!suite && parsed.positionals.length !== 1) throw new UsageError('name one check, a comma-separated list, or all')
     if (!values.env) throw new UsageError('name the environment to check: --env production')
     try {
       env = environment(values.env)
@@ -57,13 +71,13 @@ export async function main(argv: string[], { checks = allChecks }: { checks?: Ch
     if (env.name === 'mock') {
       throw new UsageError('the mock serves only the agent routes, which the checks do not read: pnpm j0 --env mock or pnpm contract --env mock')
     }
-    const names = parsed.positionals[0]!
+    const names = suite ? 'all' : parsed.positionals[0]!
     selected =
       names === 'all'
         ? checks
         : names.split(',').map((name) => checks.find((c) => c.name === name.trim()) ?? raise(new UsageError(`unknown check "${name}"`)))
   } catch (error) {
-    console.error(`${(error as Error).message}\n\n${usage(checks)}`)
+    console.error(`${(error as Error).message}\n\n${usage(checks, suite)}`)
     return 2
   }
 
@@ -90,7 +104,7 @@ export async function main(argv: string[], { checks = allChecks }: { checks?: Ch
 
   for (const result of results) await writeResult(result, values.results)
   console.log(formatText(results))
-  await writeJobSummary(results, `Contract checks against ${env.name}`)
+  await writeJobSummary(results, `${suite?.title ?? 'Contract checks'} against ${env.name}`)
   if (values.alert) await alertFailures(results)
 
   return results.every((r) => r.ok) ? 0 : 1

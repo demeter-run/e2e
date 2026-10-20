@@ -18,6 +18,29 @@ export interface Environment {
   rpc: string
   /** The Auth0 tenant the Console and the legacy app sign in through. */
   auth0: string
+  /** What the port suite signs in as and where it reaches each port; absent where the suite does not run. */
+  ports?: PortSuiteTarget
+}
+
+export interface PortSuiteTarget {
+  /** The standing test user (decision 0047), signed in by Auth0's password grant. */
+  user: string
+  /** The Auth0 audience fabric's API accepts. */
+  audience: string
+  /** fabric's native gRPC endpoint, as `host:port`. */
+  grpc: string
+  /**
+   * Each port kind's host, after the port's key: `<key>.<host>`. UTxO RPC
+   * takes its key in a header instead, so its host is used as it is.
+   */
+  hosts: {
+    node: string
+    blockfrost: string
+    kupo: string
+    ogmios: string
+    utxorpc: string
+    submitapi: string
+  }
 }
 
 /** Where `pnpm mock` listens: `E2E_MOCK_URL`, by default its default port on this machine. */
@@ -31,6 +54,19 @@ export const environments = {
     legacy: 'https://legacy.demeter.run',
     rpc: 'https://rpc.demeter.run',
     auth0: 'https://txpipe.us.auth0.com',
+    ports: {
+      user: 'e2e@txpipe.io',
+      audience: 'demeter-api',
+      grpc: 'rpc.demeter.run:443',
+      hosts: {
+        node: 'cnode-m1.demeter.run:9443',
+        blockfrost: 'blockfrost-m1.demeter.run',
+        kupo: 'mainnet-v2.kupo-m1.demeter.run',
+        ogmios: 'cardano-mainnet-v6.ogmios-m1.demeter.run',
+        utxorpc: 'mainnet.utxorpc-v0.demeter.run:443',
+        submitapi: 'submitapi-m1.demeter.run',
+      },
+    },
   },
   mock: {
     name: 'mock',

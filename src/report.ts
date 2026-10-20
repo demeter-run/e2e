@@ -34,11 +34,23 @@ export class Failure extends Error {}
 export class Run {
   readonly #steps: Step[] = []
   readonly #started = new Date()
+  readonly #concealed = new Set<string>()
 
   constructor(
     readonly name: string,
     readonly env: string,
   ) {}
+
+  /**
+   * Keeps `value` (a token, a port's key) out of every later step's detail,
+   * wherever an error message or a response quotes it. In GitHub Actions it is
+   * also masked in the job log.
+   */
+  conceal(value: string): void {
+    if (!value || this.#concealed.has(value)) return
+    this.#concealed.add(value)
+    if (process.env.GITHUB_ACTIONS === 'true') console.log(`::add-mask::${value}`)
+  }
 
   /**
    * Runs `fn` as one step. It passes when `fn` returns, with the returned text
@@ -55,6 +67,7 @@ export class Run {
       ok = false
       detail = error instanceof Error ? error.message : String(error)
     }
+    for (const value of this.#concealed) detail = detail.replaceAll(value, '***')
     this.#steps.push({ name, ok, ms: Math.round(performance.now() - t0), detail })
     return ok
   }

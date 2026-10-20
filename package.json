@@ -12,6 +12,7 @@
     "j0": "tsx src/cli/j0.ts",
     "contract": "tsx src/cli/contract.ts",
     "mock": "tsx src/mock/main.ts",
+    "ports": "tsx src/cli/ports.ts",
     "test": "tsx --test \"test/*.test.ts\"",
     "test:browser": "tsx --test \"test/browser/*.test.ts\"",
     "typecheck": "tsc --noEmit"
@@ -21,5 +22,8 @@
     "@types/node": "22.20.1",
     "tsx": "4.23.15",
     "typescript": "6.0.3"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "1.14.6"
   }
 }
