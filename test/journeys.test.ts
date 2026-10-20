@@ -196,6 +196,17 @@ describe('the journey registry', () => {
   })
 })
 
+describe('the Playwright config', () => {
+  // Under the runner an action and a navigation wait with no limit by default:
+  // one that cannot happen would hold its step until the test's timeout, and
+  // the step would say nothing of it.
+  it('limits every action to 30 s and every navigation to 60 s', async () => {
+    const { default: config } = await import('../playwright.config.ts')
+    assert.equal(config.use?.actionTimeout, 30_000)
+    assert.equal(config.use?.navigationTimeout, 60_000)
+  })
+})
+
 describe('the j2 workflow', () => {
   /** The relative imports of `file`, and theirs, as paths from the repository root. */
   const imports = (files: string[]): Set<string> => {

@@ -397,11 +397,14 @@ and `pnpm check` itself against stand-in checks. The Console's pricing grid is
 read from its cells as webui renders them (the page renders only signed in, so
 no capture of it is committed), `pnpm journey` runs against a stand-in
 Playwright, the project deletion against a stand-in Console and the port
-requests against a local server. No unit test reaches production or needs a
-browser. The browser tests under `test/browser/` take a failed step's masked
+requests against a local server; `j2.yml`'s scripts run in bash with a
+stand-in `pnpm` and a local webhook. No unit test reaches production or needs
+a browser. The browser tests under `test/browser/` take a failed step's masked
 screenshot of a stand-in port page, as the Console lays it out, whose heading,
 labels or key shape have drifted, one or two at a time, and read its pixels
-back: every pixel of the key must be painted over.
+back: every pixel of the key must be painted over. They also sign out of a
+stand-in Console through a stand-in Auth0 whose `/v2/logout` redirects back,
+or never answers, which must fail the sign-out within its limit.
 
 ## Workflows
 
