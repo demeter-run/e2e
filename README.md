@@ -330,8 +330,10 @@ It takes `--alert`, `--force-fail` and `--results` as `pnpm check` does, and
 4. claim in Chromium: open `DEMETER_CLAIM_URL`, only when it is on the
    environment's Console, "Log in", sign in (the mock's form as any user, or
    Auth0 as `e2e@txpipe.io`; nothing is typed unless the form is on the
-   environment's sign-in origin), check the project name defaults to the
-   namespace, "Claim project", and land on `/<namespace>/ports`;
+   environment's sign-in origin), "Claim project" with the project name as
+   the page offers it, and land on `/<namespace>/ports`. A step of its own
+   then checks the name offered was the namespace, so a wrong default fails
+   that step without stopping the claim;
 5. the same request with the same key still answers 2xx;
 6. on production, delete the claimed project through the Console, pass or
    fail. A claim whose landing failed may still have gone through, so once

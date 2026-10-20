@@ -121,6 +121,8 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
   let namespace = ''
   let expiresAt = ''
   let portId = ''
+  /** What the claim form's project name held when "Claim project" was pressed. */
+  let offeredName: string | undefined
   /** Set when the claim button was pressed, whether or not the landing followed. */
   let claimSent = false
   let claimed = false
@@ -207,8 +209,12 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
         await addCookieSecrets(context, secrets)
         const claim = page.getByRole('button', { name: 'Claim project' })
         await claim.waitFor({ timeout: 30_000 })
-        const name = await page.locator('input[name="name"]').inputValue()
-        if (name !== namespace) fail(`the project name defaults to "${name}", wanted the namespace ${namespace}`)
+        // The name is read once the page has hydrated, which may change it, and
+        // left as it is: the next step judges it, so a wrong default does not
+        // stop the claim (the Console names a project left empty after its
+        // namespace).
+        await page.waitForLoadState('load')
+        offeredName = await page.locator('input[name="name"]').inputValue()
         claimSent = true
         await claim.click()
         await page.waitForURL((url) => url.pathname === `/${namespace}/ports`, { timeout: 30_000 })
@@ -223,6 +229,12 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
         fail(secrets.scrub(`${(error as Error).message.split('\n')[0]} (the browser was at ${here.origin}${here.pathname})`))
       }
       return `claimed ${namespace} and landed on /${namespace}/ports in ${seconds(performance.now() - t0)}`
+    })
+
+    await run.step('the claim page offered the namespace as the project name', async () => {
+      if (offeredName === undefined) fail('not run: the claim form never showed')
+      if (offeredName !== namespace) fail(`the project name defaulted to "${offeredName}", wanted the namespace ${namespace}`)
+      return `"${offeredName}"`
     })
 
     await run.step('after the claim, the same request with the same key still answers 2xx', async () => {
