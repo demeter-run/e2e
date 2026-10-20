@@ -119,11 +119,13 @@ describe('pnpm journey', () => {
     assert.equal(await cli(['walk', '--env', 'production'], playwright([result('walk', true), result('walk-edge', false)], 0).run), 1)
   })
 
-  it('fails a result the spec did not write, and never reads one an earlier run left', async () => {
+  it('fails a result the spec did not write, and never reads one an earlier run left, nor keeps its screenshots', async () => {
     await writeFile(join(dir, 'walk-edge.json'), JSON.stringify(result('walk-edge', true)))
+    for (const shot of ['walk-01.png', 'walk-clean-up-worker-0-01-2.png', 'walk-edge-01.png', 'other-01.png']) await writeFile(join(dir, shot), '')
     assert.equal(await cli(['walk', '--env', 'production'], playwright([result('walk', true)], 1).run), 1)
     const edge = await readFile(join(dir, 'walk-edge.json'), 'utf8').catch(() => null)
     assert.equal(edge, null)
+    assert.deepEqual((await readdir(dir)).sort(), ['other-01.png', 'walk.json'])
     assert.match(String(log.mock.calls.at(-1)?.arguments[0]), /FAIL {2}walk-edge \(production\): 0\/1 steps\n {2}FAIL {2}report \(0 ms\): the journey wrote no result for walk-edge: Playwright exited 1/)
   })
 
@@ -491,6 +493,48 @@ describe('browser steps', () => {
           { path: join(tmp, 'walk-01.png'), masks: 2 },
           { path: join(tmp, 'walk-02.png'), masks: 2 },
         ])
+      })
+    } finally {
+      await rm(tmp, { recursive: true, force: true })
+    }
+  })
+
+  // J2's clean-up runs in its own runner, and again in a new worker when J2
+  // times out: neither may replace the screenshot a reported result names.
+  it('name their screenshots as asked, and never replace one an earlier runner took', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'e2e-steps-'))
+    try {
+      await withEnv({ E2E_RESULTS: tmp }, async () => {
+        const { page, shots } = stand()
+        const fail = () => {
+          throw new Failure('wrong')
+        }
+        const run = new Run('walk', 'production')
+        await browserSteps(run, () => page, () => [])('first', fail)
+        await browserSteps(run, () => page, () => [], 'walk-clean-up-worker-0')('clean up', fail)
+        await browserSteps(run, () => page, () => [])('first again', fail)
+        await browserSteps(run, () => page, () => [], 'walk-clean-up-worker-0')('clean up again', fail)
+        const named = ['walk-01.png', 'walk-clean-up-worker-0-01.png', 'walk-01-2.png', 'walk-clean-up-worker-0-01-2.png'].map((f) => join(tmp, f))
+        assert.deepEqual(shots.map((s) => s.path), named)
+        assert.deepEqual(run.finish().steps.map((s) => s.detail), named.map((path) => `wrong\nscreenshot: ${path}`))
+        assert.deepEqual((await readdir(tmp)).sort(), ['walk-01-2.png', 'walk-01.png', 'walk-clean-up-worker-0-01-2.png', 'walk-clean-up-worker-0-01.png'])
+      })
+    } finally {
+      await rm(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('leave no file behind for a screenshot that failed', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'e2e-steps-'))
+    try {
+      await withEnv({ E2E_RESULTS: tmp }, async () => {
+        const page = { screenshot: async () => Promise.reject(new Error('Target page, context or browser has been closed\nCall log: …')) } as never
+        const run = new Run('walk', 'production')
+        await browserSteps(run, () => page, () => [])('first', () => {
+          throw new Failure('wrong')
+        })
+        assert.equal(run.finish().steps[0]!.detail, 'wrong\nscreenshot: no screenshot: Target page, context or browser has been closed')
+        assert.deepEqual(await readdir(tmp), [])
       })
     } finally {
       await rm(tmp, { recursive: true, force: true })

@@ -1,4 +1,4 @@
-import { mkdir } from 'node:fs/promises'
+import { mkdir, open, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Locator, Page } from '@playwright/test'
 import { safeUrl } from '../http.ts'
@@ -55,16 +55,33 @@ export async function arrives(page: Page, test: (url: URL) => boolean, what: str
 
 /**
  * A screenshot of `page` for a failed step, with every element in `masks`
- * painted over, saved as `<dir>/<name>.png`. Returns the path, or why there is
- * none: a screenshot that fails must not fail the step a second time.
+ * painted over, saved as `<dir>/<name>.png`, or as `<name>-2.png` and on when
+ * that file exists: a screenshot never replaces one that a step taken
+ * earlier, in this worker or another, names. Returns the path, or why there
+ * is none: a screenshot that fails must not fail the step a second time.
  */
 export async function maskedScreenshot(page: Page, dir: string, name: string, masks: Locator[]): Promise<string> {
-  const path = join(dir, `${name}.png`)
+  let path: string | undefined
   try {
     await mkdir(dir, { recursive: true })
+    path = await claim(dir, name)
     await page.screenshot({ path, mask: masks, maskColor: '#ff00ff', timeout: 15_000 })
     return path
   } catch (error) {
+    if (path) await rm(path, { force: true })
     return `no screenshot: ${firstLine(error)}`
+  }
+}
+
+/** Creates the first of `<dir>/<name>.png`, `<name>-2.png`, … that does not exist yet, and returns its path. */
+async function claim(dir: string, name: string): Promise<string> {
+  for (let n = 1; ; n += 1) {
+    const path = join(dir, `${name}${n === 1 ? '' : `-${n}`}.png`)
+    try {
+      await (await open(path, 'wx')).close()
+      return path
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    }
   }
 }

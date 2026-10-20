@@ -36,12 +36,12 @@ export class NotRun extends Failure {
  * fails with its `Failure` message whole, and with only the first line of any
  * other error: a Playwright error's call log quotes the elements it met. A
  * failed step leaves a screenshot of the page with `masks` painted over, named
- * in its detail.
+ * in its detail: `<shots>-01.png` for the runner's first step, and on.
  */
-export function browserSteps(run: Run, page: () => Page | undefined, masks: (page: Page) => Locator[]) {
+export function browserSteps(run: Run, page: () => Page | undefined, masks: (page: Page) => Locator[], shots = run.name) {
   let n = 0
   return (name: string, fn: () => string | void | Promise<string | void>): Promise<boolean> => {
-    const shot = `${run.name}-${String((n += 1)).padStart(2, '0')}`
+    const shot = `${shots}-${String((n += 1)).padStart(2, '0')}`
     return run.step(name, async () => {
       try {
         return await fn()

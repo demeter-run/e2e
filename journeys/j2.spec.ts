@@ -57,9 +57,10 @@ const portType = 'cardano-preprod'
 /** A request a developer's first call could be, as `GET <endpoint>/epochs/latest`. */
 const firstCall = '/epochs/latest'
 
-/** The browser the journey and the edge cases share, signed in once J2 has signed in. */
+/** The browser the journey and the edge cases share, signed in once J2 has signed in (`signedIn`). */
 let context: BrowserContext | undefined
 let page: Page | undefined
+let signedIn = false
 let namespace: string | undefined
 let port: ConsolePort | undefined
 
@@ -73,7 +74,7 @@ const runs = new Map<string, Run>([['j2', j2]])
 /** What a screenshot must not show: the password field, and the port's key wherever it is written. */
 const masks = (p: Page) => [p.locator('input[type="password"]'), ...keyMasks(p, port?.key)]
 
-const stepsOf = (run: Run) => browserSteps(run, () => page, masks)
+const stepsOf = (run: Run, shots?: string) => browserSteps(run, () => page, masks, shots)
 
 // A test Playwright ended fails its result. J2's is written after the
 // clean-up; an edge case's, here.
@@ -86,7 +87,9 @@ test.afterEach(async ({}, testInfo) => {
 
 test.afterAll(async ({ browser }, testInfo) => {
   testInfo.setTimeout(10 * 60_000)
-  const step = stepsOf(j2)
+  // Its screenshot is named apart from J2's steps' and from another worker's
+  // clean-up, which runs too when J2 times out.
+  const step = stepsOf(j2, `j2-clean-up-worker-${testInfo.workerIndex}`)
   // Pass or fail: the clean-up deletes whatever the user owns, so the next run
   // starts from the same clean slate and nothing is left behind. It is cut
   // off before the hook's 10 minutes, so that J2's result is still written. A
@@ -115,7 +118,6 @@ test('j2', async ({ browser }) => {
   j2Ran = true
   const step = stepsOf(j2)
   let landed: number | undefined
-  let signedIn = false
 
   // 1. Before the stopwatch: the user owns nothing, so the Console's
   // first-project path runs, and Auth0 holds no session for the person's browser.
@@ -321,7 +323,7 @@ test('j2-legacy-cookie', async () => {
   const step = stepsOf(run)
   let legacy = false
   await step(`sign in through the legacy app at ${env.website}/auth`, async () => {
-    if (!page || !namespace) throw new NotRun('J2 left no signed-in session')
+    if (!page || !signedIn) throw new NotRun('J2 left no signed-in session')
     // The Console's cookie has the same name, and with it the legacy app
     // wrote nothing (run 39410716098). Without it, the legacy app signs the
     // browser in through Auth0's session, which J2 left, and writes its own.

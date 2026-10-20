@@ -322,12 +322,16 @@ user.
 summary or an alert: they are kept secret (`src/secrets.ts`), every step's
 detail is redacted, a browser error is cut to its first line, and the key
 travels only in the `dmtr-api-key` header. A failed step leaves a screenshot
-(`results/<name>-<step>.png`) with the password field and the port's key
-painted over. The key's masks are found independently (`keyMasks` in
-`src/journeys/console.ts`): any text of a key's shape, the "Auth Token" row's
-value, the "Instance info" section, and the key itself once it is read. So
-a heading, a label or the key's shape that drifts loses one mask, never the
-key. Playwright's traces stay off: they record what is typed, the
+(`results/<name>-<step>.png`; J2's clean-up's is
+`j2-clean-up-worker-<n>-01.png`) with the password field and the port's key
+painted over. A screenshot never replaces another: a name already taken gets
+`-2`, and `pnpm journey` clears the journey's screenshots from an earlier run
+with its results. The key's masks are found independently (`keyMasks` in
+`src/journeys/console.ts`): any text of a key's shape, the value of each row
+that writes the key ("Auth Token" and "Authenticated Endpoint URL"), the
+"Instance info" section, and the key itself once it is read. So the key
+stays covered while any two of the section's heading, the rows' labels and
+the key's shape drift. Playwright's traces stay off: they record what is typed, the
 cookies sent (the Console's session is a signed Auth0 access token) and every
 response body, the key included, and none of that can be masked.
 
@@ -396,8 +400,8 @@ Playwright, the project deletion against a stand-in Console and the port
 requests against a local server. No unit test reaches production or needs a
 browser. The browser tests under `test/browser/` take a failed step's masked
 screenshot of a stand-in port page, as the Console lays it out, whose heading,
-label or key shape has drifted, and read its pixels back: every pixel of the
-key must be painted over.
+labels or key shape have drifted, one or two at a time, and read its pixels
+back: every pixel of the key must be painted over.
 
 ## Workflows
 

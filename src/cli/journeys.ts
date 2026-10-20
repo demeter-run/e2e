@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { readFile, rm } from 'node:fs/promises'
+import { readdir, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
 import { type Environment, environment, environments } from '../env.ts'
@@ -64,6 +64,16 @@ options:
 
 class UsageError extends Error {}
 
+/** The files in `dir`, or none when there is no such directory. */
+async function listing(dir: string): Promise<string[]> {
+  try {
+    return await readdir(dir)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+}
+
 /** A result for one the spec did not write: Playwright stopped before that test reported. */
 function missing(name: string, env: string, code: number): Result {
   const now = new Date().toISOString()
@@ -120,8 +130,13 @@ export async function main(
     return 2
   }
 
-  // A result left by an earlier run must not stand in for one this run did not write.
-  for (const name of journey.results) await rm(join(values.results, `${name}.json`), { force: true })
+  // A result left by an earlier run must not stand in for one this run did
+  // not write, nor its screenshots for this run's.
+  for (const file of await listing(values.results)) {
+    if (journey.results.some((name) => file === `${name}.json` || (file.startsWith(`${name}-`) && file.endsWith('.png')))) {
+      await rm(join(values.results, file), { force: true })
+    }
+  }
   const code = await playwright(journey.spec, { ...process.env, [specEnv.env]: env.name, [specEnv.results]: values.results })
 
   const results: Result[] = []
