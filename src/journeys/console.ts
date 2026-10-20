@@ -154,8 +154,10 @@ export async function signOut(page: Page, env: Environment, timeoutMs = 30_000):
   if (!answer || answer.status() < 300 || answer.status() > 399 || !location) {
     throw new Failure(`Auth0's /v2/logout answered ${answer?.status() ?? 'nothing'}, wanted a redirect out of the tenant`)
   }
+  // The page it signed out from can share the origin Auth0 sends it back to,
+  // so the wait is for the path too.
   const back = new URL(location, env.auth0)
-  await arrives(page, (u) => u.origin === back.origin, `${safeUrl(back.toString())}, where Auth0 sends a signed-out browser`, timeoutMs)
+  await arrives(page, (u) => u.origin === back.origin && u.pathname === back.pathname, `${safeUrl(back.toString())}, where Auth0 sends a signed-out browser`, timeoutMs)
   const left = (await page.context().cookies(env.console)).filter((c) => c.name === sessionCookie)
   if (left.length) throw new Failure(`the browser still sends ${sessionCookie} to ${env.console} after signing out (now on ${await where(page)})`)
   const again = missed.length ? ` on the second click (${missed.join('; ')})` : ''
@@ -203,7 +205,10 @@ async function clickToSignOut(
   try {
     // Caught here so that a click that fails leaves no rejection unhandled.
     const sent = page.waitForRequest((r) => r.isNavigationRequest() && r.url().startsWith(`${env.auth0}/v2/logout`), { timeout: waitMs }).catch(() => null)
-    await link.click()
+    // A click waits for a navigation that starts as it returns to commit,
+    // which an Auth0 that never answers never does: `sent` waits instead,
+    // within its limit.
+    await link.click({ noWaitAfter: true })
     request = await sent
   } finally {
     page.off('request', onRequest)

@@ -403,8 +403,10 @@ a browser. The browser tests under `test/browser/` take a failed step's masked
 screenshot of a stand-in port page, as the Console lays it out, whose heading,
 labels or key shape have drifted, one or two at a time, and read its pixels
 back: every pixel of the key must be painted over. They also sign out of a
-stand-in Console through a stand-in Auth0 whose `/v2/logout` redirects back,
-or never answers, which must fail the sign-out within its limit.
+stand-in Console, whose link navigates after a fetch as Remix's router does or
+at once, through a stand-in Auth0 whose `/v2/logout` redirects back to a page
+on the Console's origin, which the sign-out must wait for, or never answers,
+which must fail the sign-out within its limit.
 
 ## Workflows
 

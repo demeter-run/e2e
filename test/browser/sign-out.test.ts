@@ -11,17 +11,20 @@ import { type Served, serve } from '../helpers.ts'
  * (`started` in `src/journeys/console.ts`). Its click does what Remix's router
  * does: it fetches `/logout`'s loader, whose answer is a redirect to Auth0,
  * and only then sends the browser to Auth0's `/v2/logout`, after the click has
- * returned. Auth0 answers as `logout` says: with a redirect back, or never.
+ * returned. Or, as `/?at-once` (the fetch done sooner than the click returns),
+ * it sends the browser on before the click returns. Auth0 answers as `logout`
+ * says: with a redirect back, to a page on the Console's origin that answers
+ * a second later, or never.
  */
 
-const consolePage = (auth0: string) => `<!doctype html>
+const consolePage = (auth0: string, atOnce: boolean) => `<!doctype html>
 <a href="/logout">Log out</a>
 <script>
   window.__remixRouter = { state: { initialized: true, navigation: { state: 'idle' } } }
   history.scrollRestoration = 'manual'
   document.querySelector('a').addEventListener('click', async (e) => {
     e.preventDefault()
-    await fetch('/logout?_data=routes%2Flogout')
+    ${atOnce ? '' : "await fetch('/logout?_data=routes%2Flogout')"}
     location.href = '${auth0}/v2/logout'
   })
 </script>`
@@ -40,7 +43,10 @@ describe('signing out', () => {
       if (logout === 'redirect') res.writeHead(302, { location: `${console_.url}/signed-out` }).end()
     })
     console_ = await serve((req, res) => {
-      res.writeHead(200, { 'content-type': 'text/html' }).end(req.url === '/' ? consolePage(auth0.url) : '<!doctype html><p>signed out</p>')
+      const url = new URL(req.url ?? '/', console_.url)
+      if (url.pathname === '/') return void res.writeHead(200, { 'content-type': 'text/html' }).end(consolePage(auth0.url, url.search === '?at-once'))
+      // Slower than the page it came from, which a wait for the origin alone would take for it.
+      setTimeout(() => res.writeHead(200, { 'content-type': 'text/html' }).end('<!doctype html><p>signed out</p>'), 1_000)
     })
   })
   after(async () => {
@@ -50,29 +56,31 @@ describe('signing out', () => {
 
   const env = () => ({ ...environment('production'), console: console_.url, auth0: auth0.url })
 
-  it('follows Auth0 back to where it sends a signed-out browser', async () => {
-    logout = 'redirect'
-    const page = await browser.newPage()
-    try {
-      await page.goto(`${console_.url}/`)
-      assert.equal(await signOut(page, env(), 5_000), `signed out through Auth0's /v2/logout, now on ${console_.url}/signed-out`)
-    } finally {
-      await page.close()
-    }
-  })
+  for (const [how, path] of [['after a fetch', '/'], ['at once', '/?at-once']] as const) {
+    it(`follows Auth0 back to where it sends a signed-out browser, when the link navigates ${how}`, async () => {
+      logout = 'redirect'
+      const page = await browser.newPage()
+      try {
+        await page.goto(`${console_.url}${path}`)
+        assert.equal(await signOut(page, env(), 5_000), `signed out through Auth0's /v2/logout, now on ${console_.url}/signed-out`)
+      } finally {
+        await page.close()
+      }
+    })
 
-  // A request whose answer never comes would hold the clean slate until J2's
-  // 100-minute test timeout.
-  it('fails within its limit when Auth0 never answers', { timeout: 30_000 }, async () => {
-    logout = 'never'
-    const page = await browser.newPage()
-    try {
-      await page.goto(`${console_.url}/`)
-      const t0 = performance.now()
-      await assert.rejects(signOut(page, env(), 3_000), { message: "Auth0's /v2/logout answered nothing, wanted a redirect out of the tenant" })
-      assert.ok(performance.now() - t0 < 10_000, `${Math.round(performance.now() - t0)} ms`)
-    } finally {
-      await page.close()
-    }
-  })
+    // A request whose answer never comes would hold the clean slate until J2's
+    // 100-minute test timeout, and so would a click left waiting for it.
+    it(`fails within its limit when Auth0 never answers, and the link navigates ${how}`, { timeout: 30_000 }, async () => {
+      logout = 'never'
+      const page = await browser.newPage()
+      try {
+        await page.goto(`${console_.url}${path}`)
+        const t0 = performance.now()
+        await assert.rejects(signOut(page, env(), 3_000), { message: "Auth0's /v2/logout answered nothing, wanted a redirect out of the tenant" })
+        assert.ok(performance.now() - t0 < 10_000, `${Math.round(performance.now() - t0)} ms`)
+      } finally {
+        await page.close()
+      }
+    })
+  }
 })
