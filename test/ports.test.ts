@@ -128,7 +128,7 @@ describe('the node check', () => {
   it('gives up on a node that never answers', async () => {
     const fake = await node(() => undefined)
     try {
-      await assert.rejects(queryTip('unused:9443', { open: fake.open, timeoutMs: 50 }), { message: 'no tip within 0.05 s' })
+      await assert.rejects(queryTip('unused:9443', { open: fake.open, timeoutMs: 1_000 }), { message: 'no tip within 1 s' })
       assert.equal(fake.received.length, 1)
     } finally {
       fake.close()
