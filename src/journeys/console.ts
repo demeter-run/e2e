@@ -194,9 +194,14 @@ export async function deployPort(page: Page, port: string, type: string): Promis
   await visible(page, page.getByText(`${port} port deployed successfully`), `"${port} port deployed successfully" toast`, 60_000)
 }
 
-/** Opens the port's detail page from the ports page ("View details") and reads it. */
+/**
+ * Opens the port's detail page from the ports page ("View details") and reads
+ * it. The port's card wraps its header, the link included, in an `aria-hidden`
+ * element (`components/ports/ResourceCard.tsx`), so the link is found among
+ * hidden roles too.
+ */
 export async function openPort(page: Page, env: Environment): Promise<ConsolePort> {
-  await (await visible(page, page.getByRole('link', { name: 'View details' }), '"View details" link on the port')).click()
+  await (await visible(page, page.getByRole('link', { name: 'View details', exact: true, includeHidden: true }), '"View details" link on the port')).click()
   const url = await arrives(page, (u) => u.origin === env.console && /^\/[^/]+\/resources\/[^/]+\/detail$/.test(u.pathname), "the port's detail page")
   return {
     id: url.pathname.split('/')[3]!,

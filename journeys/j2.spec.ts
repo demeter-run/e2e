@@ -252,6 +252,7 @@ test('j2', async ({ browser }) => {
 // ogmios/operator/src/metrics.rs:106, utxorpc/operator/src/metrics.rs:168): a
 // wrong key must answer 401, which is never billed.
 test('j2-401', async () => {
+  test.setTimeout(2 * 60_000)
   const run = new Run('j2-401', env.name)
   await stepsOf(run)(`a key with its last character changed: GET ${firstCall} answers 401`, async () => {
     if (!port) throw new NotRun('J2 deployed no port')
@@ -270,6 +271,7 @@ test('j2-401', async () => {
 // under every replica's share, so bursts repeat until one answers 429. None
 // may answer 5xx.
 test('j2-429', async () => {
+  test.setTimeout(3 * 60_000)
   const run = new Run('j2-429', env.name)
   await stepsOf(run)(`bursts of 30 concurrent GET ${firstCall} answer 429, and no 5xx`, async () => {
     if (!port) throw new NotRun('J2 deployed no port')
@@ -294,11 +296,17 @@ test('j2-429', async () => {
 // `account/app/services/session.server.ts` in solution/marketing/website). A
 // browser holding the legacy app's cookie must still reach the Console.
 test('j2-legacy-cookie', async () => {
+  test.setTimeout(8 * 60_000)
   const run = new Run('j2-legacy-cookie', env.name)
   const step = stepsOf(run)
   let legacy = false
   await step(`sign in through the legacy app at ${env.website}/auth`, async () => {
     if (!page || !namespace) throw new NotRun('J2 left no signed-in session')
+    // The legacy app reads the Console's cookie as its own session: holding
+    // it, /auth sends the browser straight to / as signed in and writes
+    // nothing (run 39410716098). Without it, the legacy app signs the browser
+    // in through Auth0's session, which J2 left, and writes its own.
+    await page.context().clearCookies({ name: sessionCookie })
     // Caught here so that a navigation that fails leaves no rejection unhandled.
     const callback = page.waitForResponse((r) => r.url().startsWith(`${env.website}/callbacks/auth0`), { timeout: 60_000 }).catch(() => null)
     await page.goto(`${env.website}/auth`, { waitUntil: 'commit', timeout: 30_000 })
