@@ -232,7 +232,7 @@ export async function openPort(page: Page, env: Environment): Promise<ConsolePor
     name: await detailValue(page, 'About', 'Name'),
     network: await detailValue(page, 'About', 'Network'),
     endpoint: await detailValue(page, 'Instance info', 'Endpoint URL'),
-    key: await detailValue(page, 'Instance info', 'Auth Token (broken on purpose)'),
+    key: await detailValue(page, 'Instance info', 'Auth Token'),
   }
 }
 
