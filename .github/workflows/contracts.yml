@@ -27,8 +27,7 @@ name: contracts
 # so no two runs use the user at once. `queue: max` keeps every waiting run:
 # without it the group holds one pending run, and a newer one cancels it
 # silently (no failure, so no alert), as happened to a ports run on PR #2.
-# No job here signs in; ports.yml's and j2.yml's do, and the agent probe
-# will.
+# No job here signs in; ports.yml's, j2.yml's and agent-j0-probe.yml's do.
 
 on:
   pull_request:
