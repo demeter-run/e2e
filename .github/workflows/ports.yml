@@ -1,0 +1,125 @@
+name: ports
+
+# The port suite: fabric's daily test/e2e, embedded. It signs in as the
+# standing test user (e2e@txpipe.io), creates a project, creates each port kind
+# and checks it answers from the chain tip, then deletes the project, pass or
+# fail. Report-only: nothing here is a required status.
+#
+# - Daily at 10:00 UTC and on dispatch: alerting IRM on a failure. fabric's own
+#   12:00 run has started between 15:18 and 16:42 UTC, as GitHub delays
+#   scheduled runs; 10:00 keeps clear of it while both exist. Only runs of main
+#   hold the webhook, so a dispatch on a branch logs that its alert was skipped.
+# - On pull requests that change what the suite runs (src/, the toolchain, the
+#   dependencies), from this repository only: the same run against
+#   production, no alert, so a change is proven before it merges.
+#   GitHub dispatches only workflows already on the default branch.
+# - When an alerting run fails before the suite starts (checkout, install), one
+#   `e2e-ports-setup` alert says so: no port was checked, and no suite alert
+#   would fire.
+#
+# Every run signs in as the test user, so the job shares the
+# `production-test-user` concurrency group with every other job that does.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/ports.yml
+      - src/**
+      - .nvmrc
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: Fail the run on purpose, to prove the alert path
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  ports:
+    name: Port suite against production
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: production-test-user
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - id: checkout
+        uses: actions/checkout@v4
+
+      - id: pnpm
+        uses: pnpm/action-setup@v4
+
+      - id: node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - id: install
+        run: pnpm install --frozen-lockfile
+
+      - id: ports
+        name: Run the port suite against production
+        env:
+          E2E_USER_PASSWORD: ${{ secrets.E2E_USER_PASSWORD }}
+          AUTH0_CLIENT_ID: ${{ secrets.AUTH0_CLIENT_ID }}
+          AUTH0_CLIENT_SECRET: ${{ secrets.AUTH0_CLIENT_SECRET }}
+          IRM_E2E_WEBHOOK_URL: ${{ github.ref == 'refs/heads/main' && secrets.IRM_E2E_WEBHOOK_URL || '' }}
+          ALERT: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          FORCE_FAIL: ${{ inputs.force_fail == true }}
+        run: |
+          args=(--env production)
+          if [[ "$ALERT" == true ]]; then args+=(--alert); fi
+          if [[ "$FORCE_FAIL" == true ]]; then args+=(--force-fail); fi
+          pnpm ports "${args[@]}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ports-results
+          path: results/
+          if-no-files-found: ignore
+
+      # Only when the suite never started: a failed suite has posted its own
+      # alert. Posted with curl and jq, in the shape src/report.ts sends; the
+      # webhook URL goes to curl on stdin, never on a command line or in the log.
+      - name: Alert when setup failed
+        if: >-
+          failure() && steps.ports.outcome == 'skipped'
+          && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        env:
+          IRM_E2E_WEBHOOK_URL: ${{ github.ref == 'refs/heads/main' && secrets.IRM_E2E_WEBHOOK_URL || '' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OUTCOMES: |-
+            checkout ${{ steps.checkout.outcome }}
+            pnpm setup ${{ steps.pnpm.outcome }}
+            Node setup ${{ steps.node.outcome }}
+            install ${{ steps.install.outcome }}
+        run: |
+          failed=$(awk '$NF == "failure" { sub(/ [^ ]+$/, ""); print; exit }' <<<"$OUTCOMES")
+          if [[ -z "$IRM_E2E_WEBHOOK_URL" ]]; then
+            echo "alert skipped for ports setup: IRM_E2E_WEBHOOK_URL is not set"
+            exit 0
+          fi
+          jq -n --arg step "${failed:-a setup step}" --arg link "$RUN_URL" '{
+            alert_uid: "e2e-ports-setup",
+            title: "e2e ports setup failed (production)",
+            message: "\($step) failed before the port suite started, so no port was checked.",
+            state: "alerting",
+            link_to_upstream_details: $link
+          }' > "$RUNNER_TEMP/setup-alert.json"
+          if status=$(printf 'url = "%s"\n' "$IRM_E2E_WEBHOOK_URL" | curl -K - -s -o /dev/null -w '%{http_code}' \
+                --max-time 15 -H 'content-type: application/json' --data-binary "@$RUNNER_TEMP/setup-alert.json"); then
+            if [[ "$status" == 2* ]]; then echo "alert sent for ports setup"; else echo "alert failed with HTTP $status for ports setup"; fi
+          else
+            echo "alert failed for ports setup: curl exited $?"
+          fi

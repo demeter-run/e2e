@@ -1,8 +1,9 @@
 # e2e
 
-Developer journey end-to-end tests for Demeter, run against production, and the
+Developer journey end-to-end tests for Demeter, run against production, the
 contract checks that fail when website2, the Console and fabric drift apart in
-production.
+production, and the daily port suite that creates each kind of port and checks
+it answers from the chain tip.
 
 **This repository tests live surfaces only.** It reads what is deployed, over
 HTTP and in a browser, and nothing else: it clones, vendors and reads no
@@ -10,9 +11,11 @@ product repository, and it gates no other repository's pull requests. Each
 product repository keeps its own static checks. Drift between surfaces is
 caught here, afterwards, against production.
 
-Today it holds the harness and three contract checks. The journeys (a person's
-path from `demeter.run` to a first request, and an agent's) build on the same
-harness.
+Today it holds the harness, three contract checks and the port suite. The
+port suite is the one part that writes: as the standing test user, it creates
+a project and its ports through fabric's API, and deletes them. The journeys
+(a person's path from `demeter.run` to a first request, and an agent's) build
+on the same harness.
 
 Every check is **report-only**: a failure shows on this repository's pull
 requests or alerts from a scheduled run, but nothing here is a required status.
@@ -20,8 +23,9 @@ requests or alerts from a scheduled run, but nothing here is a required status.
 ## Setup
 
 Node 22 (`.nvmrc`) and pnpm (the version in `package.json`'s
-`packageManager`; `corepack enable` provides it). No credentials: every
-surface the checks read is public.
+`packageManager`; `corepack enable` provides it). The checks need no
+credentials: every surface they read is public. The port suite signs in (see
+[its section](#the-port-suite)).
 
 ```sh
 pnpm install
@@ -182,6 +186,64 @@ or a refused connection the same way (`src/surfaces/fabric.ts`).
 | 9 | `/assets/logos/favicon.ico` | 200 |
 | 10 | `https://legacy.demeter.run/faq` | 200 |
 
+## The port suite
+
+```sh
+pnpm ports --env production      # takes --alert, --force-fail and --results as pnpm check does
+```
+
+It replaces fabric's daily `test/e2e` (and its `.github/workflows/e2e.yml`),
+doing what that script did, with a gRPC client instead of `grpcurl` and the
+node-to-client protocol instead of `socat` and `cardano-cli`:
+
+1. **Sign in** as the standing test user, `e2e@txpipe.io` (decision 0047):
+   Auth0's password grant on `https://txpipe.us.auth0.com/oauth/token`,
+   audience `demeter-api`, with `E2E_USER_PASSWORD`, `AUTH0_CLIENT_ID` and
+   `AUTH0_CLIENT_SECRET`. Without a token the run ends here.
+2. **Create a project**, `e2e project`, with fabric's
+   `ProjectService/CreateProject` on `rpc.demeter.run:443` (native gRPC),
+   allowed a minute so a slow commit is not a project the run never learns
+   the id of. Without one the run ends here. The run then reads
+   `FetchProjects`, the Console's list, until it lists the project: a
+   project that never shows there would make step 4's check pass vacuously.
+3. **Create each port kind** in that project, mainnet, tier 0, with
+   `ResourceService/CreateResource`, then read it back with
+   `FetchResourcesById` until its spec carries its key (`authToken`), and
+   **check it answers**:
+
+   | Kind | Spec | Passes when |
+   | --- | --- | --- |
+   | `CardanoNodePort` | `version: stable` | a node-to-client connection over TLS to `<key>.cnode-m1.demeter.run:9443` reports a tip whose `syncProgress` (as `cardano-cli query tip` computes it) is 99–100 |
+   | `BlockfrostPort` | `operatorVersion: 1` | `GET https://<key>.blockfrost-m1.demeter.run/blocks/latest` answers a `slot` at the chain tip |
+   | `KupoPort` | `pruneUtxo: true`, `operatorVersion: 1` | `GET https://<key>.mainnet-v2.kupo-m1.demeter.run/health` answers a `most_recent_checkpoint` at the chain tip |
+   | `OgmiosPort` | `version: 6` | `GET https://<key>.cardano-mainnet-v6.ogmios-m1.demeter.run/health` answers a `lastKnownTip.slot` at the chain tip |
+   | `UtxoRpcPort` | `operatorVersion: 1` | `QueryService/ReadParams` on `mainnet.utxorpc-v0.demeter.run:443`, key in `dmtr-api-key`, answers a `ledger_tip.slot` at the chain tip |
+   | `SubmitApiPort` | `operatorVersion: 1` | `POST https://<key>.submitapi-m1.demeter.run/api/submit/tx` with an empty CBOR body answers 400 |
+
+   The node goes first: "at the chain tip" means at or past the node's slot
+   less 120. When the node's port is not created or not synced, the others
+   report the slot they answered and fail, as there is no tip to compare it
+   with. fabric's Mumak
+   and DbSync checks were commented out, and are not here.
+4. **Delete the project**, pass or fail, with `DeleteProject` on the id step 2
+   returned, and only that one: deleting it deletes its ports. A failed delete
+   names the project it left behind. fabric deletes
+   by an event, so the run then reads `FetchProjects`, the Console's list,
+   until the project is gone.
+
+The retry budget is fabric's: five tries, three seconds before each (the node
+check's waits double from three seconds; the Submit API's come between
+tries). A kind that fails does not stop the others, and a request that gets
+no answer names why (DNS, a refused connection, TLS). The run is one result,
+`results/ports.json`, one step per action above, and alerts once, as
+`e2e-ports`. A `--force-fail` run adds the harness's `force-fail` check, so
+it alerts as `e2e-force-fail`, the same alert a forced `pnpm check` run
+posts.
+
+The access token, the three credentials and every port's key are never
+written: a step's detail has each replaced with `***` (`Run.conceal` in
+`src/report.ts`), and in GitHub Actions they are masked in the log too.
+
 ## Results and alerts
 
 Every check and journey writes `results/<name>.json`:
@@ -229,6 +291,26 @@ production.
 
 ## Workflows
 
+`.github/workflows/ports.yml` runs the port suite:
+
+- daily at 10:00 UTC and on `workflow_dispatch` (with the same `force_fail`
+  input): `pnpm ports --env production --alert`, the result file uploaded as
+  the `ports-results` artifact. fabric's `0 12 * * *` run has started between
+  15:18 and 16:42 UTC, as GitHub delays scheduled runs, so 10:00 keeps clear
+  of it while both exist;
+- on pull requests from this repository that change what the suite runs
+  (anything under `src/`, the workflow, `.nvmrc` or the dependencies,
+  `package.json`, `pnpm-lock.yaml` and `pnpm-workspace.yaml`): the same run,
+  no alert, so a change is proven against production before it merges. GitHub
+  dispatches only workflows already on the default branch;
+- when an alerting run fails before the suite starts, one `e2e-ports-setup`
+  alert naming the step.
+
+It runs in the `production-test-user` concurrency group with `queue: max`:
+runs that sign in as the test user wait for each other, and every waiting run
+is kept. By default the group keeps one pending run, and a newer one cancels it
+without failing, so no alert would say that day went unchecked.
+
 `.github/workflows/contracts.yml` runs:
 
 - on `pull_request` and on `push` to `main`: install, typecheck and unit tests
@@ -248,12 +330,13 @@ production.
   what failed.
 
 Any job that signs in as the standing test user sets the concurrency group
-`production-test-user` (`cancel-in-progress: false`), so no two runs use the
-user at once. None does yet.
+`production-test-user` (`cancel-in-progress: false`, `queue: max`), so no two
+runs use the user at once and no waiting run is dropped. The `ports` job does;
+J2 and the agent probe will.
 
 ### Secrets
 
 | Name | Used by | For |
 | --- | --- | --- |
 | `IRM_E2E_WEBHOOK_URL` | scheduled and dispatched runs of `main` | the IRM integration alerts post to |
-| `E2E_USER_PASSWORD`, `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET` | the journeys | signing in as the standing test user |
+| `E2E_USER_PASSWORD`, `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET` | the port suite and the journeys | signing in as the standing test user |

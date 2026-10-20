@@ -95,3 +95,31 @@ export function safeUrl(url: string | null, keep: string[] = []): string {
   const kept = keep.filter((k) => u.searchParams.has(k)).map((k) => `${k}=${u.searchParams.get(k)}`)
   return `${u.origin}${u.pathname}${kept.length ? `?${kept.join('&')}` : ''}`
 }
+
+/**
+ * An error as a step names it: its code and message, `ECONNREFUSED (connect
+ * ECONNREFUSED 10.0.0.1:443)`. Only a string code counts: a timeout's
+ * `DOMException` carries the legacy number 23, so it is named
+ * `TimeoutError`. A connection tried on every address of a dual-stack host
+ * fails with an `AggregateError` whose message is empty and whose attempts
+ * say what happened, so they are its message.
+ */
+export function describeError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error)
+  const { code } = error as { code?: unknown }
+  const attempts = error instanceof AggregateError ? error.errors.map((e) => (e instanceof Error ? e.message : String(e))) : []
+  return `${typeof code === 'string' ? code : error.name} (${error.message || attempts.join('; ')})`
+}
+
+/**
+ * `fetch`, failing as `probe` does: Node's `fetch` rejects with a bare "fetch
+ * failed" and keeps what went wrong (DNS, a refused connection, TLS) in its
+ * `cause`, so the failure names the cause instead.
+ */
+export async function fetchNamingCause(url: string, init: RequestInit, send: typeof fetch = fetch): Promise<Response> {
+  try {
+    return await send(url, init)
+  } catch (error) {
+    throw new Error(describeError((error as Error).cause instanceof Error ? (error as Error).cause : error))
+  }
+}
