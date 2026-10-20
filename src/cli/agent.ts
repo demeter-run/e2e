@@ -3,7 +3,7 @@ import { type Registration, registerWithPort, Secrets } from '../agent/client.ts
 import { contractTests, runContract, type Tag } from '../agent/contract.spec.ts'
 import { j0 } from '../agent/j0.ts'
 import { type Environment, environment, environments } from '../env.ts'
-import { mockCalls } from '../mock/control.ts'
+import { mockCalls, resetMock } from '../mock/control.ts'
 import { alertFailures, formatText, type Result, Run, writeJobSummary, writeResult } from '../report.ts'
 import { TEST_USER } from '../signin.ts'
 
@@ -15,8 +15,9 @@ request it, claim it in the browser, request it again, and, on production,
 delete the claimed project. With --contract it also runs the contract tests on
 the same registration, so a production run registers once.
 
-pnpm contract runs the contract tests alone, on the mock: on production they
-run inside J0, which claims and deletes the registration they use.
+pnpm contract runs the contract tests alone, on the mock, which it resets
+first: on production they run inside J0, which claims and deletes the
+registration they use.
 
 contract tests:
 ${contractTests.map((t) => `  [${t.tag}] ${t.name}`).join('\n')}
@@ -29,7 +30,8 @@ options:
   --force-fail         add a result that fails on purpose, to prove the alert path
   --results <dir>      where result files go (default: results)
 
-On production, J0 signs in as ${TEST_USER} with E2E_USER_PASSWORD.`
+On production, J0 signs in as ${TEST_USER} with E2E_USER_PASSWORD. Without
+it, J0 registers nothing and its one step fails, so the probe's alert says so.`
 
 /** A mistake in the command line: printed with the usage, exit 2. */
 class UsageError extends Error {}
@@ -40,7 +42,8 @@ type Values = { env?: string; contract?: string; tag?: string; alert: boolean; '
  * `pnpm j0` and `pnpm contract`. Writes `results/j0.json` and
  * `results/agent-contract.json`, prints the run, appends the job summary and,
  * with `--alert`, alerts on failures. Returns the exit code: 0 when every
- * result passed, 1 when one failed, 2 on a usage error.
+ * result passed, 1 when one failed (and, with `--alert`, was alerted), 2 on a
+ * usage error.
  */
 export async function main(
   suite: 'j0' | 'contract',
@@ -50,6 +53,7 @@ export async function main(
   let values: Values
   let env: Environment
   let tag: Tag | undefined
+  let noPassword = false
   const password = process.env.E2E_USER_PASSWORD ?? ''
   try {
     const parsed = parseArgs({
@@ -84,8 +88,9 @@ export async function main(
       }
       if (values.contract === 'all' && !onMock) throw new UsageError("the mock-only tests need the mock's error states: --contract prod-safe off the mock")
       if (values.contract === 'prod-safe') tag = 'prod-safe'
-      // A registration nobody can claim would stay behind for 7 days.
-      if (!onMock && !password) throw new UsageError(`J0 claims as ${TEST_USER} off the mock: set E2E_USER_PASSWORD`)
+      // Not a usage error: a probe whose secret is missing must still say so
+      // in a result and an alert.
+      noPassword = !onMock && !password
     } else {
       if (values.contract !== undefined) throw new UsageError('--contract is for pnpm j0; pnpm contract takes --tag')
       if (values.tag !== undefined && values.tag !== 'prod-safe' && values.tag !== 'mock-only') {
@@ -106,7 +111,7 @@ export async function main(
   const secrets = new Secrets()
   secrets.add('password', password)
   const journey = suite === 'j0' ? new Run('j0', env.name) : undefined
-  const contract = suite === 'contract' || values.contract !== undefined ? new Run('agent-contract', env.name) : undefined
+  const contract = !noPassword && (suite === 'contract' || values.contract !== undefined) ? new Run('agent-contract', env.name) : undefined
 
   const runContractOn = async (registration: () => Promise<Registration>) => {
     if (!contract) return
@@ -119,7 +124,12 @@ export async function main(
     }
   }
 
-  if (journey) {
+  if (noPassword) {
+    // A registration nobody can claim would stay behind for 7 days.
+    await journey!.step(`sign in as ${TEST_USER}`, () => {
+      throw new Error(`E2E_USER_PASSWORD is not set, and J0 claims as ${TEST_USER} off the mock, so it registered nothing`)
+    })
+  } else if (journey) {
     try {
       await j0({
         env,
@@ -135,7 +145,10 @@ export async function main(
       })
     }
   } else {
-    // pnpm contract on the mock: the run's own registration, made on first use.
+    // pnpm contract on the mock: from an empty mock, as J0 starts, so no
+    // state another client left on fails a test; then the run's own
+    // registration, made on first use.
+    await contract!.step('start from an empty mock', () => resetMock(env).then(() => 'POST /__mock/reset'))
     let made: Promise<Registration> | undefined
     await runContractOn(() => (made ??= registerWithPort(env, secrets, 'e2e-contract')))
   }

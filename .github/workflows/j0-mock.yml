@@ -58,6 +58,17 @@ jobs:
           mkdir -p results
           curl -sf http://127.0.0.1:4010/__mock/calls > results/mock-calls.json || echo "the mock did not answer"
 
+      # A handler error answers 500 mock_error, which says nothing of why: the
+      # mock writes the error to its log, and the job fails on one.
+      - name: Print the mock's log, and fail on a handler error
+        if: always()
+        run: |
+          cat "$RUNNER_TEMP/mock.log"
+          if grep -q '^mock error: ' "$RUNNER_TEMP/mock.log"; then
+            echo "::error::the mock logged a handler error"
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

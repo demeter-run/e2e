@@ -19,7 +19,9 @@ import * as pages from './pages.ts'
  *   | null, "retry_after_seconds"?: <int>}` makes every call to that route
  *   answer that error (any code in the contract's table), or stops it; with
  *   `{"project": <id or namespace>, "expired": true | false}` it expires a
- *   project or revives it.
+ *   project or revives it. It answers the state after, as `GET
+ *   /__mock/state` does: `{"errors": {<route>: {"error", "retry_after_seconds"?}},
+ *   "expired": [<project id>]}`.
  * - `GET /__mock/calls`: every other call so far, `{method, path, status,
  *   headers}`, with each credential the mock issued replaced by
  *   `[redacted]` and the credential headers redacted whole.
@@ -160,7 +162,8 @@ export interface Mock {
 
 export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: MockOptions = {}): Promise<Mock> {
   let state = freshState()
-  let base = baseUrl ?? ''
+  // Paths are appended to it, so a trailing slash would make them `//claim/…`.
+  let base = (baseUrl ?? '').replace(/\/+$/, '')
 
   /**
    * A logged path or header value without credentials: a claim token and a
@@ -403,6 +406,7 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
 
   async function control(request: IncomingMessage, response: ServerResponse, path: string) {
     if (path === '/__mock/calls' && request.method === 'GET') return sendJson(response, 200, state.calls)
+    if (path === '/__mock/state' && request.method === 'GET') return sendJson(response, 200, snapshot())
     if (path === '/__mock/reset' && request.method === 'POST') {
       state = freshState()
       return sendJson(response, 200, {})
@@ -431,8 +435,19 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
     } else {
       return sendJson(response, 400, { error: 'send {"route", "error"} or {"project", "expired"}' })
     }
-    sendJson(response, 200, { errors: state.errors, expired: state.projects.filter((p) => p.expired).map((p) => p.id) })
+    sendJson(response, 200, snapshot())
   }
+
+  /** The error states and expired projects, in the shape `POST /__mock/state` takes them. */
+  const snapshot = () => ({
+    errors: Object.fromEntries(
+      Object.entries(state.errors).map(([route, { error, retryAfterSeconds }]) => [
+        route,
+        { error, ...(retryAfterSeconds !== undefined ? { retry_after_seconds: retryAfterSeconds } : {}) },
+      ]),
+    ),
+    expired: state.projects.filter((p) => p.expired).map((p) => p.id),
+  })
 
   async function handle(request: IncomingMessage, response: ServerResponse) {
     const url = new URL(request.url ?? '/', 'http://mock')
@@ -449,6 +464,9 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
     })
 
     if (path === '/api/agent/register' || path === '/api/agent/ports') {
+      // The contract defines POST only. Production answers another method
+      // with this 405, except GET and HEAD, which never reach its action:
+      // Remix answers those 400 in plain text, which no test reads.
       if (request.method !== 'POST') return agentError(response, 'invalid_request', { message: 'Use POST with a JSON body.', status: 405 })
       return path === '/api/agent/register' ? register(request, response) : createPort(request, response)
     }
@@ -479,6 +497,9 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
 
   const server = createServer((request, response) => {
     handle(request, response).catch((error: unknown) => {
+      // On stderr, where a run that starts the mock can find it: a 500 alone
+      // says nothing of why.
+      console.error(`mock error: ${request.method} ${scrub(request.url ?? '/')}: ${scrub(error instanceof Error ? (error.stack ?? error.message) : String(error))}`)
       if (!response.headersSent) sendJson(response, 500, { error: 'mock_error', message: error instanceof Error ? error.message : String(error) })
       else response.end()
     })
@@ -486,7 +507,8 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
   server.listen(port, host)
   await once(server, 'listening')
   const address = server.address() as AddressInfo
-  base ||= `http://${host}:${address.port}`
+  // An IPv6 address goes in brackets in a URL.
+  base ||= `http://${host.includes(':') ? `[${host}]` : host}:${address.port}`
 
   return {
     url: base,

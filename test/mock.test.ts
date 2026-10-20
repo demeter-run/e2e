@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { after, before, beforeEach, describe, it } from 'node:test'
+import type { AddressInfo } from 'node:net'
+import { after, before, beforeEach, describe, it, mock as mocks } from 'node:test'
 import { type AgentAnswer, call, createPort, type Credentials, dotenvVars, errorBody, names, register } from '../src/agent/client.ts'
 import { type Environment, environments } from '../src/env.ts'
-import { mockCalls, resetMock, setMockState } from '../src/mock/control.ts'
+import { mockCalls, mockState, resetMock, setMockState } from '../src/mock/control.ts'
 import { type Mock, startMock } from '../src/mock/server.ts'
 
 let mock: Mock
@@ -72,6 +73,8 @@ describe('the mock: register', () => {
     }
     // Characters, not bytes, as the Console counts them.
     assert.equal((await register(env, { name: '🦀'.repeat(64) })).status, 200)
+    assert.deepEqual(codeOf(await register(env, { name: 'ok', url: `https://${'u'.repeat(250)}` })), [400, 'invalid_request'])
+    assert.equal((await register(env, { name: 'ok', url: `https://${'u'.repeat(248)}` })).status, 200)
   })
 
   it('refuses a body that is not JSON with 400, and GET with 405', async () => {
@@ -236,6 +239,17 @@ describe('the mock: claim pages', () => {
     assert.match((await visit('GET', '/activate?code=nope')).body, /That is not a user code/)
   })
 
+  it('sends a signed-out claim to sign in, and claims nothing', async () => {
+    const { vars } = await registered()
+    const claim = new URL(vars.get('DEMETER_CLAIM_URL')!).pathname
+    const visit = browser()
+    const posted = await visit('POST', claim, { name: 'Stolen' })
+    assert.deepEqual([posted.status, posted.headers.location], [302, '/login'])
+    await visit('POST', '/login', { username: 'alice', password: 'x' })
+    assert.match((await visit('GET', claim)).body, /Claim project/)
+    assert.equal((await visit('GET', `/${vars.get('DEMETER_PROJECT_NAMESPACE')}/ports`)).status, 404)
+  })
+
   it("keeps another user's ports page from a signed-in stranger, and sends the signed-out to sign in", async () => {
     const { vars } = await registered()
     const namespace = vars.get('DEMETER_PROJECT_NAMESPACE')!
@@ -250,6 +264,35 @@ describe('the mock: claim pages', () => {
 })
 
 describe('the mock: control routes', () => {
+  it('answers the error states and expired projects it holds, in the shape it takes them', async () => {
+    const { vars } = await registered()
+    await setMockState(env, { route: 'register', error: 'ip_cap', retry_after_seconds: 90 })
+    await setMockState(env, { route: 'ports', error: 'global_cap' })
+    await setMockState(env, { project: vars.get('DEMETER_PROJECT_ID')!, expired: true })
+    assert.deepEqual(await mockState(env), {
+      errors: { register: { error: 'ip_cap', retry_after_seconds: 90 }, ports: { error: 'global_cap' } },
+      expired: [vars.get('DEMETER_PROJECT_ID')],
+    })
+    await resetMock(env)
+    assert.deepEqual(await mockState(env), { errors: {}, expired: [] })
+  })
+
+  it('answers a handler error 500 and writes it to stderr without its credentials', async () => {
+    const error = mocks.method(console, 'error', () => {})
+    try {
+      const { vars } = await registered()
+      const claim = new URL(vars.get('DEMETER_CLAIM_URL')!).pathname
+      // A cookie that does not decode breaks the handler.
+      const answer = await call('GET', `${mock.url}${claim}`, { headers: { cookie: 'mock_session=%E0%A4%A' } })
+      assert.deepEqual(codeOf(answer), [500, 'mock_error'])
+      const logged = String(error.mock.calls[0]?.arguments[0])
+      assert.match(logged, /^mock error: GET \/claim\/\[redacted\]: URIError/)
+      assert.ok(!logged.includes(claim.slice(7)), 'stderr carries the claim token')
+    } finally {
+      error.mock.restore()
+    }
+  })
+
   it('logs every call but its own, with credentials redacted, and forgets everything on reset', async () => {
     const { vars, credentials } = await registered()
     const port = dotenvVars((await createPort(env, credentials, BLOCKFROST)).body)
@@ -282,5 +325,34 @@ describe('the mock: control routes', () => {
     await resetMock(env)
     assert.deepEqual(await mockCalls(env), [])
     assert.deepEqual(codeOf(await createPort(env, credentials, BLOCKFROST)), [401, 'unauthenticated'])
+  })
+})
+
+describe('the mock: where it says it is', () => {
+  it('writes claim and port URLs under --base-url, without a trailing slash', async () => {
+    const other = await startMock({ port: 0, baseUrl: 'http://mock.example:4020/' })
+    try {
+      assert.equal(other.url, 'http://mock.example:4020')
+      const { port } = other.server.address() as AddressInfo
+      const answer = await call('POST', `http://127.0.0.1:${port}/api/agent/register`, { body: JSON.stringify({ agent: { name: 'a' } }) })
+      assert.match(dotenvVars(answer.body).get('DEMETER_CLAIM_URL')!, /^http:\/\/mock\.example:4020\/claim\/[A-Za-z0-9_-]{43}$/)
+    } finally {
+      await other.close()
+    }
+  })
+
+  it('brackets an IPv6 address in its URL', async (t) => {
+    let other: Mock
+    try {
+      other = await startMock({ port: 0, host: '::1' })
+    } catch {
+      return t.skip('no IPv6 loopback here')
+    }
+    try {
+      assert.match(other.url, /^http:\/\/\[::1\]:\d+$/)
+      assert.equal((await call('GET', `${other.url}/__mock/calls`)).status, 200)
+    } finally {
+      await other.close()
+    }
   })
 })

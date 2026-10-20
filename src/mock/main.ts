@@ -11,7 +11,18 @@ options:
   --host <address>    the address to listen on (default 127.0.0.1)
   --base-url <url>    the origin written into claim and port URLs (default http://<host>:<port>)
 
-\`--env mock\` reads its URL from E2E_MOCK_URL (default http://127.0.0.1:4010).`
+\`--env mock\` reads its URL from E2E_MOCK_URL (default http://127.0.0.1:4010);
+with --base-url, set E2E_MOCK_URL to the same origin.`
+
+/** An http(s) URL with no path but `/`, no query and no fragment: what claim and port URLs are written under. */
+function isOrigin(text: string): boolean {
+  try {
+    const url = new URL(text)
+    return (url.protocol === 'http:' || url.protocol === 'https:') && url.pathname === '/' && !url.search && !url.hash
+  } catch {
+    return false
+  }
+}
 
 let values: { port: string; host: string; 'base-url'?: string; help: boolean }
 try {
@@ -37,6 +48,12 @@ if (!Number.isInteger(port) || port < 0 || port > 65535) {
   process.exit(2)
 }
 
-const mock = await startMock({ port, host: values.host, ...(values['base-url'] ? { baseUrl: values['base-url'] } : {}) })
+const baseUrl = values['base-url']
+if (baseUrl !== undefined && !isOrigin(baseUrl)) {
+  console.error(`--base-url ${baseUrl} is not an http(s) origin, such as http://mock.local:4020\n\n${usage}`)
+  process.exit(2)
+}
+
+const mock = await startMock({ port, host: values.host, ...(baseUrl ? { baseUrl } : {}) })
 console.log(`mock listening on ${mock.url}`)
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => void mock.close().then(() => process.exit(0)))

@@ -125,27 +125,46 @@ export function credentials(registration: Registration): Credentials | null {
  */
 export async function registerWithPort(env: Environment, secrets: Secrets, name: string): Promise<Registration> {
   const answer = await register(env, { name })
-  addRegistrationSecrets(secrets, dotenvVars(answer.body))
+  addRegistrationSecrets(secrets, answer.body)
   const made = credentials({ register: answer, port: null })
   const port = made ? await createPort(env, made, { ...J0_PORT }) : null
-  if (port) addPortSecrets(secrets, dotenvVars(port.body))
+  if (port) addPortSecrets(secrets, port.body)
   return { register: answer, port }
 }
 
-/** A dotenv body's lines, in order. A line that is not `NAME=value` is kept with a null value, so the order check sees it. */
+/**
+ * A dotenv body's lines, in order, read strictly: as the contract writes
+ * them, `NAME=value` and LF. Any other line is kept with a null value, so the
+ * order check sees it, and named by what may be printed: the name it seems to
+ * carry, never the rest, which may be a credential.
+ */
 export function parseDotenv(body: string): { name: string; value: string | null }[] {
   return body
     .split('\n')
     .filter((line) => line !== '')
     .map((line) => {
       const match = /^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line)
-      return match ? { name: match[1]!, value: match[2]! } : { name: line.slice(0, 40), value: null }
+      if (match) return { name: match[1]!, value: match[2]! }
+      const seems = /^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=/.exec(line)?.[1]
+      return { name: seems ? `${seems} (not NAME=value)` : '(a line that is not NAME=value)', value: null }
     })
 }
 
-/** A dotenv body as a map from name to value. */
-export const dotenvVars = (body: string): Map<string, string> =>
-  new Map(parseDotenv(body).flatMap(({ name, value }) => (value === null ? [] : [[name, value] as const])))
+/**
+ * A dotenv body as a map from name to value, read as leniently as an agent's
+ * dotenv loader would (CRLF, `export `, spaces around `=`, quotes), so a body
+ * that drifts in form still hands every credential to `Secrets`.
+ */
+export function dotenvVars(body: string): Map<string, string> {
+  const vars = new Map<string, string>()
+  for (const line of body.split(/\r?\n/)) {
+    const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line)
+    if (!match) continue
+    const value = match[2]!
+    vars.set(match[1]!, /^(["']).*\1$/.test(value) ? value.slice(1, -1) : value)
+  }
+  return vars
+}
 
 /** The line names of a dotenv body, which a step may print. */
 export const names = (body: string): string[] => parseDotenv(body).map((l) => l.name)
@@ -208,23 +227,58 @@ export class Secrets {
   }
 }
 
-/** Registers the credentials a register body hands out. */
-export function addRegistrationSecrets(secrets: Secrets, vars: Map<string, string>): void {
+/** A URL component as it may also be printed, decoded; itself when it does not decode. */
+const decoded = (text: string): string => {
+  try {
+    return decodeURIComponent(text)
+  } catch {
+    return text
+  }
+}
+
+/**
+ * Whatever in a body has a credential's shape, by name or not: every
+ * `dmtr_…` key, so a body that drifts in form still hands its keys over.
+ */
+function addKeyShapes(secrets: Secrets, kind: string, body: string): void {
+  for (const [key] of body.matchAll(/dmtr_[0-9a-z]+/g)) secrets.add(kind, key)
+}
+
+/**
+ * Registers the credentials a register body hands out: the API key, the claim
+ * URL whole and its token wherever it sits (the path, or any query value),
+ * and the user code with and without its hyphen.
+ */
+export function addRegistrationSecrets(secrets: Secrets, body: string): void {
+  const vars = dotenvVars(body)
   secrets.add('API key', vars.get('DEMETER_API_KEY'))
   const claimUrl = vars.get('DEMETER_CLAIM_URL')
   if (claimUrl) {
-    const token = /\/claim\/([^/?#]+)/.exec(claimUrl)?.[1]
-    if (token) {
+    secrets.add('claim token', claimUrl)
+    // As written, and decoded: the last path segment and every query value.
+    let tokens: string[] = []
+    try {
+      const url = new URL(claimUrl)
+      const query = url.search.slice(1).split('&').map((pair) => pair.slice(pair.indexOf('=') + 1))
+      tokens = [url.pathname.split('/').filter(Boolean).at(-1) ?? '', ...query]
+    } catch {
+      tokens = [/\/claim\/([^/?#\s]+)/.exec(claimUrl)?.[1] ?? '']
+    }
+    for (const token of tokens) {
       secrets.add('claim token', token)
-      secrets.add('claim token', decodeURIComponent(token))
+      secrets.add('claim token', decoded(token))
+      secrets.add('claim token', decoded(token.replace(/\+/g, ' ')))
     }
   }
-  secrets.add('user code', vars.get('DEMETER_USER_CODE'))
+  const code = vars.get('DEMETER_USER_CODE')
+  secrets.add('user code', code)
+  secrets.add('user code', code?.replace('-', ''))
+  addKeyShapes(secrets, 'API key', body)
 }
 
-/** Registers the credentials a ports body hands out: every key, and every URL that may carry one. */
-export function addPortSecrets(secrets: Secrets, vars: Map<string, string>): void {
-  for (const [name, value] of vars) {
+/** Registers the credentials a ports body hands out: every `_KEY`, and the password part of db-sync's. */
+export function addPortSecrets(secrets: Secrets, body: string): void {
+  for (const [name, value] of dotenvVars(body)) {
     if (name.endsWith('_KEY')) {
       secrets.add('port key', value)
       // db-sync's is username:password; the password alone is the secret part.
@@ -232,4 +286,5 @@ export function addPortSecrets(secrets: Secrets, vars: Map<string, string>): voi
       if (password) secrets.add('port key', password)
     }
   }
+  addKeyShapes(secrets, 'port key', body)
 }

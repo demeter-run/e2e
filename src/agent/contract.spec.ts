@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import type { Environment } from '../env.ts'
-import { setMockState } from '../mock/control.ts'
+import { catalog, preClaimNetworks } from '../mock/catalog.ts'
+import { mockState, setMockState } from '../mock/control.ts'
+import { errorStatus } from '../mock/server.ts'
 import { Failure, type Run } from '../report.ts'
 import {
   type AgentAnswer,
@@ -112,18 +114,18 @@ async function credentialsOf(ctx: ContractContext) {
 async function registerOwn(ctx: ContractContext, name: string) {
   const answer = await register(ctx.env, { name })
   if (answer.status !== 200) fail(`register answered ${describe(answer)}, wanted 200`)
-  const vars = dotenvVars(answer.body)
-  addRegistrationSecrets(ctx.secrets, vars)
+  addRegistrationSecrets(ctx.secrets, answer.body)
   return credentials({ register: answer, port: null }) ?? fail('register answered 200 without DEMETER_API_KEY and DEMETER_PROJECT_ID')
 }
 
-/** Switches a mock error state on for `fn`, and off after it, pass or fail. */
+/** Switches a mock error state on for `fn`, and back to the route's previous state after it, pass or fail. */
 async function withMockError(ctx: ContractContext, state: { route: 'register' | 'ports'; error: 'ip_cap' | 'global_cap' | 'registration_disabled'; retry_after_seconds?: number }, fn: () => Promise<string>) {
+  const before = (await mockState(ctx.env)).errors[state.route]
   await setMockState(ctx.env, state)
   try {
     return await fn()
   } finally {
-    await setMockState(ctx.env, { route: state.route, error: null })
+    await setMockState(ctx.env, { route: state.route, ...(before ?? { error: null }) })
   }
 }
 
@@ -186,7 +188,7 @@ test('ports answers a dotenv body of _PORT_ID, _URL (then _URL_2, _URL_3…) and
 // expires in 7 days: a broken rule is worth that one.
 test('a 65-character agent name is 400 invalid_request', 'prod-safe', async (ctx) => {
   const answer = await register(ctx.env, { name: 'e2e-j0-'.padEnd(65, 'x') })
-  if (answer.status === 200) addRegistrationSecrets(ctx.secrets, dotenvVars(answer.body))
+  if (answer.status === 200) addRegistrationSecrets(ctx.secrets, answer.body)
   expectError(answer, 400, 'invalid_request', ctx.secrets)
   return describe(answer)
 })
@@ -200,14 +202,14 @@ test('a bad API key on /ports is 401 unauthenticated', 'prod-safe', async (ctx) 
 
 test('a mainnet port is 403 pre_claim_limit', 'prod-safe', async (ctx) => {
   const answer = await createPort(ctx.env, await credentialsOf(ctx), { kind: J0_PORT.kind, network: 'cardano-mainnet' })
-  if (answer.status === 200) addPortSecrets(ctx.secrets, dotenvVars(answer.body))
+  if (answer.status === 200) addPortSecrets(ctx.secrets, answer.body)
   expectError(answer, 403, 'pre_claim_limit', ctx.secrets)
   return describe(answer)
 })
 
 test('a tier other than 0 is 403 pre_claim_limit', 'prod-safe', async (ctx) => {
   const answer = await createPort(ctx.env, await credentialsOf(ctx), { ...J0_PORT, throughputTier: '1' })
-  if (answer.status === 200) addPortSecrets(ctx.secrets, dotenvVars(answer.body))
+  if (answer.status === 200) addPortSecrets(ctx.secrets, answer.body)
   expectError(answer, 403, 'pre_claim_limit', ctx.secrets)
   return describe(answer)
 })
@@ -216,6 +218,36 @@ test('an unknown port kind is 400 invalid_request', 'prod-safe', async (ctx) => 
   const answer = await createPort(ctx.env, await credentialsOf(ctx), { kind: 'NoSuchPort', network: J0_PORT.network })
   expectError(answer, 400, 'invalid_request', ctx.secrets)
   return describe(answer)
+})
+
+// The mock's copy of fabric's catalog (`src/mock/catalog.ts`) against the
+// environment's, read without creating anything: a request with a key no
+// project holds passes every check the Console makes before fabric's, so a
+// kind with an option on the network is refused only for its key (401), a
+// kind without one is 403 and an unknown kind 400. The unknown kind's message
+// names every kind the Console knows, which catches a kind the mock lacks.
+test("the port catalog on preprod and preview is the mock's", 'prod-safe', async (ctx) => {
+  const projectId = credentials(await ctx.registration())?.projectId ?? randomUUID()
+  const problems: string[] = []
+  for (const network of preClaimNetworks) {
+    for (const [kind, networks] of Object.entries(catalog)) {
+      const want = networks.includes(network) ? 'unauthenticated' : 'pre_claim_limit'
+      const answer = await createPort(ctx.env, { apiKey: BAD_KEY, projectId }, { kind, network })
+      if (answer.status === 200) addPortSecrets(ctx.secrets, answer.body)
+      if (errorBody(answer)?.error !== want) problems.push(`${kind} on ${network} answered ${describe(answer)}, wanted ${errorStatus[want]} ${want}`)
+    }
+  }
+  const unknown = await createPort(ctx.env, { apiKey: BAD_KEY, projectId }, { kind: 'NoSuchPort', network: J0_PORT.network })
+  const listed = /use one of ([A-Za-z, ]+)\.$/.exec(errorBody(unknown)?.message ?? '')?.[1]?.split(', ')
+  if (!listed) problems.push(`an unknown kind answered ${describe(unknown)} with no list of kinds, so a kind the mock lacks would go unseen`)
+  else {
+    const extra = listed.filter((kind) => !Object.hasOwn(catalog, kind))
+    const missing = Object.keys(catalog).filter((kind) => !listed.includes(kind))
+    if (extra.length) problems.push(`the Console knows ${extra.join(', ')}, which the mock does not`)
+    if (missing.length) problems.push(`the mock knows ${missing.join(', ')}, which the Console does not`)
+  }
+  if (problems.length) fail(problems.join('\n'))
+  return `${Object.keys(catalog).length} kinds on ${preClaimNetworks.join(' and ')}, as the mock has them`
 })
 
 test('an error body is JSON with error, message and docs, and never carries the key', 'prod-safe', async (ctx) => {
@@ -246,7 +278,7 @@ test('the fourth port of an unclaimed project is 429 port_cap', 'mock-only', asy
   for (const port of ports) {
     const answer = await createPort(ctx.env, own, port)
     if (answer.status !== 200) fail(`${port.kind} on ${port.network} answered ${describe(answer)}, wanted 200 before the cap`)
-    addPortSecrets(ctx.secrets, dotenvVars(answer.body))
+    addPortSecrets(ctx.secrets, answer.body)
   }
   const fourth = await createPort(ctx.env, own, { kind: 'UtxoRpcPort', network: 'cardano-preview' })
   expectError(fourth, 429, 'port_cap', ctx.secrets)

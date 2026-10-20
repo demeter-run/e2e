@@ -1,3 +1,4 @@
+import { rmSync } from 'node:fs'
 import { appendFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -29,7 +30,7 @@ import {
  *
  * The agent keeps what it is given where an agent would: in a `.env.demeter`
  * of its own, in a fresh temporary directory, readable by this user only,
- * never printed, and removed at the end.
+ * never printed, and removed at the end, or on SIGINT or SIGTERM.
  */
 
 export interface J0Options {
@@ -58,6 +59,29 @@ const fail = (message: string): never => {
 }
 
 const seconds = (ms: number) => `${(ms / 1000).toFixed(1)} s`
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * The browser's cookies, for `Secrets`: a Playwright error's call log
+ * carries the request's `cookie:` header, the Console session included.
+ * Short values (flags, `Lax`) are not credentials.
+ */
+async function addCookieSecrets(context: BrowserContext, secrets: Secrets): Promise<void> {
+  for (const cookie of await context.cookies()) if (cookie.value.length >= 16) secrets.add('session cookie', cookie.value)
+}
+
+/**
+ * A Playwright call that may fail with its call log (request headers, the
+ * cookie among them): the step keeps the first line, scrubbed.
+ */
+async function guarded<T>(secrets: Secrets, what: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn()
+  } catch (error) {
+    return fail(secrets.scrub(`${what}: ${(error as Error).message.split('\n')[0]}`))
+  }
+}
 
 /**
  * Requests `url` with the port's key until it answers 2xx or `withinMs` runs
@@ -97,11 +121,22 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
   let namespace = ''
   let expiresAt = ''
   let portId = ''
+  /** Set when the claim button was pressed, whether or not the landing followed. */
+  let claimSent = false
   let claimed = false
   let browser: Browser | undefined
   let context: BrowserContext | undefined
   /** Positions in the mock's call log around `between`, whose calls are not J0's. */
   let skip: [number, number] | undefined
+
+  // A cancelled run skips `finally`: the .env.demeter goes before the signal
+  // takes its default course.
+  const onSignal = (signal: NodeJS.Signals) => {
+    rmSync(dir, { recursive: true, force: true })
+    process.kill(process.pid, signal)
+  }
+  process.once('SIGINT', onSignal)
+  process.once('SIGTERM', onSignal)
 
   try {
     if (onMock) await run.step('start from an empty mock', () => resetMock(env).then(() => 'POST /__mock/reset'))
@@ -112,7 +147,7 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
       const answer = registration.register
       if (answer.status !== 200) fail(`register answered ${describe(answer)}, wanted 200`)
       const got = dotenvVars(answer.body)
-      addRegistrationSecrets(secrets, got)
+      addRegistrationSecrets(secrets, answer.body)
       await writeFile(envFile, answer.body, { mode: 0o600 })
       namespace = got.get('DEMETER_PROJECT_NAMESPACE') ?? ''
       expiresAt = got.get('DEMETER_EXPIRES_AT') ?? ''
@@ -128,7 +163,7 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
       registration.port = await createPort(env, { apiKey, projectId }, { ...J0_PORT })
       const answer = registration.port
       if (answer.status !== 200) fail(`ports answered ${describe(answer)}, wanted 200`)
-      addPortSecrets(secrets, dotenvVars(answer.body))
+      addPortSecrets(secrets, answer.body)
       await appendFile(envFile, answer.body)
       portId = (await vars()).get(`${PREFIX}_PORT_ID`) ?? ''
       return `200 in ${seconds(performance.now() - t0)}: port ${portId || '(no id)'}`
@@ -157,6 +192,10 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
 
     await run.step(`claim in the browser as ${onMock ? 'a mock user' : user}`, async () => {
       const claimUrl = (await vars()).get('DEMETER_CLAIM_URL') ?? fail('.env.demeter has no DEMETER_CLAIM_URL: register failed')
+      // The browser goes only to the Console: the claim page leads to the
+      // sign-in, where the test user's password is typed.
+      const claimOrigin = URL.canParse(claimUrl) ? new URL(claimUrl).origin : '(not a URL)'
+      if (claimOrigin !== new URL(env.console).origin) fail(`DEMETER_CLAIM_URL is on ${claimOrigin}, not the Console (${env.console}), so the browser does not open it`)
       const t0 = performance.now()
       browser = await chromium.launch()
       context = await browser.newContext()
@@ -164,11 +203,13 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
       try {
         await page.goto(claimUrl, { waitUntil: 'domcontentloaded' })
         await page.getByRole('link', { name: 'Log in' }).click()
-        await signIn(page, user, password)
+        await signIn(page, user, password, { origin: env.auth0 })
+        await addCookieSecrets(context, secrets)
         const claim = page.getByRole('button', { name: 'Claim project' })
         await claim.waitFor({ timeout: 30_000 })
         const name = await page.locator('input[name="name"]').inputValue()
         if (name !== namespace) fail(`the project name defaults to "${name}", wanted the namespace ${namespace}`)
+        claimSent = true
         await claim.click()
         await page.waitForURL((url) => url.pathname === `/${namespace}/ports`, { timeout: 30_000 })
         claimed = true
@@ -177,6 +218,7 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
         // A Playwright error carries a call log and URLs with their queries
         // (Auth0's state); the first line and where the browser was are enough.
         // Either may hold the claim URL, so neither leaves unscrubbed.
+        if (context) await addCookieSecrets(context, secrets).catch(() => {})
         const here = new URL(page.url())
         fail(secrets.scrub(`${(error as Error).message.split('\n')[0]} (the browser was at ${here.origin}${here.pathname})`))
       }
@@ -214,27 +256,91 @@ export async function j0({ env, run, secrets, user, password, between, firstRequ
       })
     } else {
       await run.step('delete the claimed project through the Console', async () => {
-        if (registration.register.status !== 200) return 'nothing was registered, so nothing is left behind'
+        const registered = registration.register
+        if (registered.status !== 200) {
+          // A refusal registered nothing; a timeout or a 5xx may have, without
+          // handing its credentials over.
+          return registered.status !== null && registered.status < 500
+            ? `register answered ${describe(registered)}: nothing was registered, so nothing is left behind`
+            : `register answered ${describe(registered)}: a project may have been registered without this run learning it, and if so it expires unclaimed within 7 days`
+        }
         if (!namespace) fail('register answered 200 but named no namespace, so nothing can be deleted')
-        if (!claimed || !context) fail(`${namespace} was not claimed, so it cannot be deleted: it expires unclaimed at ${expiresAt}`)
-        // The settings page's DELETE button posts this form. The browser would
-        // then follow the redirect to /, whose loader creates "My First
-        // Project" for a user left with no project, so the post is sent
-        // without following it.
+        if (!claimSent || !context) fail(`${namespace} was never claimed: it expires unclaimed at ${expiresAt}`)
+        const session = context!
+        await addCookieSecrets(session, secrets)
+        const portsPage = `${env.console}/${namespace}/ports`
+        const get = (url: string) => guarded(secrets, `GET ${new URL(url).pathname}`, () => session.request.get(url, { maxRedirects: 0 }))
+        const redirectedTo = (answer: { headers(): Record<string, string> }) => new URL(answer.headers().location ?? '/', env.console).pathname
+
+        // The project must be the test user's to be deleted. A claim whose
+        // landing failed may still have gone through: it gets the landing's time.
+        if (!claimed) {
+          const t0 = performance.now()
+          for (;;) {
+            const page = await get(portsPage)
+            if (page.status() === 200) break
+            if (performance.now() - t0 > 30_000) {
+              fail(
+                `the claim was sent, but /${namespace}/ports answered ${page.status()} for the next 30 s: if the claim went through, ${namespace} is on ${user}'s account and needs deleting by hand; if not, it expires unclaimed at ${expiresAt}`,
+              )
+            }
+            await sleep(3_000)
+          }
+        }
+
+        // The settings page's DELETE button posts this form. Its action answers
+        // a redirect once fabric has taken the delete: to the user's next
+        // project, or to /, whose loader creates "My First Project" for a user
+        // left with none, so the redirect is not followed. A redirect to /login
+        // means the session was refused. A 200 is the action reporting an
+        // error, a 5xx one of its own (fabric's projection may lag the claim),
+        // and a lost answer says nothing: each is tried again, unless the
+        // project's page has stopped loading meanwhile, when the delete went
+        // through without its answer.
         const settings = `${env.console}/${namespace}/settings`
-        const deleted = await context!.request.post(settings, { form: { intent: 'DELETE_PROJECT' }, maxRedirects: 0 })
-        if (deleted.status() !== 302) fail(`POST /${namespace}/settings answered ${deleted.status()}, wanted 302 after the delete`)
-        // fabric deletes on its event stream: the project leaves the Console a moment later.
+        let accepted = ''
+        for (let attempt = 1; !accepted; attempt++) {
+          let answered: string
+          try {
+            const answer = await session.request.post(settings, { form: { intent: 'DELETE_PROJECT' }, maxRedirects: 0 })
+            const to = answer.status() === 302 ? redirectedTo(answer) : ''
+            if (to.startsWith('/login')) fail(`POST /${namespace}/settings redirected to ${to}: the Console refused the session, so ${namespace} is still on ${user}'s account`)
+            if (to) {
+              accepted = `302 to ${to}${attempt > 1 ? ` on attempt ${attempt}` : ''}`
+              break
+            }
+            answered = String(answer.status())
+          } catch (error) {
+            if (error instanceof Failure) throw error
+            answered = secrets.scrub((error as Error).message.split('\n')[0]!)
+          }
+          await sleep(5_000)
+          const page = await get(portsPage)
+          if (page.status() !== 200 && page.status() !== 302) accepted = `${answered} on attempt ${attempt}, then /${namespace}/ports answered ${page.status()}`
+          else if (attempt === 3) fail(`POST /${namespace}/settings answered ${answered} on the last of 3 attempts, wanted a redirect after the delete: ${namespace} is still on ${user}'s account`)
+        }
+
+        // fabric deletes on its event stream: the project leaves the Console a
+        // moment later, and its pages stop loading (fabric no longer knows the
+        // namespace, and the Console answers 500). Two such answers in a row,
+        // so one passing error is not taken for the delete.
         const t0 = performance.now()
+        let gone = 0
         for (;;) {
-          const page = await context!.request.get(`${env.console}/${namespace}/ports`, { maxRedirects: 0 })
-          if (page.status() !== 200) return `deleted; /${namespace}/ports answers ${page.status()} after ${seconds(performance.now() - t0)}`
-          if (performance.now() - t0 > 60_000) fail(`deleted, but /${namespace}/ports still answers 200 after 60 s`)
-          await new Promise((resolve) => setTimeout(resolve, 3_000))
+          const page = await get(portsPage)
+          if (page.status() === 302) {
+            fail(`deleted (${accepted}), but /${namespace}/ports then redirected to ${redirectedTo(page)}, so the session cannot confirm the project is gone`)
+          }
+          gone = page.status() === 200 ? 0 : gone + 1
+          if (gone === 2) return `deleted (${accepted}); /${namespace}/ports answers ${page.status()} twice in a row after ${seconds(performance.now() - t0)}`
+          if (performance.now() - t0 > 60_000) fail(`deleted (${accepted}), but /${namespace}/ports still loads after 60 s`)
+          await sleep(3_000)
         }
       })
     }
     await browser?.close()
     await rm(dir, { recursive: true, force: true })
+    process.off('SIGINT', onSignal)
+    process.off('SIGTERM', onSignal)
   }
 }

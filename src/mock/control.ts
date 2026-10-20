@@ -15,7 +15,15 @@ async function control(env: Environment, method: string, path: string, body?: un
   return answer.body
 }
 
+/** What `GET /__mock/state` answers: each route's error state, as it was switched on, and the expired projects' ids. */
+export interface MockStates {
+  errors: Partial<Record<'register' | 'ports', { error: ErrorCode; retry_after_seconds?: number }>>
+  expired: string[]
+}
+
 export const setMockState = async (env: Environment, state: MockState): Promise<void> => void (await control(env, 'POST', '/__mock/state', state))
+
+export const mockState = async (env: Environment): Promise<MockStates> => JSON.parse(await control(env, 'GET', '/__mock/state')) as MockStates
 
 export const resetMock = async (env: Environment): Promise<void> => void (await control(env, 'POST', '/__mock/reset', {}))
 
