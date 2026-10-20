@@ -270,7 +270,7 @@ signup form.
 | 5 | First project | the Console lands on `/{namespace}/ports` of "My First Project" |
 | 6 | Port | "ADD PRODUCTS" → Blockfrost → `cardano-preprod` (Free) → "DEPLOY" shows the success toast; the port's page shows its endpoint and key |
 | 7 | First request | `GET <endpoint>/epochs/latest` answers 2xx within 3 minutes. The stopwatch stops: `elapsed_seconds` in the result and the summary |
-| 8 | Usage, then cost | the port's usage view counts a request within 5 minutes, then the billing page's "Project Usage" lists the port within 75 (fabric's daemon reads Prometheus every 3600 s), with the units fabric counted. They read 0: the proxies meter increases of their request counter, and a new port's counter is born holding its first request, so a lone first request is never billed |
+| 8 | Usage, then cost | the port's usage view counts a request within 5 minutes, then the billing page's "Project Usage" lists the port within 75 (fabric's daemon reads Prometheus every 3600 s), with the units fabric counted, which read 0 for J2's one request |
 | 9 | Console price | the port's pricing page quotes Blockfrost as fabric bills it, through the `pricing` check's comparator |
 | 10 | Clean up | pass or fail, every project the user owns is deleted, and the Console then names none |
 
@@ -292,9 +292,7 @@ Three edge cases ride on J2's signed-in session, each a result of its own:
 - **`j2-legacy-cookie`:** the legacy app still serves `/auth` and
   `/callbacks/auth0` on the apex with its own Auth0 client, and names its
   session cookie as the Console does, `_session-v2` on the `demeter.run`
-  zone. Each app reads the other's cookie as its own session: holding the
-  Console's, the legacy `/auth` sends the browser straight to `/` as signed
-  in. So the test drops the Console's cookie, signs in at `/auth` through
+  zone. The test drops the Console's cookie, signs in at `/auth` through
   Auth0's session, checks the legacy callback set `_session-v2`, and then
   that the browser still reaches the Console's ports page. The detail says
   whether the Console read that cookie or signed the browser in again, and

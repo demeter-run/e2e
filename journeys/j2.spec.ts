@@ -208,11 +208,8 @@ test('j2', async ({ browser }) => {
 
   // 8. After the stopwatch: usage within minutes (Prometheus), cost within the
   // hour (fabric's daemon reads Prometheus every 3600 s) once the port
-  // appears in "Project Usage". The detail says how many units fabric counted:
-  // none for J2's one request. The proxies' metering counts increases of
-  // their request counter, and a new port's counter is born holding its first
-  // request, so that request is never billed (run 39414503862: the counter
-  // stayed at 1 for 75 minutes and the port at 0 units).
+  // appears in "Project Usage". The detail says how many units fabric counted,
+  // which for J2's one request is none (run 39414503862 waited 75 minutes).
   await step('usage, then cost: the Console shows the request', async () => {
     if (!port || !namespace || j2.elapsedSeconds === undefined) throw new NotRun('no successful request')
     const [n, at] = [namespace, port]
@@ -307,10 +304,9 @@ test('j2-legacy-cookie', async () => {
   let legacy = false
   await step(`sign in through the legacy app at ${env.website}/auth`, async () => {
     if (!page || !namespace) throw new NotRun('J2 left no signed-in session')
-    // The legacy app reads the Console's cookie as its own session: holding
-    // it, /auth sends the browser straight to / as signed in and writes
-    // nothing (run 39410716098). Without it, the legacy app signs the browser
-    // in through Auth0's session, which J2 left, and writes its own.
+    // The Console's cookie has the same name, and with it the legacy app
+    // wrote nothing (run 39410716098). Without it, the legacy app signs the
+    // browser in through Auth0's session, which J2 left, and writes its own.
     await page.context().clearCookies({ name: sessionCookie })
     // Caught here so that a navigation that fails leaves no rejection unhandled.
     const callback = page.waitForResponse((r) => r.url().startsWith(`${env.website}/callbacks/auth0`), { timeout: 60_000 }).catch(() => null)
