@@ -16,11 +16,12 @@ import {
   describe,
   dotenvVars,
   J0_PORT,
+  NAMESPACE,
   type Registration,
   register,
   type Secrets,
 } from './client.ts'
-import { addCookieSecrets, type ConsoleWaits, consoleWaits, deleteClaimed, firstLine, pageLoads, said } from './console.ts'
+import { addCookieSecrets, type ConsoleWaits, consoleWaits, deleteClaimed, firstLine, pageAnswer, pageLoads, said } from './console.ts'
 
 /**
  * J0, the coding agent's main journey (`solution/devex/contracts/
@@ -120,6 +121,8 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
   let portId = ''
   /** What the claim form's project name held when "Claim project" was pressed. */
   let offeredName: string | undefined
+  /** Set when the project's page already answered the user before the claim: register named a project the user had. */
+  let ownedBefore = false
   /** Set when the claim button was pressed, whether or not the landing followed. */
   let claimSent = false
   let claimed = false
@@ -154,6 +157,12 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
       namespace = got.get('DEMETER_PROJECT_NAMESPACE') ?? ''
       expiresAt = got.get('DEMETER_EXPIRES_AT') ?? ''
       if (!namespace || !got.get('DEMETER_CLAIM_URL')) fail('register answered 200 without DEMETER_PROJECT_NAMESPACE and DEMETER_CLAIM_URL')
+      // The namespace goes into the Console's paths, the delete's among them:
+      // anything but a DNS label could name another page, or another project.
+      if (!NAMESPACE.test(namespace)) {
+        namespace = ''
+        fail('register answered 200 with a DEMETER_PROJECT_NAMESPACE that is not a DNS label')
+      }
       return `200 in ${seconds(performance.now() - t0)}: namespace ${namespace}, expires ${expiresAt}`
     })
 
@@ -195,7 +204,7 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
     await run.step(`claim in the browser as ${onMock ? 'a mock user' : user}`, async () => {
       const claimUrl = (await vars()).get('DEMETER_CLAIM_URL') ?? fail('.env.demeter has no DEMETER_CLAIM_URL: register failed')
       // A project claimed under no known namespace could not be deleted after.
-      if (!namespace) fail('not run: register named no namespace, so a claimed project could not be found to delete')
+      if (!namespace) fail('not run: register named no usable namespace, so a claimed project could not be found to delete')
       // The browser goes only to the Console: the claim page leads to the
       // sign-in, where the test user's password is typed.
       const claimOrigin = URL.canParse(claimUrl) ? new URL(claimUrl).origin : '(not a URL)'
@@ -208,16 +217,17 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
       page.setDefaultTimeout(waits.browserMs)
       // How the last page the browser loaded answered, and the claim's post,
       // for an error: a page that answers 500 shows no button, and the wait
-      // for one says only that. The Console's claim form posts by fetch once
-      // the page has hydrated, so its answer is no page load: a claim fabric
-      // refuses answers 500 and leaves the browser on the claim page.
+      // for one says only that. Once the page has hydrated, the Console's
+      // claim form posts by fetch, whose answer is no page load: a claim
+      // fabric refuses answers 500 and leaves the browser on the claim page.
+      // Before, the form posts as a page load, which is both.
       const claimPath = new URL(claimUrl).pathname
       let loaded: number | undefined
       let posted: number | undefined
       page.on('response', (response) => {
         try {
           if (response.request().method() === 'POST' && new URL(response.url()).pathname === claimPath) posted = response.status()
-          else if (response.request().isNavigationRequest() && response.frame() === page.mainFrame()) loaded = response.status()
+          if (response.request().isNavigationRequest() && response.frame() === page.mainFrame()) loaded = response.status()
         } catch {
           // A service worker's response has no frame.
         }
@@ -236,6 +246,15 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
         // namespace).
         await page.waitForLoadState('load')
         offeredName = await page.locator('input[name="name"]').inputValue()
+        // Nothing else ties the namespace register named to the project this
+        // claim makes: before the claim, it must not be the user's already, or
+        // the delete after it could remove a project the user had.
+        const before = await pageAnswer(session.request, `${env.console}/${namespace}/ports`, secrets)
+        if (before.status === 200) {
+          ownedBefore = true
+          fail(`/${namespace}/ports answered ${user} 200 before the claim: register named a project ${user} already owns, so nothing is claimed`)
+        }
+        if (before.status === null) fail(`/${namespace}/ports gave ${said(before)} before the claim, so whether it is already ${user}'s is unknown, and nothing is claimed`)
         claimSent = true
         await claim.click()
         await page.waitForURL((url) => url.pathname === `/${namespace}/ports`)
@@ -290,6 +309,7 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
           'GET /login 200',
           'POST /login 302',
           'GET /claim/[redacted] 200', // signed in: the claim form
+          `GET /${namespace}/ports 404`, // before the claim, outside the browser: not the user's yet
           'POST /claim/[redacted] 302',
           `GET /${namespace}/ports 200`, // the landing
           `GET /${namespace}/ports 200`, // its check, outside the browser
@@ -311,9 +331,11 @@ export async function j0({ env, run, secrets, user, password, between, waits: sh
         // The claim step claims nothing without a namespace.
         if (!claimSent || !context) {
           return fail(
-            namespace
-              ? `${namespace} was never claimed: it expires unclaimed at ${expiresAt}`
-              : 'register answered 200 but named no namespace: its project cannot be found, and expires unclaimed within 7 days',
+            !namespace
+              ? 'register answered 200 but named no usable namespace: its project cannot be found, and expires unclaimed within 7 days'
+              : ownedBefore
+                ? `register named ${namespace}, which was already ${user}'s, so nothing was claimed or deleted: this run's project expires unclaimed at ${expiresAt}`
+                : `${namespace} was never claimed: it expires unclaimed at ${expiresAt}`,
           )
         }
         return deleteClaimed({ console: env.console, namespace, expiresAt, user, session: context.request, secrets, landed: claimed }, waits)

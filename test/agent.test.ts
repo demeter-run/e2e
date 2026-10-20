@@ -602,32 +602,41 @@ describe('J0 up to the browser', () => {
     assert.equal(step(result, 'create a Blockfrost port').detail, 'ports answered 200, but the body did not finish: ECONNRESET, wanted 200')
   })
 
-  it('claims nothing when register names no namespace, as a claimed project could not be found to delete', async () => {
-    // On the stand-in's own origin, so only the missing namespace keeps the browser shut.
-    const standIn = await serve((request, response) => {
-      request.resume()
-      if (request.url !== '/api/agent/register') return response.writeHead(404).end()
-      const origin = `http://${request.headers.host}`
-      response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end(`DEMETER_PROJECT_ID=7e0b2f9c-0000-4000-8000-000000000000\nDEMETER_CLAIM_URL=${origin}/claim/stand-in-token\n`)
+  for (const [what, line, registerDetail] of [
+    ['no namespace', '', 'register answered 200 without DEMETER_PROJECT_NAMESPACE and DEMETER_CLAIM_URL'],
+    // A path in the Console: the delete would post to another project's settings.
+    ['a namespace that is not a DNS label', 'DEMETER_PROJECT_NAMESPACE=prj-mine/../prj-other\n', 'register answered 200 with a DEMETER_PROJECT_NAMESPACE that is not a DNS label'],
+  ] as const) {
+    it(`claims nothing when register names ${what}, as a claimed project could not be found to delete`, async () => {
+      // On the stand-in's own origin, so only the namespace keeps the browser shut.
+      const standIn = await serve((request, response) => {
+        request.resume()
+        if (request.url !== '/api/agent/register') return response.writeHead(404).end()
+        const origin = `http://${request.headers.host}`
+        response
+          .writeHead(200, { 'content-type': 'text/plain; charset=utf-8' })
+          .end(`DEMETER_PROJECT_ID=7e0b2f9c-0000-4000-8000-000000000000\n${line}DEMETER_CLAIM_URL=${origin}/claim/stand-in-token\n`)
+      })
+      try {
+        const run = new Run('j0', 'standin')
+        const url = standIn.url
+        await j0({ env: { name: 'standin', website: url, console: url, legacy: url, rpc: url, auth0: url }, run, secrets: new Secrets(), user: 'e2e@txpipe.io', password: 'x', waits: fast })
+        const result = run.finish()
+        assert.equal(step(result, 'register as agent').detail, registerDetail)
+        assert.equal(step(result, 'claim in the browser').detail, 'not run: register named no usable namespace, so a claimed project could not be found to delete')
+        assert.equal(step(result, 'after the claim').detail, 'not run: no claim was sent, so no request comes after it')
+        assert.equal(step(result, 'delete').detail, 'register answered 200 but named no usable namespace: its project cannot be found, and expires unclaimed within 7 days')
+      } finally {
+        await standIn.close()
+      }
     })
-    try {
-      const run = new Run('j0', 'standin')
-      const url = standIn.url
-      await j0({ env: { name: 'standin', website: url, console: url, legacy: url, rpc: url, auth0: url }, run, secrets: new Secrets(), user: 'e2e@txpipe.io', password: 'x', waits: fast })
-      const result = run.finish()
-      assert.equal(step(result, 'claim in the browser').detail, 'not run: register named no namespace, so a claimed project could not be found to delete')
-      assert.equal(step(result, 'after the claim').detail, 'not run: no claim was sent, so no request comes after it')
-      assert.equal(step(result, 'delete').detail, 'register answered 200 but named no namespace: its project cannot be found, and expires unclaimed within 7 days')
-    } finally {
-      await standIn.close()
-    }
-  })
+  }
 
   it('fails the delete step when a 200 names no namespace, as its project cannot be found', async () => {
     const result = await j0Against((response) =>
       response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('DEMETER_PROJECT_ID=7e0b2f9c-0000-4000-8000-000000000000\nDEMETER_API_KEY=dmtr_apikey1qqqqqqqq\n'),
     )
     assert.equal(step(result, 'register as agent').detail, 'register answered 200 without DEMETER_PROJECT_NAMESPACE and DEMETER_CLAIM_URL')
-    assert.deepEqual([step(result, 'delete').ok, step(result, 'delete').detail], [false, 'register answered 200 but named no namespace: its project cannot be found, and expires unclaimed within 7 days'])
+    assert.deepEqual([step(result, 'delete').ok, step(result, 'delete').detail], [false, 'register answered 200 but named no usable namespace: its project cannot be found, and expires unclaimed within 7 days'])
   })
 })

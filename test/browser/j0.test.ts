@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { type ChildProcess, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -75,6 +75,38 @@ describe('J0 in the browser against a stand-in Console', () => {
     )
     assert.ok(console.log.includes('POST /claim refused'), 'the claim was not posted by fetch')
     assert.match(step(result, 'delete').detail, new RegExp(`^the claim was sent, but /${namespace}/ports answered 404 for the next 0\\.3 s`))
+  })
+
+  it('names the 500 page a claim posted as a page load shows, before the page has hydrated', async () => {
+    const { result, console, namespace } = await j0On({ claimErrorPage: true })
+    assert.match(
+      step(result, 'claim in the browser').detail,
+      /^page\.waitForURL: Timeout 3000ms exceeded\.? \(the browser was at http:\/\/127\.0\.0\.1:\d+\/claim\/<token>, where the last page it loaded answered 500, and the claim's post answered 500\)$/,
+    )
+    assert.ok(console.log.includes('POST /claim error page'), 'the claim was not posted')
+    assert.match(step(result, 'delete').detail, new RegExp(`^the claim was sent, but /${namespace}/ports answered 404 for the next 0\\.3 s`))
+  })
+
+  it('claims nothing, and deletes nothing, when the namespace register named is already the user\'s', async () => {
+    const { result, console, namespace } = await j0On({ alreadyOwned: true })
+    assert.equal(
+      step(result, 'claim in the browser').detail,
+      `/${namespace}/ports answered e2e@txpipe.io 200 before the claim: register named a project e2e@txpipe.io already owns, so nothing is claimed`,
+    )
+    assert.equal(step(result, 'after the claim').detail, 'not run: no claim was sent, so no request comes after it')
+    assert.match(step(result, 'delete').detail, new RegExp(`^register named ${namespace}, which was already e2e@txpipe\\.io's, so nothing was claimed or deleted: this run's project expires unclaimed at \\d{4}-`))
+    assert.ok(!console.claimPosted, 'it posted the claim')
+    assert.ok(!console.log.some((c) => c.startsWith('POST /<ns>/settings')), 'it posted a delete')
+  })
+
+  it('claims nothing when the look before the claim gets no answer, as whose the project is stays unknown', async () => {
+    const { result, console, namespace } = await j0On({ resetBeforeClaim: true })
+    assert.match(
+      step(result, 'claim in the browser').detail,
+      new RegExp(`^/${namespace}/ports gave no answer \\(apiRequestContext\\.get: .+\\) before the claim, so whether it is already e2e@txpipe\\.io's is unknown, and nothing is claimed$`),
+    )
+    assert.match(step(result, 'delete').detail, new RegExp(`^${namespace} was never claimed: it expires unclaimed at \\d{4}-`))
+    assert.ok(!console.claimPosted, 'it posted the claim')
   })
 
   it('fails a claim page that answers 500 on its status, and says the project expires unclaimed', async () => {
@@ -154,9 +186,10 @@ describe('J0 in the browser against a stand-in Console', () => {
 async function endsOn(signal: NodeJS.Signals, exit: number) {
   const console = await standIn({ hangClaimPage: true })
   const tmp = await mkdtemp(join(tmpdir(), 'e2e-j0-signal-'))
+  let child: ChildProcess | undefined
   try {
     const root = join(import.meta.dirname, '..', '..')
-    const child = spawn(join(root, 'node_modules', '.bin', 'tsx'), ['src/cli/j0.ts', '--env', 'mock', '--results', join(tmp, 'results')], {
+    child = spawn(join(root, 'node_modules', '.bin', 'tsx'), ['src/cli/j0.ts', '--env', 'mock', '--results', join(tmp, 'results')], {
       cwd: root,
       env: { ...process.env, E2E_MOCK_URL: console.url, TMPDIR: tmp, GITHUB_ACTIONS: '', GITHUB_STEP_SUMMARY: '', IRM_E2E_WEBHOOK_URL: '' },
       stdio: 'ignore',
@@ -177,6 +210,13 @@ async function endsOn(signal: NodeJS.Signals, exit: number) {
     assert.deepEqual(await env(), [])
     assert.deepEqual(await readdir(tmp).then((names) => names.filter((n) => n === 'results')), [], 'J0 went on to write results')
   } finally {
+    // An assertion that fails before the kill leaves J0 running: freed when
+    // the stand-in closes, it would write its results after the removal.
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const exited = once(child, 'exit')
+      child.kill('SIGTERM')
+      await exited
+    }
     await console.close()
     await rm(tmp, { recursive: true, force: true })
   }

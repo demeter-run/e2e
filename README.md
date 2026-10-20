@@ -345,16 +345,20 @@ It takes `--alert`, `--force-fail` and `--results` as `pnpm check` does, and
    2xx, every 5 s for up to 3 minutes while the port comes up;
 4. claim in Chromium: open `DEMETER_CLAIM_URL`, only when it is on the
    environment's Console, only to a `200` and only when register named the
-   project's namespace (a project claimed under no known namespace could
-   not be deleted after), "Log in", sign in (the mock's form as any user,
-   or Auth0 as `e2e@txpipe.io`; nothing is typed unless the form is on the
-   environment's sign-in origin), "Claim project" with the project name as
-   the page offers it once it has loaded, and land on `/<namespace>/ports`,
+   project's namespace as a DNS label (a project claimed under no known
+   namespace could not be deleted after), "Log in", sign in (the mock's form
+   as any user, or Auth0 as `e2e@txpipe.io`; nothing is typed unless the
+   form is on the environment's sign-in origin), check outside the browser
+   that `/<namespace>/ports` does not already answer the test user `200`
+   (it would be a project the user had, which the delete would remove; a
+   lost answer claims nothing either), "Claim project" with the project name
+   as the page offers it once it has loaded, and land on `/<namespace>/ports`,
    which must then answer the test user's session `200` outside the
    browser, within 30 s, as fabric may take a moment to show the claim: a
    failed claim can land there on an error page. A claim that stays on its
-   page names how the claim's post answered (production's form posts by
-   fetch). A step of its own then checks the name offered was the
+   page names how the last page loaded and the claim's post answered
+   (production's form posts by fetch once the page has hydrated, and as a
+   page load before). A step of its own then checks the name offered was the
    namespace, so a wrong default fails that step without stopping the
    claim;
 5. once "Claim project" was pressed, the same request with the same key
@@ -534,15 +538,19 @@ one, and `retry_after_seconds`. J0's delete runs against a stand-in Console
 answering each way production may (a redirect, a redirect back into the
 project, `/login`, an error page, a lost answer, a fabric outage on both
 routes), and J0 itself up to the browser against registrations and ports
-that fail or are cut short, or name no namespace. The CLI's tests name
-production where nothing listens. So no unit test reaches production.
+that fail or are cut short, or name no namespace or one that is not a DNS
+label. The CLI's tests name production where nothing listens. So no unit
+test reaches production.
 
 `pnpm test:browser` (`test/browser/`) drives Chromium: J0 against a stand-in
 Console (the mock behind a proxy that adds the settings form's delete),
 whole and with one thing broken at a time (a claim page that answers 500, a
 claim that lands without ownership, a claim refused by a fetch post, a
-default name emptied as the page finishes loading, one and every lost answer
-on the check after the landing, `SIGTERM` and `SIGINT` while Chromium runs),
+claim posted as a page load that answers a 500 page, a namespace that
+already answers the test user, a lost answer on the look before the claim,
+a default name emptied as the page finishes loading, one and every lost
+answer on the check after the landing, `SIGTERM` and `SIGINT` while
+Chromium runs),
 `pnpm j0 --env mock` typing `mock` whatever `E2E_USER_PASSWORD` holds, and
 the sign-in form filler against Auth0's two screens and forms on another
 origin. `j0-mock.yml` runs them, after J0 on the mock.

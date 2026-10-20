@@ -32,7 +32,17 @@ export interface Breaks {
    * claim fabric refused. The browser stays on the claim page.
    */
   claimRefused?: boolean
-  /** How many requests for the project's page from outside the browser get a reset, from the first. */
+  /**
+   * The claim form posts as a page load, as production's does before it has
+   * hydrated, and the post answers a 500 page, which the browser shows on
+   * the claim's path.
+   */
+  claimErrorPage?: boolean
+  /** Before the claim, the project's page answers the user 200: register named a project the user already owns. */
+  alreadyOwned?: boolean
+  /** Before the claim, a request for the project's page from outside the browser gets a reset. */
+  resetBeforeClaim?: boolean
+  /** How many requests for the project's page from outside the browser, once the claim is posted, get a reset, from the first. */
   resetChecks?: number
 }
 
@@ -41,6 +51,8 @@ export interface StandIn extends Served {
   readonly log: string[]
   /** The mock's session cookie, once the sign-in set it. */
   readonly sessionCookie: string
+  /** Whether the claim was posted, by any means. */
+  readonly claimPosted: boolean
   mock: Mock
 }
 
@@ -59,6 +71,7 @@ export async function standIn(breaks: Breaks = {}): Promise<StandIn> {
   let claimLoads = 0
   let checks = 0
   let lost = false
+  let claimPosted = false
   let upstream = ''
 
   /** Forwards to the mock, rewriting its body when asked; the mock's headers (two Set-Cookie among them) go back as they came. */
@@ -107,6 +120,7 @@ document.querySelector('form').addEventListener('submit', async (event) => {
     const ports = /^\/([a-z0-9-]+)\/ports$/.exec(path)
     const claim = /^\/claim\/[^/]+$/.test(path)
     const page = (status: number) => res.writeHead(status, { 'content-type': 'text/html' }).end(`<h1>${status}</h1>`)
+    if (claim && req.method === 'POST') claimPosted = true
 
     if (settings && req.method === 'POST') {
       const body = await text(req)
@@ -117,8 +131,11 @@ document.querySelector('form').addEventListener('submit', async (event) => {
     }
     if (ports && req.method === 'GET') {
       if (deleted.has(ports[1]!) || lost) return page(500)
+      if (breaks.alreadyOwned && !claimPosted) return page(200)
       // Chromium marks its navigations; Playwright's request API does not.
-      if (req.headers['sec-fetch-mode'] !== 'navigate' && checks++ < (breaks.resetChecks ?? 0)) return req.socket.destroy()
+      const outside = req.headers['sec-fetch-mode'] !== 'navigate'
+      if (outside && !claimPosted && breaks.resetBeforeClaim) return req.socket.destroy()
+      if (outside && claimPosted && checks++ < (breaks.resetChecks ?? 0)) return req.socket.destroy()
     }
     if (path === '/__standin/hydrate.js') {
       // Late enough that the button shows well before the page's load.
@@ -147,6 +164,11 @@ document.querySelector('form').addEventListener('submit', async (event) => {
       lost = true
       return res.writeHead(302, { location: `/${namespace}/ports` }).end()
     }
+    if (claim && req.method === 'POST' && breaks.claimErrorPage) {
+      req.resume()
+      log.push('POST /claim error page')
+      return page(500)
+    }
     if (claim && req.method === 'POST' && breaks.claimRefused) {
       req.resume()
       log.push('POST /claim refused')
@@ -169,6 +191,9 @@ document.querySelector('form').addEventListener('submit', async (event) => {
     log,
     get sessionCookie() {
       return sessionCookie
+    },
+    get claimPosted() {
+      return claimPosted
     },
     async close() {
       for (const res of held) res.destroy()

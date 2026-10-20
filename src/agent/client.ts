@@ -99,6 +99,9 @@ export const createPort = (env: Environment, credentials: Credentials, body: Rec
 /** The port J0 creates, and the one the contract's ports rules read: the cheapest real port, Free on preprod. */
 export const J0_PORT = { kind: 'BlockfrostPort', network: 'cardano-preprod' } as const
 
+/** A project namespace, as the contract has it: a DNS label. */
+export const NAMESPACE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/
+
 /**
  * The run's own registration and its first port, made once per run and
  * shared: J0 makes them, and the contract's prod-safe tests read them, so a

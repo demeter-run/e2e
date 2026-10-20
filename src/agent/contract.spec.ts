@@ -14,6 +14,7 @@ import {
   dotenvVars,
   errorBody,
   J0_PORT,
+  NAMESPACE,
   names,
   type Registration,
   register,
@@ -152,7 +153,7 @@ test("register's values have the contract's formats", 'prod-safe', async (ctx) =
   const sevenDays = Date.now() + 7 * 86_400_000
   const problems = [
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value('DEMETER_PROJECT_ID')) ? '' : 'DEMETER_PROJECT_ID is not a UUID',
-    /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(value('DEMETER_PROJECT_NAMESPACE')) ? '' : 'DEMETER_PROJECT_NAMESPACE is not a namespace',
+    NAMESPACE.test(value('DEMETER_PROJECT_NAMESPACE')) ? '' : 'DEMETER_PROJECT_NAMESPACE is not a namespace',
     /^dmtr_apikey1[0-9a-z]+$/.test(value('DEMETER_API_KEY')) ? '' : 'DEMETER_API_KEY is not dmtr_apikey1…',
     claim?.[1] === ctx.env.console ? '' : `DEMETER_CLAIM_URL is not ${ctx.env.console}/claim/<token>`,
     // 32 random bytes, base64url without padding.
