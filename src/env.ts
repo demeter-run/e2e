@@ -20,6 +20,29 @@ export interface Environment {
    * is `E2E_USER_PASSWORD`; absent where nothing signs in.
    */
   testUser?: string
+  /** What the port suite signs in as and where it reaches each port; absent where the suite does not run. */
+  ports?: PortSuiteTarget
+}
+
+export interface PortSuiteTarget {
+  /** The standing test user (decision 0047), signed in by Auth0's password grant. */
+  user: string
+  /** The Auth0 audience fabric's API accepts. */
+  audience: string
+  /** fabric's native gRPC endpoint, as `host:port`. */
+  grpc: string
+  /**
+   * Each port kind's host, after the port's key: `<key>.<host>`. UTxO RPC
+   * takes its key in a header instead, so its host is used as it is.
+   */
+  hosts: {
+    node: string
+    blockfrost: string
+    kupo: string
+    ogmios: string
+    utxorpc: string
+    submitapi: string
+  }
 }
 
 export const environments = {
@@ -31,6 +54,19 @@ export const environments = {
     rpc: 'https://rpc.demeter.run',
     auth0: 'https://txpipe.us.auth0.com',
     testUser: 'e2e@txpipe.io',
+    ports: {
+      user: 'e2e@txpipe.io',
+      audience: 'demeter-api',
+      grpc: 'rpc.demeter.run:443',
+      hosts: {
+        node: 'cnode-m1.demeter.run:9443',
+        blockfrost: 'blockfrost-m1.demeter.run',
+        kupo: 'mainnet-v2.kupo-m1.demeter.run',
+        ogmios: 'cardano-mainnet-v6.ogmios-m1.demeter.run',
+        utxorpc: 'mainnet.utxorpc-v0.demeter.run:443',
+        submitapi: 'submitapi-m1.demeter.run',
+      },
+    },
   },
 } satisfies Record<string, Environment>
 

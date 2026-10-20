@@ -9,8 +9,8 @@ import { redact } from './secrets.ts'
  * Nothing secret goes in a step's detail. A detail is written to the result
  * file, the job summary and the alert as-is, so the code producing it is where
  * a URL loses its query string (see `safeUrl` in `http.ts`). A secret a
- * journey holds (`keepSecret` in `secrets.ts`) is redacted from every detail
- * as well.
+ * journey holds (`keepSecret` in `secrets.ts`), or one a run conceals
+ * (`Run.conceal`), is redacted from every detail as well.
  */
 
 export interface Step {
@@ -41,6 +41,7 @@ export class Run {
   /** The steps still running: when each started, and how many steps had been recorded then. */
   readonly #running = new Map<object, { name: string; t0: number; at: number }>()
   readonly #started = new Date()
+  readonly #concealed = new Set<string>()
   /** Set by a journey when its stopwatch stops; written to the result as `elapsed_seconds`. */
   elapsedSeconds?: number
 
@@ -48,6 +49,17 @@ export class Run {
     readonly name: string,
     readonly env: string,
   ) {}
+
+  /**
+   * Keeps `value` (a token, a port's key) out of every later step's detail,
+   * wherever an error message or a response quotes it. In GitHub Actions it is
+   * also masked in the job log.
+   */
+  conceal(value: string): void {
+    if (!value || this.#concealed.has(value)) return
+    this.#concealed.add(value)
+    if (process.env.GITHUB_ACTIONS === 'true') console.log(`::add-mask::${value}`)
+  }
 
   /**
    * Runs `fn` as one step. It passes when `fn` returns, with the returned text
@@ -69,6 +81,7 @@ export class Run {
     } finally {
       this.#running.delete(running)
     }
+    for (const value of this.#concealed) detail = detail.replaceAll(value, '***')
     this.#steps.push({ name: redact(name), ok, ms: Math.round(performance.now() - t0), detail: redact(detail) })
     return ok
   }
