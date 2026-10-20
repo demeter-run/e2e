@@ -1,8 +1,8 @@
-import type { BrowserContext, Page, Request } from '@playwright/test'
+import type { BrowserContext, ConsoleMessage, Page, Request } from '@playwright/test'
 import type { Environment } from '../env.ts'
 import { safeUrl } from '../http.ts'
 import { Failure } from '../report.ts'
-import { arrives, visible, where } from './browser.ts'
+import { arrives, firstLine, visible, where } from './browser.ts'
 
 /**
  * The Console as a signed-in person meets it, read from webui's routes on
@@ -41,15 +41,25 @@ export async function landOnPorts(page: Page, env: Environment, timeoutMs = 60_0
 }
 
 /**
- * Waits for the Console's app to start on the page: its Remix router, which
- * Remix creates as React hydrates the server-rendered page. Until then a
- * button does nothing and a link is a plain anchor, whose click loads its
- * target as a page instead of navigating within the app.
+ * Waits for the Console's app to start on the page: React has hydrated the
+ * server-rendered page and Remix's router runs it. Until then a button does
+ * nothing and a link is a plain anchor, whose click loads its target as a
+ * page instead of navigating within the app.
+ *
+ * Remix creates its router as hydration begins, before React commits it.
+ * Sign-in proof run 39412617330 clicked sign-out about 0.3 s after the router
+ * appeared, and the page showed the Console's error page on the same URL
+ * without navigating; so this also waits for the commit. The
+ * `<ScrollRestoration>` in the Console's root layout sets
+ * `history.scrollRestoration` to "manual" in an effect, which runs only once
+ * React has committed the hydrated page.
  */
 export async function started(page: Page, timeoutMs = 30_000): Promise<void> {
   try {
     await page.waitForFunction(
-      () => (window as { __remixRouter?: { state: { initialized: boolean } } }).__remixRouter?.state.initialized === true,
+      () =>
+        (window as { __remixRouter?: { state: { initialized: boolean } } }).__remixRouter?.state.initialized === true &&
+        history.scrollRestoration === 'manual',
       undefined,
       { timeout: timeoutMs },
     )
@@ -123,11 +133,19 @@ export async function signOut(page: Page, env: Environment, timeoutMs = 30_000):
   await started(page, timeoutMs)
   // A page load that fails, as the loop does, leaves Chromium's error page,
   // whose URL says nothing: the failed request names the page and the error.
+  // A click that goes nowhere leaves the app's own errors to say why.
   let failed = ''
+  const logged = new Set<string>()
   const onFailed = (r: Request) => {
     if (r.isNavigationRequest()) failed = `loading ${safeUrl(r.url())} failed with ${r.failure()?.errorText ?? 'an error'}`
   }
+  const onConsole = (m: ConsoleMessage) => {
+    if (m.type() === 'error') logged.add(firstLine(m.text()).slice(0, 200))
+  }
+  const onPageError = (e: Error) => logged.add(`uncaught ${firstLine(e)}`.slice(0, 200))
   page.on('requestfailed', onFailed)
+  page.on('console', onConsole)
+  page.on('pageerror', onPageError)
   let request: Request | null
   try {
     // Caught here so that a click that fails leaves no rejection unhandled.
@@ -136,8 +154,14 @@ export async function signOut(page: Page, env: Environment, timeoutMs = 30_000):
     request = await sent
   } finally {
     page.off('requestfailed', onFailed)
+    page.off('console', onConsole)
+    page.off('pageerror', onPageError)
   }
-  if (!request) throw new Failure(`the sign-out link sent the browser to no ${env.auth0}/v2/logout within ${timeoutMs / 1000} s; ${failed || `it is on ${await where(page)}`}`)
+  if (!request) {
+    const errors = [...logged].slice(0, 3)
+    const said = errors.length ? `; the page logged ${errors.map((e) => `"${e}"`).join(', ')}` : '; the page logged no error'
+    throw new Failure(`the sign-out link sent the browser to no ${env.auth0}/v2/logout within ${timeoutMs / 1000} s; ${failed || `it is on ${await where(page)}${said}`}`)
+  }
   const answer = await request.response()
   const location = answer?.headers().location
   if (!answer || answer.status() < 300 || answer.status() > 399 || !location) {
