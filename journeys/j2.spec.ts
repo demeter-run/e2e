@@ -4,7 +4,6 @@ import { safeUrl } from '../src/http.ts'
 import { signIn, type TestUser, testUser } from '../src/journeys/auth0.ts'
 import {
   billingRow,
-  type ConsolePort,
   cookiesNamed,
   dailyRequests,
   deleteProjects,
@@ -17,6 +16,7 @@ import {
   signOut,
 } from '../src/journeys/console.ts'
 import { arrives, visible } from '../src/journeys/browser.ts'
+import { deployedPort, type Shared, signedInPage } from '../src/journeys/j2.ts'
 import { burst, describePortAnswer, describeTally, portGet, tally, untilSuccess } from '../src/journeys/port.ts'
 import { browserSteps, ended, journeyEnvironment, NotRun, poll, report, verdict, within } from '../src/journeys/spec.ts'
 import { Failure, Run } from '../src/report.ts'
@@ -57,16 +57,15 @@ const portType = 'cardano-preprod'
 /** A request a developer's first call could be, as `GET <endpoint>/epochs/latest`. */
 const firstCall = '/epochs/latest'
 
-/**
- * What the edge cases share with J2: its browser, signed in once J2 has
- * signed in (`signedIn`), and its port. J2's project stays J2's own: the
- * legacy-cookie case needs only the session, which a later step that fails
- * leaves signed in.
- */
+/** J2's browser, which the edge cases share. */
 let context: BrowserContext | undefined
-let page: Page | undefined
-let signedIn = false
-let port: ConsolePort | undefined
+/**
+ * What the edge cases take from J2, each through its guard
+ * (`src/journeys/j2.ts`): its page, signed in once J2 has signed in, and its
+ * port. J2's project stays J2's own: the legacy-cookie case needs only the
+ * session, which a later step that fails leaves signed in.
+ */
+const shared: Shared = { signedIn: false }
 
 const j2 = new Run('j2', env.name)
 /** Whether J2 ran in this worker, which owns its result, and whether its test returned. */
@@ -76,9 +75,9 @@ let j2Returned = false
 const runs = new Map<string, Run>([['j2', j2]])
 
 /** What a screenshot must not show: the password field, and the port's key wherever it is written. */
-const masks = (p: Page) => [p.locator('input[type="password"]'), ...keyMasks(p, port?.key)]
+const masks = (p: Page) => [p.locator('input[type="password"]'), ...keyMasks(p, shared.port?.key)]
 
-const stepsOf = (run: Run, shots?: string) => browserSteps(run, () => page, masks, shots)
+const stepsOf = (run: Run, shots?: string) => browserSteps(run, () => shared.page, masks, shots)
 
 // A test Playwright ended fails its result. J2's is written after the
 // clean-up; an edge case's, here.
@@ -102,8 +101,8 @@ test.afterAll(async ({ browser }, testInfo) => {
   const cleaned = await step('clean up: delete every project the user owns', () =>
     within(8 * 60_000, 'the clean-up', async () => {
       context ??= await browser.newContext()
-      if (!page || (j2Ran && !j2Returned)) page = await context.newPage()
-      const [c, p] = [context, page]
+      if (!shared.page || (j2Ran && !j2Returned)) shared.page = await context.newPage()
+      const [c, p] = [context, shared.page]
       await p.goto(`${env.console}/`, { waitUntil: 'commit', timeout: 60_000 })
       await arrives(p, (u) => u.origin === env.auth0 || /^\/[^/]+\/ports$/.test(u.pathname), 'the Console or Auth0')
       if (new URL(p.url()).origin === env.auth0) await signIn(p, env, user())
@@ -129,7 +128,7 @@ test('j2', async ({ browser }) => {
   // The browser is closed only after the step, which takes its screenshot first.
   const slate = await browser.newContext()
   try {
-    const s = (page = await slate.newPage())
+    const s = (shared.page = await slate.newPage())
     await step('clean slate: sign in, delete every project the user owns, sign out', async () => {
       await s.goto(`${env.console}/login`, { waitUntil: 'domcontentloaded', timeout: 30_000 })
       await signIn(s, env, user())
@@ -137,13 +136,12 @@ test('j2', async ({ browser }) => {
       return `deleted ${deleted.length} (${deleted.join(', ')}); ${await signOut(s, env)}`
     })
   } finally {
-    page = undefined
+    shared.page = undefined
     await slate.close()
   }
 
   context = await browser.newContext()
-  page = await context.newPage()
-  const p = page
+  const p = (shared.page = await context.newPage())
 
   // 2. A person lands on the site. The stopwatch starts.
   await step(`land on ${env.website}/, then open /pricing`, async () => {
@@ -194,7 +192,7 @@ test('j2', async ({ browser }) => {
     await (await visible(p, p.getByRole('link', { name: 'Log in', exact: true }), '"Log in" link on the signup screen')).click()
     await arrives(p, (u) => u.origin === env.auth0 && u.pathname === auth0Screens.login.path, `Auth0's ${auth0Screens.login.path}`)
     const how = await signIn(p, env, user())
-    signedIn = true
+    shared.signedIn = true
     return `"${label}" → ${env.console}/login?intent=signup → ${env.auth0}${want.path} ("${heading}") → signed in through the ${how}`
   })
 
@@ -202,7 +200,7 @@ test('j2', async ({ browser }) => {
   // steps work in it only once it is that project: a run signed in as the
   // same user elsewhere (fabric's daily e2e) can have left another.
   await step('first project: the Console lands on "My First Project"', async () => {
-    if (!signedIn) throw new NotRun('not signed in')
+    if (!shared.signedIn) throw new NotRun('not signed in')
     const first = await landOnPorts(p, env)
     await visible(p, p.getByText('My First Project', { exact: true }), 'project named "My First Project"')
     namespace = first
@@ -215,7 +213,7 @@ test('j2', async ({ browser }) => {
     await deployPort(p, portKind, portType)
     const opened = await openPort(p, env)
     keepSecret(opened.key)
-    port = opened
+    shared.port = opened
     if (opened.network !== portType) throw new Failure(`the port's network reads "${opened.network}", wanted ${portType}`)
     if (!/^https:\/\//.test(opened.endpoint)) throw new Failure(`the "Endpoint URL" row reads "${opened.endpoint}", not a URL`)
     return `${opened.name} on ${opened.network}, endpoint ${safeUrl(opened.endpoint)}; the key is held in memory only`
@@ -223,6 +221,7 @@ test('j2', async ({ browser }) => {
 
   // 7. The first successful request stops the stopwatch.
   await step(`first request: GET ${firstCall} answers 2xx`, async () => {
+    const { port } = shared
     if (!port || landed === undefined) throw new NotRun('no port')
     const { answer, tries, at } = await untilSuccess(`${port.endpoint}${firstCall}`, port.key, { timeoutMs: 180_000 })
     j2.elapsedSeconds = Math.round((at - landed) / 100) / 10
@@ -235,6 +234,7 @@ test('j2', async ({ browser }) => {
   // appears in "Project Usage". The detail says how many units fabric counted,
   // which for J2's one request is none (run 39414503862 waited 75 minutes).
   await step('usage, then cost: the Console shows the request', async () => {
+    const { port } = shared
     if (!port || !namespace || j2.elapsedSeconds === undefined) throw new NotRun('no successful request')
     const [n, at] = [namespace, port]
     const usage = await poll(5 * 60_000, 15_000, async () => {
@@ -255,6 +255,7 @@ test('j2', async ({ browser }) => {
   // 9. The Console's leg of the live pricing check: its prices render only
   // signed in, so `pnpm check pricing` cannot read them (rescope of 2026-10-19).
   await step(`Console price: the ${portKind} card agrees with fabric`, async () => {
+    const { port } = shared
     if (!port || !namespace) throw new NotRun('no port')
     const quoted = consoleCards(readConsolePricing(await pricingCells(p, env, namespace, port)), 'blockfrost')
     const read = quoted.map(describeCard).join('; ')
@@ -284,10 +285,9 @@ test('j2-401', async () => {
   test.setTimeout(2 * 60_000)
   const run = edgeRun('j2-401')
   await stepsOf(run)(`a key with its last character changed: GET ${firstCall} answers 401`, async () => {
-    if (!port) throw new NotRun('J2 deployed no port')
-    const key = port.key
+    const { endpoint, key } = deployedPort(shared)
     const wrong = keepSecret(`${key.slice(0, -1)}${key.endsWith('a') ? 'b' : 'a'}`)
-    const answer = await portGet(`${port.endpoint}${firstCall}`, wrong)
+    const answer = await portGet(`${endpoint}${firstCall}`, wrong)
     if (answer.status !== 401) throw new Failure(`answered ${describePortAnswer(answer)}, wanted 401`)
     return '401'
   })
@@ -302,10 +302,10 @@ test('j2-429', async () => {
   test.setTimeout(3 * 60_000)
   const run = edgeRun('j2-429')
   await stepsOf(run)(`bursts of 30 concurrent GET ${firstCall} answer 429, and no 5xx`, async () => {
-    if (!port) throw new NotRun('J2 deployed no port')
+    const { endpoint, key } = deployedPort(shared)
     const answers = []
     for (let bursts = 1; bursts <= 5; bursts += 1) {
-      answers.push(...(await burst(`${port.endpoint}${firstCall}`, port.key, 30)))
+      answers.push(...(await burst(`${endpoint}${firstCall}`, key, 30)))
       if (answers.some((a) => a.status === 429)) break
     }
     const counts = tally(answers)
@@ -326,9 +326,10 @@ test('j2-legacy-cookie', async () => {
   test.setTimeout(8 * 60_000)
   const run = edgeRun('j2-legacy-cookie')
   const step = stepsOf(run)
-  let legacy = false
+  /** The page that holds the legacy app's session, once it does. */
+  let legacy: Page | undefined
   await step(`sign in through the legacy app at ${env.website}/auth`, async () => {
-    if (!page || !signedIn) throw new NotRun('J2 left no signed-in session')
+    const page = signedInPage(shared)
     // The Console's cookie has the same name, and with it the legacy app
     // wrote nothing (run 39410716098). Without it, the legacy app signs the
     // browser in through Auth0's session, which J2 left, and writes its own.
@@ -342,11 +343,12 @@ test('j2-legacy-cookie', async () => {
     if (!answered) throw new Failure(`the legacy app's ${env.website}/callbacks/auth0 never answered; the browser is on ${safeUrl(page.url())}`)
     const set = (await answered.headerValues('set-cookie')).map((c) => c.split('=')[0]!.trim())
     if (!set.includes(sessionCookie)) throw new Failure(`${env.website}/callbacks/auth0 answered ${answered.status()} and set ${set.join(', ') || 'no cookie'}, not ${sessionCookie}`)
-    legacy = true
+    legacy = page
     return `the legacy callback answered ${answered.status()} and set ${sessionCookie}; the browser holds ${(await cookiesNamed(page.context(), sessionCookie)).join(', ')}`
   })
   await step(`open ${env.console}/ and sign in: the Console lands on the ports page`, async () => {
-    if (!page || !legacy) throw new NotRun('no legacy session')
+    const page = legacy
+    if (!page) throw new NotRun('no legacy session')
     // A Console that cannot read the cookie it is sent signs the browser in
     // again, through Auth0's session when there is one: its callback says so.
     let called = false

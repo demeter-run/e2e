@@ -40,11 +40,39 @@ export const specEnv = { env: 'E2E_ENV', results: 'E2E_RESULTS' } as const
 /** Runs one spec with Playwright and resolves to its exit code. */
 export type Playwright = (spec: string, env: NodeJS.ProcessEnv) => Promise<number>
 
+/**
+ * Playwright stops a run on SIGINT by ending its tests and running their
+ * `afterAll`, where a journey deletes what it made; a second SIGINT, a second
+ * later or more, kills it. So while it runs, a SIGINT or SIGTERM sent here
+ * reaches it as a SIGINT, and this process waits for it to exit, then reports
+ * what it wrote. A Ctrl+C reaches Playwright from the terminal too: it reads
+ * the two as one. Left to their defaults the signals would end this process
+ * at once (tsx exits 130 for a script that does not listen), giving the
+ * prompt back while the clean-up runs on, out of reach of another Ctrl+C.
+ */
 const runPlaywright: Playwright = (spec, env) =>
   new Promise((resolve, reject) => {
     const child = spawn('playwright', ['test', spec], { stdio: 'inherit', env })
-    child.on('error', reject)
-    child.on('exit', (code, signal) => resolve(code ?? (signal ? 1 : 0)))
+    let told = false
+    const relay = (signal: NodeJS.Signals) => {
+      if (!told) console.error(`${signal}: Playwright is stopping the journey and cleaning up; its results follow. A second Ctrl+C gives up on the clean-up, which can leave a project behind.`)
+      told = true
+      child.kill('SIGINT')
+    }
+    const settle = () => {
+      process.off('SIGINT', relay)
+      process.off('SIGTERM', relay)
+    }
+    process.on('SIGINT', relay)
+    process.on('SIGTERM', relay)
+    child.on('error', (error) => {
+      settle()
+      reject(error)
+    })
+    child.on('exit', (code, signal) => {
+      settle()
+      resolve(code ?? (signal ? 1 : 0))
+    })
   })
 
 const usage = (all: Journey[]) => `usage: pnpm journey <name> --env <name> [options]

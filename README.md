@@ -309,6 +309,14 @@ Every action has a 30-second limit and every navigation a 60-second one
 (`playwright.config.ts`), so a click that cannot happen fails its step rather
 than hold it until the test's timeout.
 
+**Stopping it.** A Ctrl+C stops a journey as it stops any Playwright run: the
+tests end, then their clean-up runs, which for J2 deletes every project the
+user owns. `pnpm journey` waits for that, then reports as usual, so the
+prompt comes back only once nothing is left running. A SIGTERM to the
+journey's own process does the same (pnpm does not pass one on). A second
+Ctrl+C, a second or more after the first, gives up on the clean-up, which can
+leave a project on the test user's account until the next run.
+
 **What it costs and leaves behind.** J2 deletes every project the test user
 owns before it starts and after it ends, pass or fail, so it must not overlap
 another run signed in as the user. The concurrency group below keeps this
@@ -400,9 +408,11 @@ answering as production does, intent's browser steps against a stand-in page,
 and `pnpm check` itself against stand-in checks. The Console's pricing grid is
 read from its cells as webui renders them (the page renders only signed in, so
 no capture of it is committed), `pnpm journey` runs against a stand-in
-Playwright, the project deletion against a stand-in Console and the port
+Playwright (its entry point through tsx, interrupted by a Ctrl+C or a
+SIGTERM), the project deletion against a stand-in Console and the port
 requests against a local server; `j2.yml`'s scripts run in bash with a
-stand-in `pnpm` and a local webhook. No unit test reaches production or needs
+stand-in `pnpm` and a local webhook, and J2's edge cases take what J2 left
+them through guards tested on their own. No unit test reaches production or needs
 a browser. The browser tests under `test/browser/` take a failed step's masked
 screenshot of a stand-in port page, as the Console lays it out, whose heading,
 labels or key shape have drifted, one or two at a time, and read its pixels
@@ -410,7 +420,8 @@ back: every pixel of the key must be painted over. They also sign out of a
 stand-in Console, whose link navigates after a fetch as Remix's router does or
 at once, through a stand-in Auth0 whose `/v2/logout` redirects back to a page
 on the Console's origin, which the sign-out must wait for, or never answers,
-which must fail the sign-out within its limit.
+which must fail the sign-out within its limit. A first click that goes
+nowhere must be clicked again, and two must fail it within its limit.
 
 ## Workflows
 

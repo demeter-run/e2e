@@ -6,9 +6,10 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, normalize } from 'node:path'
 import { afterEach, beforeEach, describe, it, mock } from 'node:test'
-import { request } from '@playwright/test'
+import { type Page, request } from '@playwright/test'
 import { type Journey, journeys, main, type Playwright } from '../src/cli/journeys.ts'
-import { deleteProjects, keyShape } from '../src/journeys/console.ts'
+import { type ConsolePort, deleteProjects, keyShape } from '../src/journeys/console.ts'
+import { deployedPort, type Shared, signedInPage } from '../src/journeys/j2.ts'
 import { burst, describeTally, portGet, tally, untilSuccess } from '../src/journeys/port.ts'
 import { browserSteps, ended, NotRun, poll, within } from '../src/journeys/spec.ts'
 import { Failure, formatMarkdown, formatText, type Result, Run } from '../src/report.ts'
@@ -193,6 +194,99 @@ describe('the pnpm journey entry point', () => {
       await rm(tmp, { recursive: true, force: true })
     }
   })
+
+  /**
+   * A stand-in Playwright, as `pnpm j2` runs it (tsx, then Node): it logs the
+   * signals it gets, and on the first SIGINT cleans up for a second, writes
+   * its result and exits 130, as Playwright's `afterAll` does. Like
+   * Playwright, it has no SIGTERM handler of its own: one ends it, with no
+   * clean-up. Left alone it exits after 20 s.
+   */
+  const standIn = `const { appendFileSync, writeFileSync } = require('node:fs')
+const log = (line) => appendFileSync(process.env.STAND_IN_LOG, line + '\\n')
+let stopping = false
+process.on('SIGTERM', () => { log('SIGTERM'); process.exit(143) })
+process.on('SIGINT', () => {
+  log('SIGINT')
+  if (stopping) return
+  stopping = true
+  setTimeout(() => {
+    const step = { name: 'stopped', ok: false, ms: 0, detail: 'interrupted' }
+    writeFileSync(process.env.E2E_RESULTS + '/sign-in.json', JSON.stringify({ name: 'sign-in', env: 'production', started_at: '', finished_at: '', ok: false, steps: [step] }))
+    log('cleaned up')
+    process.exit(130)
+  }, 1_000)
+})
+setTimeout(() => process.exit(0), 20_000)
+// Last, so that no signal the test sends once it reads this meets a default handler.
+log('started')
+`
+
+  /**
+   * Starts the entry point through tsx, as `pnpm j2` does, in a process group of
+   * its own as a terminal's job is, with the stand-in as `playwright`; then,
+   * once the stand-in has started, sends `signal` to the group (a Ctrl+C) or
+   * to the tsx process alone (a `kill`). Resolves with what the stand-in had
+   * logged when the entry point exited, and what it printed.
+   */
+  async function interrupt(signal: 'SIGINT' | 'SIGTERM', to: 'group' | 'tsx') {
+    const tmp = await mkdtemp(join(tmpdir(), 'e2e-interrupt-'))
+    const log = join(tmp, 'stand-in.log')
+    await writeFile(join(tmp, 'stand-in.cjs'), standIn)
+    await writeFile(join(tmp, 'playwright'), `#!/bin/sh\nexec '${process.execPath}' '${join(tmp, 'stand-in.cjs')}'\n`, { mode: 0o755 })
+    await writeFile(log, '')
+    const child = spawn(join(root, 'node_modules', '.bin', 'tsx'), [join('src', 'cli', 'journey.ts'), 'sign-in', '--env', 'production', '--results', tmp], {
+      cwd: root,
+      detached: true,
+      env: { ...process.env, PATH: `${tmp}:${process.env.PATH}`, STAND_IN_LOG: log, E2E_USER_PASSWORD: 'stand-in', IRM_E2E_WEBHOOK_URL: '', GITHUB_STEP_SUMMARY: '' },
+    })
+    let [stdout, stderr] = ['', '']
+    child.stdout.on('data', (c) => (stdout += c))
+    child.stderr.on('data', (c) => (stderr += c))
+    let atExit = ''
+    const exited = new Promise<number | null>((resolve) =>
+      child.on('exit', (code) => {
+        atExit = readFileSync(log, 'utf8')
+        resolve(code)
+      }),
+    )
+    const closed = once(child, 'close')
+    try {
+      const t0 = performance.now()
+      while (!readFileSync(log, 'utf8').includes('started')) {
+        assert.ok(performance.now() - t0 < 15_000, `the stand-in did not start: ${stderr}`)
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      process.kill(to === 'group' ? -child.pid! : child.pid!, signal)
+      const code = await exited
+      await closed
+      return { code, logged: atExit.trim().split('\n'), stdout, stderr }
+    } finally {
+      // A stand-in the entry point left behind must not outlive the test.
+      try {
+        process.kill(-child.pid!, 'SIGKILL')
+      } catch {}
+      await rm(tmp, { recursive: true, force: true })
+    }
+  }
+
+  // Left to the signals' defaults, a Ctrl+C gave the prompt back at once,
+  // while Playwright's clean-up ran on where no second Ctrl+C could reach it.
+  for (const [how, signal, to] of [
+    ['a Ctrl+C, which reaches Playwright too', 'SIGINT', 'group'],
+    ['a SIGTERM to the journey alone', 'SIGTERM', 'tsx'],
+  ] as const) {
+    it(`on ${how}, waits for Playwright to clean up, then reports and exits 1`, { timeout: 30_000 }, async () => {
+      const { code, logged, stdout, stderr } = await interrupt(signal, to)
+      assert.equal(logged[0], 'started')
+      // Playwright is stopped by SIGINT alone, and had cleaned up before the entry point exited.
+      assert.ok(logged.includes('SIGINT') && !logged.includes('SIGTERM'), logged.join(', '))
+      assert.equal(logged.at(-1), 'cleaned up', logged.join(', '))
+      assert.equal(code, 1, stderr)
+      assert.match(stderr, new RegExp(`^${signal}: Playwright is stopping the journey and cleaning up; its results follow\\.`, 'm'))
+      assert.match(stdout, /FAIL {2}sign-in \(production\): 0\/1 steps\n {2}FAIL {2}stopped \(0 ms\): interrupted/)
+    })
+  }
 })
 
 describe('the journey registry', () => {
@@ -202,6 +296,43 @@ describe('the journey registry', () => {
       const spec = readFileSync(join(root, journey.spec), 'utf8')
       const tests = [...spec.matchAll(/^test\('([^']+)'/gm)].map((m) => m[1])
       assert.deepEqual([...journey.results].sort(), tests.sort(), journey.spec)
+    }
+  })
+})
+
+describe('what J2 leaves its edge cases', () => {
+  const page = {} as Page
+  const port: ConsolePort = { id: 'r1', name: 'blockfrost-m1-preprod-1', network: 'cardano-preprod', endpoint: 'https://example.invalid', key: 'stand-in' }
+  const notRun = (why: string) => (error: unknown) => error instanceof NotRun && error.message === `not run: ${why}`
+
+  it('gives the legacy-cookie case the signed-in page, though J2 failed before deploying a port', () => {
+    const shared: Shared = { page, signedIn: true }
+    assert.equal(signedInPage(shared), page)
+    assert.throws(() => deployedPort(shared), notRun('J2 deployed no port'))
+  })
+
+  it('fails the legacy-cookie case as not run when J2 did not sign in, or left no page', () => {
+    for (const shared of [{ page, signedIn: false, port }, { signedIn: true, port }] satisfies Shared[]) {
+      assert.throws(() => signedInPage(shared), notRun('J2 left no signed-in session'))
+    }
+  })
+
+  it('gives 401 and 429 the port J2 deployed', () => {
+    assert.equal(deployedPort({ page, signedIn: true, port }), port)
+  })
+
+  // The spec's tests reach the guards only through production, so each edge
+  // case's guard is held here as the spec calls it.
+  it('is what each edge case of the spec takes, through its guard', () => {
+    const spec = readFileSync(join(root, 'journeys', 'j2.spec.ts'), 'utf8')
+    const body = (name: string) => spec.split(/^test\(/m).find((t) => t.startsWith(`'${name}'`)) ?? ''
+    for (const [name, guard] of [
+      ['j2-401', 'deployedPort(shared)'],
+      ['j2-429', 'deployedPort(shared)'],
+      ['j2-legacy-cookie', 'signedInPage(shared)'],
+    ] as const) {
+      const guards = [...body(name).matchAll(/\b(?:deployedPort|signedInPage)\([^)]*\)/g)].map((m) => m[0])
+      assert.deepEqual(guards, [guard], name)
     }
   })
 })
