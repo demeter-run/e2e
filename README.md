@@ -263,7 +263,7 @@ signup form.
 
 | # | Step | Passes when |
 | --- | --- | --- |
-| 1 | Clean slate | the user signs in at the Console's `/login`, every project it owns is deleted, and it signs out with the sidebar's sign-out link once the Console's app has started, through Auth0's `/v2/logout` (loading the Console's `/logout` as a page loops). Before the stopwatch. |
+| 1 | Clean slate | the user signs in at the Console's `/login`, every project it owns is deleted, and it signs out with the sidebar's sign-out link once the Console's app has started, through Auth0's `/v2/logout` (loading the Console's `/logout` as a page loops). A click that goes nowhere is clicked once more, and the detail says so. Before the stopwatch. |
 | 2 | Land | `https://demeter.run/` answers 200 (the stopwatch starts) and its "Pricing" link opens `/pricing` |
 | 3 | Price | `/pricing` renders a Blockfrost Flexible "PER 100K REQUESTS" price, recorded in the detail |
 | 4 | Sign up | the page's sign-up CTA requests `console.demeter.run/login?intent=signup` and lands on Auth0's signup screen; its "Log in" link leads to the login form, where the user signs in |
@@ -292,8 +292,13 @@ Three edge cases ride on J2's signed-in session, each a result of its own:
 - **`j2-legacy-cookie`:** the legacy app still serves `/auth` and
   `/callbacks/auth0` on the apex with its own Auth0 client, and names its
   session cookie as the Console does, `_session-v2` on the `demeter.run`
-  zone. After signing in there, the browser still reaches the Console's ports
-  page. The detail lists the browser's `_session-v2` cookies by domain.
+  zone. Each app reads the other's cookie as its own session: holding the
+  Console's, the legacy `/auth` sends the browser straight to `/` as signed
+  in. So the test drops the Console's cookie, signs in at `/auth` through
+  Auth0's session, checks the legacy callback set `_session-v2`, and then
+  that the browser still reaches the Console's ports page. The detail says
+  whether the Console read that cookie or signed the browser in again, and
+  lists the browser's `_session-v2` cookies by domain.
 
 ## Unit tests
 
