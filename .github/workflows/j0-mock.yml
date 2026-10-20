@@ -1,0 +1,92 @@
+name: j0-mock
+
+# J0 and the whole agent contract suite against the agent-route mock
+# (src/mock/), and the tests that need a browser (test/browser/: J0's claim
+# and delete against a stand-in Console, and the sign-in form filler), on
+# every pull request and push to main. Nothing here reaches production or
+# signs in as the test user. Report-only: nothing here is a required status.
+#
+# The prod-safe contract tests also run against production in
+# agent-j0-probe.yml, so on those rules a mock that drifts from the contract
+# fails here, and a production that drifts from the mock fails there. The
+# mock-only rules (the caps, the kill switch, expiry) are held to the
+# contract alone: nothing compares them with production.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  j0:
+    name: Contract suite and J0 on the mock
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - id: chromium
+        name: Install Chromium
+        run: pnpm exec playwright install --with-deps --only-shell chromium
+
+      # The mock keeps running for the job's later steps.
+      - name: Start the mock
+        run: |
+          pnpm mock --port 4010 > "$RUNNER_TEMP/mock.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:4010/__mock/calls; then exit 0; fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/mock.log"
+          exit 1
+
+      - name: Run the contract suite and J0 on the mock
+        run: pnpm j0 --env mock --contract all
+
+      # Redacted by the mock, and checked for credentials by the run itself.
+      - name: Save the mock's call log
+        if: always()
+        run: |
+          mkdir -p results
+          curl -sf http://127.0.0.1:4010/__mock/calls > results/mock-calls.json || echo "the mock did not answer"
+
+      # After the run on the mock, so a browser failure leaves the mock's
+      # result standing, and whatever the mock steps did, once Chromium is in.
+      # The unit job installs no browser.
+      - name: Browser tests
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' }}
+        run: pnpm test:browser
+
+      # A handler error answers 500 mock_error, which says nothing of why: the
+      # mock writes the error to its log, and the job fails on one.
+      - name: Print the mock's log, and fail on a handler error
+        if: always()
+        run: |
+          if [[ ! -f "$RUNNER_TEMP/mock.log" ]]; then
+            echo "the mock was never started"
+            exit 0
+          fi
+          cat "$RUNNER_TEMP/mock.log"
+          if grep -q '^mock error: ' "$RUNNER_TEMP/mock.log"; then
+            echo "::error::the mock logged a handler error"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: j0-mock-results
+          path: results/
+          if-no-files-found: ignore

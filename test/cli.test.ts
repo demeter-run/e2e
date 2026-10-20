@@ -106,8 +106,10 @@ describe('pnpm check', () => {
     assert.equal(await run('nope', '--env', 'production'), 2)
     assert.equal(await run('passes'), 2)
     assert.equal(await run('passes', '--env', 'staging'), 2)
+    assert.equal(await run('passes', '--env', 'mock'), 2)
     assert.deepEqual(await readdir(dir), [])
     assert.match(String(error.mock.calls[0]!.arguments[0]), /^unknown check "nope"/)
+    assert.match(String(error.mock.calls[3]!.arguments[0]), /^the mock serves only the agent routes/)
   })
 })
 

@@ -68,6 +68,9 @@ export async function main(argv: string[], { checks = allChecks, suite }: { chec
     } catch (error) {
       throw new UsageError((error as Error).message)
     }
+    if (env.name === 'mock') {
+      throw new UsageError('the mock serves only the agent routes, which the checks do not read: pnpm j0 --env mock or pnpm contract --env mock')
+    }
     const names = suite ? 'all' : parsed.positionals[0]!
     selected =
       names === 'all'

@@ -1,0 +1,642 @@
+import assert from 'node:assert/strict'
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import type { ServerResponse } from 'node:http'
+import type { Socket } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { after, afterEach, before, beforeEach, describe, it, mock as mocks } from 'node:test'
+import {
+  type AgentAnswer,
+  addRegistrationSecrets,
+  call,
+  dotenvVars,
+  names,
+  parseDotenv,
+  registerWithPort,
+  Secrets,
+} from '../src/agent/client.ts'
+import { contractTests, runContract } from '../src/agent/contract.spec.ts'
+import { j0, type J0Waits, j0Waits } from '../src/agent/j0.ts'
+import { main } from '../src/cli/agent.ts'
+import { type Environment, environment, environments } from '../src/env.ts'
+import { mockCalls, mockState, resetMock, setMockState } from '../src/mock/control.ts'
+import { type Mock, startMock } from '../src/mock/server.ts'
+import { Run, type Result } from '../src/report.ts'
+import { refusedUrl, type Served, serve, withEnv } from './helpers.ts'
+
+// Under node:test, a `::add-mask::` line that `Secrets` prints reaches the job
+// log as a `# ` diagnostic, which Actions does not read as a command: every
+// throwaway credential a test makes would print in plain text. This file's
+// process masks nothing; the test of the masking sets the variable itself.
+delete process.env.GITHUB_ACTIONS
+
+let mock: Mock
+let env: Environment
+
+before(async () => {
+  mock = await startMock({ port: 0 })
+  env = { ...environments.mock, console: mock.url }
+})
+after(() => mock.close())
+beforeEach(() => resetMock(env))
+
+/** A request as the rewriting proxy forwards it. */
+interface Seen {
+  method: string
+  path: string
+  headers: Record<string, string>
+  body: string
+}
+
+/**
+ * The mock behind a server that rewrites what it answers (status, headers,
+ * body), the way a drifted mock or a broken production would. Calls to it are
+ * forwarded whole, and the mock's origin in what it answers becomes the
+ * proxy's, as `--base-url` would write it.
+ */
+async function rewriting(rewrite: (answer: AgentAnswer, request: Seen) => AgentAnswer): Promise<Served> {
+  let self = ''
+  const served = await serve(async (request, response) => {
+    const chunks: Buffer[] = []
+    for await (const chunk of request) chunks.push(chunk as Buffer)
+    const headers = Object.fromEntries(Object.entries(request.headers).flatMap(([k, v]) => (typeof v === 'string' && k !== 'host' ? [[k, v]] : [])))
+    const body = Buffer.concat(chunks).toString('utf8')
+    const answer = await call(request.method ?? 'GET', `${mock.url}${request.url}`, { headers, ...(body ? { body } : {}) })
+    const out = rewrite({ ...answer, body: answer.body.split(mock.url).join(self) }, { method: request.method ?? 'GET', path: request.url ?? '', headers, body })
+    const { 'transfer-encoding': _te, connection: _c, 'content-length': _cl, ...kept } = out.headers
+    response.writeHead(out.status ?? 502, { ...kept, 'content-length': String(Buffer.byteLength(out.body)) })
+    response.end(out.body)
+  })
+  self = served.url
+  return served
+}
+
+/** A rewrite of the bodies of one path only. */
+const onBody =
+  (path: string, edit: (body: string) => string) =>
+  (answer: AgentAnswer, request: Seen): AgentAnswer =>
+    request.path === path ? { ...answer, body: edit(answer.body) } : answer
+
+/** A rewrite of the contract's error answers only. */
+const onError =
+  (edit: (answer: AgentAnswer, request: Seen) => AgentAnswer) =>
+  (answer: AgentAnswer, request: Seen): AgentAnswer =>
+    answer.body.startsWith('{"error"') ? edit(answer, request) : answer
+
+async function contractOn(target: Environment) {
+  const secrets = new Secrets()
+  const run = new Run('agent-contract', target.name)
+  let made: ReturnType<typeof registerWithPort> | undefined
+  await runContract(run, { env: target, secrets, registration: () => (made ??= registerWithPort(target, secrets, 'e2e-contract')) })
+  return run.finish()
+}
+
+/** The contract suite's result through a proxy making `rewrite`. */
+async function contractThrough(rewrite: (answer: AgentAnswer, request: Seen) => AgentAnswer): Promise<Result> {
+  const proxy = await rewriting(rewrite)
+  try {
+    return await contractOn({ ...env, console: proxy.url })
+  } finally {
+    await proxy.close()
+  }
+}
+
+const failed = (result: Result) => result.steps.filter((s) => !s.ok).map((s) => s.name)
+
+/** The detail of the step whose name starts with `prefix`, which must have failed. */
+function failedDetail(result: Result, prefix: string): string {
+  const step = result.steps.find((s) => s.name.startsWith(prefix))
+  assert.ok(step, `no step starts with ${prefix}`)
+  assert.equal(step.ok, false, `${step.name} passed: ${step.detail}`)
+  return step.detail
+}
+
+describe('the contract suite', () => {
+  it('passes every test on the mock, prod-safe and mock-only', async () => {
+    const result = await contractOn(env)
+    assert.deepEqual(failed(result), [])
+    assert.equal(result.steps.length, contractTests.length)
+    assert.ok(contractTests.some((t) => t.tag === 'mock-only') && contractTests.some((t) => t.tag === 'prod-safe'))
+  })
+
+  it('passes through a proxy that changes nothing, so the tests below fail for their rewrite alone', async () => {
+    assert.deepEqual(failed(await contractThrough((answer) => answer)), [])
+  })
+
+  it('fails when one dotenv line name drifts, which is the drift guard', async () => {
+    const result = await contractThrough(onBody('/api/agent/register', (body) => body.replace('DEMETER_USER_CODE=', 'DEMETER_DEVICE_CODE=')))
+    assert.deepEqual(failed(result), [
+      '[prod-safe] register answers a dotenv body of the six lines, in order',
+      "[prod-safe] register's values have the contract's formats",
+    ])
+    assert.match(result.steps[0]!.detail, /DEMETER_DEVICE_CODE/)
+  })
+
+  it('fails when a ports line moves out of order', async () => {
+    const result = await contractThrough(
+      onBody('/api/agent/ports', (body) => {
+        if (!body.includes('_KEY=')) return body
+        const [id, url, key] = body.trimEnd().split('\n')
+        return `${id}\n${key}\n${url}\n`
+      }),
+    )
+    assert.deepEqual(failed(result), ['[prod-safe] ports answers a dotenv body of _PORT_ID, _URL (then _URL_2, _URL_3…) and _KEY, in order'])
+  })
+
+  it('fails a body in another form (CRLF, export, spaces), naming its lines and never printing a value', async () => {
+    let body = ''
+    const result = await contractThrough(
+      onBody('/api/agent/register', (text) => {
+        if (!text.includes('DEMETER_API_KEY=')) return text
+        const lines = text.trimEnd().split('\n')
+        body = [lines[0], `export ${lines[1]}`, lines[2]!.replace('=', ' = '), ...lines.slice(3).map((l) => `${l}\r`)].join('\n')
+        return `${body}\n`
+      }),
+    )
+    const detail = failedDetail(result, '[prod-safe] register answers a dotenv body')
+    assert.match(detail, /DEMETER_PROJECT_NAMESPACE \(not NAME=value\), DEMETER_API_KEY \(not NAME=value\), DEMETER_CLAIM_URL \(not NAME=value\)/)
+    const vars = dotenvVars(body)
+    for (const value of [vars.get('DEMETER_API_KEY')!, vars.get('DEMETER_USER_CODE')!, new URL(vars.get('DEMETER_CLAIM_URL')!).pathname]) {
+      assert.ok(value.length >= 9 && !JSON.stringify(result).includes(value), `the result carries ${value.slice(0, 4)}…`)
+    }
+  })
+
+  it('fails a dotenv answer that may be cached', async () => {
+    const result = await contractThrough((answer, request) =>
+      request.path === '/api/agent/register' ? { ...answer, headers: { ...answer.headers, 'cache-control': 'private' } } : answer,
+    )
+    assert.deepEqual(failed(result), ['[prod-safe] register answers a dotenv body of the six lines, in order'])
+    assert.match(result.steps[0]!.detail, /Cache-Control is "private", wanted "no-store"/)
+  })
+
+  it("fails an error whose status alone drifts, and one whose code alone does", async () => {
+    const status = await contractThrough(onError((answer) => (answer.status === 401 ? { ...answer, status: 403 } : answer)))
+    assert.match(failedDetail(status, '[prod-safe] a bad API key'), /answered 403 unauthenticated, wanted 401 unauthenticated/)
+    const code = await contractThrough(
+      onError((answer, request) => (request.path === '/api/agent/register' ? { ...answer, body: answer.body.replace('"invalid_request"', '"bad_request"') } : answer)),
+    )
+    assert.deepEqual(failed(code), ['[prod-safe] a 65-character agent name is 400 invalid_request'])
+    assert.match(code.steps.find((s) => !s.ok)!.detail, /answered 400 bad_request, wanted 400 invalid_request/)
+  })
+
+  it('fails an error that is not JSON, or whose docs link moved', async () => {
+    const text = await contractThrough(onError((answer) => ({ ...answer, headers: { ...answer.headers, 'content-type': 'text/plain' } })))
+    assert.match(failedDetail(text, '[prod-safe] a 65-character'), /Content-Type is "text\/plain", wanted JSON/)
+    const docs = await contractThrough(onError((answer) => ({ ...answer, body: answer.body.replace('https://demeter.run/auth.md', 'https://demeter.run/docs') })))
+    assert.match(failedDetail(docs, '[prod-safe] a bad API key'), /docs is "https:\/\/demeter.run\/docs", wanted "https:\/\/demeter.run\/auth.md"/)
+  })
+
+  it('fails an error body that carries the key the request sent, without printing it', async () => {
+    const result = await contractThrough(
+      onError((answer, request) =>
+        request.headers['dmtr-api-key'] ? { ...answer, body: answer.body.replace('"message":"', `"message":"${request.headers['dmtr-api-key']} `) } : answer,
+      ),
+    )
+    assert.match(failedDetail(result, '[prod-safe] a bad API key'), /carries the key the request sent/)
+    assert.match(failedDetail(result, '[prod-safe] an error body'), /carries the API key/)
+    assert.ok(!JSON.stringify(result).includes('dmtr_apikey1'), 'the result carries a key')
+  })
+
+  it('fails a claim token of another length, and an expiry other than 7 days away', async () => {
+    const token = await contractThrough(onBody('/api/agent/register', (body) => body.replace(/(\/claim\/[A-Za-z0-9_-]+)[A-Za-z0-9_-]\n/, '$1\n')))
+    assert.match(failedDetail(token, "[prod-safe] register's values"), /^the claim token is not 32 bytes of base64url$/)
+    const sixDays = new Date(Date.now() + 6 * 86_400_000).toISOString().replace('Z', '+00:00')
+    const expiry = await contractThrough(onBody('/api/agent/register', (body) => body.replace(/DEMETER_EXPIRES_AT=.*/, `DEMETER_EXPIRES_AT=${sixDays}`)))
+    assert.match(failedDetail(expiry, "[prod-safe] register's values"), /^DEMETER_EXPIRES_AT .* is not 7 days away$/)
+  })
+
+  it('fails each value, header and line the contract fixes, when it alone drifts', async () => {
+    // Seven days ahead to the second, as UTC with its Z, so only the zone a case writes is wrong.
+    const inSevenDays = () => new Date(Math.floor(Date.now() / 1000) * 1000 + 7 * 86_400_000).toISOString().replace('.000Z', 'Z')
+    const register = (edit: (body: string) => string) => onBody('/api/agent/register', edit)
+    const ports = (edit: (body: string) => string) => onBody('/api/agent/ports', (body) => (body.includes('_KEY=') ? edit(body) : body))
+    const cases: [string, (answer: AgentAnswer, request: Seen) => AgentAnswer, string, RegExp][] = [
+      [
+        'a dotenv answer of another type',
+        (answer, request) => (request.path === '/api/agent/register' && answer.status === 200 ? { ...answer, headers: { ...answer.headers, 'content-type': 'text/html' } } : answer),
+        '[prod-safe] register answers a dotenv body',
+        /^register's dotenv answer: Content-Type is "text\/html", wanted "text\/plain; charset=utf-8"$/,
+      ],
+      ['an error with no message', onError((answer) => ({ ...answer, body: answer.body.replace(/"message":"[^"]*"/, '"message":""') })), '[prod-safe] a bad API key', /^401 unauthenticated, but it has no message$/],
+      ['a project id that is not a UUID', register((b) => b.replace(/DEMETER_PROJECT_ID=.*/, 'DEMETER_PROJECT_ID=project-1')), "[prod-safe] register's values", /^DEMETER_PROJECT_ID is not a UUID$/],
+      ['a namespace with capitals', register((b) => b.replace(/DEMETER_PROJECT_NAMESPACE=.*/, 'DEMETER_PROJECT_NAMESPACE=Mock_Project')), "[prod-safe] register's values", /^DEMETER_PROJECT_NAMESPACE is not a namespace$/],
+      ['a key of another kind', register((b) => b.replace('DEMETER_API_KEY=dmtr_apikey1', 'DEMETER_API_KEY=dmtr_apikey2')), "[prod-safe] register's values", /^DEMETER_API_KEY is not dmtr_apikey1…$/],
+      [
+        'a claim URL off the Console',
+        register((b) => b.replace(/DEMETER_CLAIM_URL=http:\/\/[^/]+/, 'DEMETER_CLAIM_URL=http://elsewhere.example')),
+        "[prod-safe] register's values",
+        /^DEMETER_CLAIM_URL is not http:\/\/127\.0\.0\.1:\d+\/claim\/<token>$/,
+      ],
+      [
+        'an expiry shaped as RFC 3339 that is no date',
+        register((b) => b.replace(/DEMETER_EXPIRES_AT=.*/, 'DEMETER_EXPIRES_AT=2026-13-45T00:00:00+00:00')),
+        "[prod-safe] register's values",
+        /^DEMETER_EXPIRES_AT "2026-13-45T00:00:00\+00:00" is not an RFC 3339 UTC date$/,
+      ],
+      [
+        'an expiry on a day the month lacks',
+        register((b) => b.replace(/DEMETER_EXPIRES_AT=.*/, 'DEMETER_EXPIRES_AT=2026-02-30T00:00:00Z')),
+        "[prod-safe] register's values",
+        /^DEMETER_EXPIRES_AT "2026-02-30T00:00:00Z" is not an RFC 3339 UTC date$/,
+      ],
+      [
+        'an expiry with a space for its T',
+        register((b) => b.replace(/(DEMETER_EXPIRES_AT=\d{4}-\d\d-\d\d)T/, '$1 ')),
+        "[prod-safe] register's values",
+        /^DEMETER_EXPIRES_AT "[^"]+" is not an RFC 3339 UTC date$/,
+      ],
+      [
+        'an expiry with no zone',
+        register((b) => b.replace(/DEMETER_EXPIRES_AT=.*/, `DEMETER_EXPIRES_AT=${inSevenDays().replace('Z', '')}`)),
+        "[prod-safe] register's values",
+        /^DEMETER_EXPIRES_AT "[^"]+" is not an RFC 3339 UTC date$/,
+      ],
+      [
+        'an expiry with a zone written +0000',
+        register((b) => b.replace(/DEMETER_EXPIRES_AT=.*/, `DEMETER_EXPIRES_AT=${inSevenDays().replace('Z', '+0000')}`)),
+        "[prod-safe] register's values",
+        /^DEMETER_EXPIRES_AT "[^"]+\+0000" is not an RFC 3339 UTC date$/,
+      ],
+      [
+        'a user code with a letter outside the alphabet',
+        register((b) => b.replace(/DEMETER_USER_CODE=./, 'DEMETER_USER_CODE=O')),
+        "[prod-safe] register's values",
+        /^DEMETER_USER_CODE is not XXXX-XXXX in the contract alphabet$/,
+      ],
+      [
+        'a register answer that is plain text with no charset',
+        (answer, request) => (request.path === '/api/agent/register' && answer.status === 200 ? { ...answer, headers: { ...answer.headers, 'content-type': 'text/plain' } } : answer),
+        '[prod-safe] register answers a dotenv body',
+        /^register's dotenv answer: Content-Type is "text\/plain", wanted "text\/plain; charset=utf-8"$/,
+      ],
+      [
+        'a ports answer of another type',
+        (answer, request) => (request.path === '/api/agent/ports' && answer.status === 200 ? { ...answer, headers: { ...answer.headers, 'content-type': 'text/html' } } : answer),
+        '[prod-safe] ports answers',
+        /^ports's dotenv answer: Content-Type is "text\/html", wanted "text\/plain; charset=utf-8"$/,
+      ],
+      [
+        'a ports answer that may be cached',
+        (answer, request) => (request.path === '/api/agent/ports' && answer.status === 200 ? { ...answer, headers: { ...answer.headers, 'cache-control': 'private' } } : answer),
+        '[prod-safe] ports answers',
+        /^ports's dotenv answer: Cache-Control is "private", wanted "no-store"$/,
+      ],
+      [
+        'ports with no _URL',
+        ports((b) => b.replace(/^DEMETER_BLOCKFROST_PREPROD_URL=.*\n/m, '')),
+        '[prod-safe] ports answers',
+        /answered DEMETER_BLOCKFROST_PREPROD_PORT_ID, DEMETER_BLOCKFROST_PREPROD_KEY, wanted/,
+      ],
+      ['a _URL that is not a URL', ports((b) => b.replace(/^(DEMETER_BLOCKFROST_PREPROD_URL)=.*$/m, '$1=not-a-url')), '[prod-safe] ports answers', /^DEMETER_BLOCKFROST_PREPROD_URL is empty or not a URL$/],
+      ['a _URL of another scheme', ports((b) => b.replace(/^(DEMETER_BLOCKFROST_PREPROD_URL)=http/m, '$1=ftp')), '[prod-safe] ports answers', /^DEMETER_BLOCKFROST_PREPROD_URL is empty or not a URL$/],
+      ['an empty _KEY', ports((b) => b.replace(/^(DEMETER_BLOCKFROST_PREPROD_KEY)=.*$/m, '$1=')), '[prod-safe] ports answers', /^DEMETER_BLOCKFROST_PREPROD_KEY is empty or not a URL$/],
+      [
+        'an unknown kind whose message lists no kinds',
+        onError((answer) => ({ ...answer, body: answer.body.replace(/use one of [A-Za-z, ]+\./, 'use a kind the Console knows.') })),
+        '[prod-safe] the port catalog',
+        /^an unknown kind answered 400 invalid_request with no list of kinds, so a kind the mock lacks would go unseen$/,
+      ],
+      [
+        'an unknown kind whose list lost one the mock knows',
+        onError((answer) => ({ ...answer, body: answer.body.replace(', UtxoRpcPort.', '.') })),
+        '[prod-safe] the port catalog',
+        /^the mock knows UtxoRpcPort, which the Console does not$/,
+      ],
+      [
+        "an ip_cap whose retry_after_seconds is not the mock's",
+        onError((answer) => ({ ...answer, body: answer.body.replace('"retry_after_seconds":4321', '"retry_after_seconds":60') })),
+        '[mock-only] ip_cap',
+        /^retry_after_seconds is 60, wanted the mock's 4321$/,
+      ],
+    ]
+    for (const [what, rewrite, step, detail] of cases) assert.match(failedDetail(await contractThrough(rewrite), step), detail, what)
+  })
+
+  it('fails an ip_cap whose Retry-After differs from retry_after_seconds', async () => {
+    const result = await contractThrough((answer) => (answer.headers['retry-after'] ? { ...answer, headers: { ...answer.headers, 'retry-after': '60' } } : answer))
+    assert.deepEqual(failed(result), ['[mock-only] ip_cap is 429 with retry_after_seconds and the same Retry-After'])
+    assert.match(result.steps.find((s) => !s.ok)!.detail, /Retry-After is "60", wanted "4321"/)
+  })
+
+  it("fails when the Console's port catalog drifts from the mock's", async () => {
+    const gone = await contractThrough((answer, request) =>
+      request.path === '/api/agent/ports' && request.body.includes('"KupoPort"') && request.body.includes('cardano-preview') && answer.status === 401
+        ? { ...answer, status: 400, body: answer.body.replace('"unauthenticated"', '"invalid_request"') }
+        : answer,
+    )
+    assert.deepEqual(failed(gone), ["[prod-safe] the port catalog on preprod and preview is the mock's"])
+    assert.match(gone.steps.find((s) => !s.ok)!.detail, /^KupoPort on cardano-preview answered 400 invalid_request, wanted 401 unauthenticated$/)
+    const added = await contractThrough(onError((answer) => ({ ...answer, body: answer.body.replace('UtxoRpcPort.', 'UtxoRpcPort, WarpPort.') })))
+    assert.match(failedDetail(added, '[prod-safe] the port catalog'), /^the Console knows WarpPort, which the mock does not$/)
+  })
+
+  it("switches a mock error state on for one test and puts the route's previous state back", async () => {
+    await setMockState(env, { route: 'register', error: 'registration_disabled' })
+    const globalCap = contractTests.find((t) => t.name === 'global_cap is 503')!
+    await globalCap.run({ env, secrets: new Secrets(), registration: () => Promise.reject(new Error('unused')) })
+    assert.deepEqual((await mockState(env)).errors, { register: { error: 'registration_disabled' } })
+  })
+})
+
+describe('the agent CLI', () => {
+  let dir: string
+  let log: ReturnType<typeof mocks.method>
+  let error: ReturnType<typeof mocks.method>
+  /** Production by name, where nothing listens: a guard that regressed would fail here, not register there. */
+  let production: Environment
+
+  before(async () => {
+    const dead = await refusedUrl()
+    production = { ...environments.production, website: dead, console: dead, legacy: dead, rpc: dead, auth0: dead }
+  })
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'e2e-agent-'))
+    log = mocks.method(console, 'log', () => {})
+    error = mocks.method(console, 'error', () => {})
+  })
+  afterEach(async () => {
+    log.mock.restore()
+    error.mock.restore()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  const lookup = (name: string) => (name === 'mock' ? env : name === 'production' ? production : environment(name))
+  const quiet = { IRM_E2E_WEBHOOK_URL: undefined, GITHUB_STEP_SUMMARY: undefined, GITHUB_ACTIONS: undefined }
+  const run = (suite: 'j0' | 'contract', vars: Record<string, string | undefined>, ...argv: string[]) =>
+    withEnv({ ...quiet, ...vars }, () => main(suite, [...argv, '--results', dir], { lookup }))
+  const usageError = () => String(error.mock.calls[0]?.arguments[0]).split('\n')[0] ?? ''
+
+  it('runs the contract on the mock and writes its result, with the leak check last', async () => {
+    assert.equal(await run('contract', {}, '--env', 'mock'), 0)
+    assert.deepEqual(await readdir(dir), ['agent-contract.json'])
+    const result = JSON.parse(await readFile(join(dir, 'agent-contract.json'), 'utf8')) as Result
+    assert.equal(result.ok, true)
+    assert.equal(result.steps.at(-1)!.name, 'no credential in a result or the call log')
+  })
+
+  it('runs only the tests of one tag', async () => {
+    assert.equal(await run('contract', {}, '--env', 'mock', '--tag', 'mock-only'), 0)
+    const result = JSON.parse(await readFile(join(dir, 'agent-contract.json'), 'utf8')) as Result
+    assert.ok(result.steps.slice(1, -1).every((s) => s.name.startsWith('[mock-only]')))
+  })
+
+  it('starts from an empty mock, so an error state another client left on fails nothing', async () => {
+    await setMockState(env, { route: 'register', error: 'ip_cap' })
+    assert.equal(await run('contract', {}, '--env', 'mock'), 0)
+    const result = JSON.parse(await readFile(join(dir, 'agent-contract.json'), 'utf8')) as Result
+    assert.equal(result.steps[0]!.name, 'start from an empty mock')
+  })
+
+  it('fails the leak check, exits 1 and writes a scrubbed result, when a credential reaches a result', async () => {
+    // A Console that names the API key as its error code, which a test prints.
+    let key = ''
+    const leaky = await rewriting((answer, request) => {
+      if (request.path === '/api/agent/register' && answer.status === 200) key = dotenvVars(answer.body).get('DEMETER_API_KEY') ?? key
+      return request.path === '/api/agent/ports' && answer.status === 401 ? { ...answer, body: answer.body.replace('"unauthenticated"', JSON.stringify(key)) } : answer
+    })
+    try {
+      const code = await withEnv({ ...quiet }, () => main('contract', ['--env', 'mock', '--results', dir], { lookup: () => ({ ...env, console: leaky.url }) }))
+      assert.equal(code, 1)
+      const written = await readFile(join(dir, 'agent-contract.json'), 'utf8')
+      const leak = (JSON.parse(written) as Result).steps.at(-1)!
+      assert.deepEqual([leak.name, leak.ok, leak.detail], ['no credential in a result or the call log', false, 'the agent-contract result carries the API key'])
+      assert.ok(key && !written.includes(key), 'the written result carries the key')
+    } finally {
+      await leaky.close()
+    }
+  })
+
+  it('refuses to run the contract alone on production, where only J0 may register', async () => {
+    assert.equal(await run('contract', {}, '--env', 'production'), 2)
+    assert.match(usageError(), /only inside J0/)
+  })
+
+  it('fails J0 on production without the password, unset or empty as Actions passes a missing secret, in a result its alert carries, registering nothing', async () => {
+    for (const password of [undefined, '']) {
+      log.mock.resetCalls()
+      assert.equal(await run('j0', { E2E_USER_PASSWORD: password }, '--env', 'production', '--contract', 'prod-safe', '--alert'), 1)
+      assert.deepEqual(await readdir(dir), ['j0.json'])
+      const result = JSON.parse(await readFile(join(dir, 'j0.json'), 'utf8')) as Result
+      assert.deepEqual(
+        result.steps.map((s) => [s.name, s.ok]),
+        [
+          ['sign in as e2e@txpipe.io', false],
+          ['no credential in a result or the call log', true],
+        ],
+        JSON.stringify(password),
+      )
+      assert.match(result.steps[0]!.detail, /E2E_USER_PASSWORD is not set/)
+      assert.ok(log.mock.calls.some((c) => /alert skipped for j0/.test(String(c.arguments[0]))), 'no alert was tried')
+    }
+  })
+
+  it("refuses the mock-only tests on production, which has no error states to switch", async () => {
+    assert.equal(await run('j0', { E2E_USER_PASSWORD: 'x' }, '--env', 'production', '--contract', 'all'), 2)
+    assert.match(usageError(), /--contract prod-safe off the mock/)
+  })
+
+  it('refuses a flag of the other suite, or a value it does not know', async () => {
+    assert.equal(await run('j0', {}, '--env', 'mock', '--tag', 'prod-safe'), 2)
+    assert.equal(await run('contract', {}, '--env', 'mock', '--contract', 'all'), 2)
+    assert.equal(await run('j0', {}, '--env', 'mock', '--contract', 'some'), 2)
+    assert.equal(await run('contract', {}, '--env', 'nowhere'), 2)
+  })
+})
+
+describe('Secrets', () => {
+  it('scrubs the longest credential first and names the kinds a text carries', () => {
+    const secrets = new Secrets()
+    secrets.add('API key', 'dmtr_apikey1abcdef')
+    secrets.add('claim token', 'dmtr_apikey1abcdef-and-more')
+    secrets.add('short', 'abc')
+    assert.equal(secrets.scrub('a dmtr_apikey1abcdef-and-more b dmtr_apikey1abcdef abc'), 'a [redacted] b [redacted] abc')
+    assert.deepEqual(secrets.find('x dmtr_apikey1abcdef y'), ['API key'])
+    assert.equal(secrets.size, 2)
+  })
+
+  it('masks each credential in the GitHub Actions log as it arrives', async () => {
+    const log = mocks.method(console, 'log', () => {})
+    try {
+      await withEnv({ GITHUB_ACTIONS: 'true' }, () => new Secrets().add('API key', 'dmtr_apikey1abcdef'))
+      assert.deepEqual(log.mock.calls.map((c) => c.arguments[0]), ['::add-mask::dmtr_apikey1abcdef'])
+    } finally {
+      log.mock.restore()
+    }
+  })
+})
+
+describe('parseDotenv and dotenvVars', () => {
+  it('keeps the order, and a line that is not NAME=value with no value and only the name it seems to carry', () => {
+    assert.deepEqual(parseDotenv('A=1\nnot a line\nB_2=x=y\nexport C=secret\nD = secret\nE=secret\r\n'), [
+      { name: 'A', value: '1' },
+      { name: '(a line that is not NAME=value)', value: null },
+      { name: 'B_2', value: 'x=y' },
+      { name: 'C (not NAME=value)', value: null },
+      { name: 'D (not NAME=value)', value: null },
+      { name: 'E (not NAME=value)', value: null },
+    ])
+    assert.ok(!names('X=1\nsecret-value-here\nY = secret-value-here\n').join().includes('secret'))
+  })
+
+  it('reads values as leniently as a dotenv loader, so a body in another form still yields its credentials', () => {
+    assert.deepEqual([...dotenvVars('A=1\r\nexport B=two\nC = "three"\n  D=\'4\'\nnot a line\nE=x=y\n')], [
+      ['A', '1'],
+      ['B', 'two'],
+      ['C', 'three'],
+      ['D', '4'],
+      ['E', 'x=y'],
+    ])
+  })
+})
+
+describe('the credentials a body hands out', () => {
+  it('takes the claim URL whole and its token from the path or the query, and the user code with and without its hyphen', () => {
+    const secrets = new Secrets()
+    addRegistrationSecrets(
+      secrets,
+      'DEMETER_API_KEY=dmtr_apikey1aaaaaaaa\nDEMETER_CLAIM_URL=https://console.example/claim?token=tok%2Ben-in-query&x=1\nDEMETER_USER_CODE=ABCD-2345\n',
+    )
+    const text = 'https://console.example/claim?token=tok%2Ben-in-query&x=1 /claim?token=tok%2Ben-in-query tok+en-in-query ABCD2345 ABCD-2345 dmtr_apikey1aaaaaaaa'
+    assert.equal(secrets.scrub(text), '[redacted] /claim?token=[redacted] [redacted] [redacted] [redacted] [redacted]')
+  })
+
+  it('takes the claim token from the path, whether or not the URL has a query', () => {
+    for (const url of ['https://console.example/claim/Path-form_token-0123456789', 'https://console.example/claim/Path-form_token-0123456789?from=x']) {
+      const secrets = new Secrets()
+      addRegistrationSecrets(secrets, `DEMETER_CLAIM_URL=${url}\n`)
+      assert.equal(secrets.scrub('at /claim/Path-form_token-0123456789, or Path-form_token-0123456789 alone'), 'at /claim/[redacted], or [redacted] alone', url)
+    }
+  })
+
+  it('takes every dmtr_ key in a body, whatever its line looks like', () => {
+    const secrets = new Secrets()
+    addRegistrationSecrets(secrets, 'export DEMETER_API_KEY = "dmtr_apikey1bbbbbbbb"\r\nsomething dmtr_apikey1cccccccc\n')
+    assert.equal(secrets.scrub('dmtr_apikey1bbbbbbbb dmtr_apikey1cccccccc'), '[redacted] [redacted]')
+  })
+})
+
+describe('J0 up to the browser', () => {
+  const fast: Partial<J0Waits> = { firstRequestMs: 2_000, requestEveryMs: 10, landingMs: 200, deleteEveryMs: 10, goneMs: 200, pageEveryMs: 10 }
+  const step = (result: Result, prefix: string) => result.steps.find((s) => s.name.startsWith(prefix)) ?? assert.fail(`no step starts with ${prefix}`)
+
+  it('opens no browser on a claim URL off the Console, so nothing is typed there', async () => {
+    // The same mock under another name: the browser would reach it.
+    const proxy = await rewriting(onBody('/api/agent/register', (body) => body.replace(/DEMETER_CLAIM_URL=http:\/\/127\.0\.0\.1:/, 'DEMETER_CLAIM_URL=http://localhost:')))
+    try {
+      const target = { ...env, console: proxy.url, auth0: proxy.url }
+      const run = new Run('j0', target.name)
+      await j0({ env: target, run, secrets: new Secrets(), user: 'e2e-j0@mock', password: 'mock', waits: fast })
+      const result = run.finish()
+      assert.match(step(result, 'claim in the browser').detail, /^DEMETER_CLAIM_URL is on http:\/\/localhost:\d+, not the Console \(http:\/\/127\.0\.0\.1:\d+\), so the browser does not open it$/)
+      assert.equal(step(result, 'the claim page offered').detail, 'not run: the claim form never showed')
+      assert.ok(!(await mockCalls(target)).some((c) => c.path.startsWith('/login') || c.path.startsWith('/claim')), 'the browser went to the claim page or the sign-in')
+    } finally {
+      await proxy.close()
+    }
+  })
+
+  type Answers = (response: ServerResponse, socket: Socket) => void
+
+  /** J0 against a stand-in Console whose register (and ports) answer as given, so the delete step runs as on production. */
+  async function j0Against(register: Answers, ports?: Answers): Promise<Result> {
+    const standIn = await serve((request, response) => {
+      request.resume()
+      if (request.url === '/api/agent/register') register(response, request.socket)
+      else if (request.url === '/api/agent/ports' && ports) ports(response, request.socket)
+      else response.writeHead(404).end()
+    })
+    try {
+      const url = standIn.url
+      const run = new Run('j0', 'standin')
+      await j0({ env: { name: 'standin', website: url, console: url, legacy: url, rpc: url, auth0: url }, run, secrets: new Secrets(), user: 'e2e@txpipe.io', password: 'x', waits: fast })
+      return run.finish()
+    } finally {
+      await standIn.close()
+    }
+  }
+
+  const json = (status: number, error: string) => (response: ServerResponse) =>
+    response.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error, message: 'm', docs: 'https://demeter.run/auth.md' }))
+
+  it('says a refused registration left nothing, and one that may have registered expires unclaimed', async () => {
+    const refused = await j0Against(json(429, 'ip_cap'))
+    assert.equal(step(refused, 'register as agent').detail, 'register answered 429 ip_cap, wanted 200')
+    assert.deepEqual([step(refused, 'delete').ok, step(refused, 'delete').detail], [true, 'register answered 429 ip_cap: nothing was registered, so nothing is left behind'])
+    const broken = await j0Against(json(500, 'internal'))
+    assert.match(step(broken, 'delete').detail, /^register answered 500 internal: a project may have been registered without this run learning it, and if so it expires unclaimed within 7 days$/)
+  })
+
+  it('fails a 200 whose body did not finish, naming the reset, and says its project expires unclaimed', async () => {
+    const result = await j0Against((response, socket) => {
+      response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'content-length': '500' })
+      response.write('DEMETER_PROJECT_ID=7e0b2f9c-0000-4000-8000-000000000000\n')
+      setTimeout(() => socket.destroy(), 20)
+    })
+    assert.equal(step(result, 'register as agent').detail, 'register answered 200, but the body did not finish: ECONNRESET, wanted 200')
+    assert.match(step(result, 'delete').detail, /^register answered 200, but the body did not finish: ECONNRESET: a project may have been registered without this run learning it/)
+  })
+
+  /** A register body whole but for `drop`, with its claim URL off every Console, so no browser opens. */
+  const registered = (drop = '') => (response: ServerResponse) =>
+    response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end(
+      [
+        'DEMETER_PROJECT_ID=7e0b2f9c-0000-4000-8000-000000000000',
+        'DEMETER_PROJECT_NAMESPACE=prj-stand-in-abc123',
+        'DEMETER_API_KEY=dmtr_apikey1qqqqqqqq',
+        'DEMETER_CLAIM_URL=http://elsewhere.invalid/claim/stand-in-token',
+        'DEMETER_USER_CODE=ABCD-2345',
+        'DEMETER_EXPIRES_AT=2026-10-27T12:00:00Z',
+      ]
+        .filter((line) => !drop || !line.startsWith(drop))
+        .map((line) => `${line}\n`)
+        .join(''),
+    )
+
+  it('fails a ports 200 whose body did not finish, naming the reset', async () => {
+    const result = await j0Against(registered(), (response, socket) => {
+      response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'content-length': '500' })
+      response.write('DEMETER_BLOCKFROST_PREPROD_PORT_ID=port-1\n')
+      setTimeout(() => socket.destroy(), 20)
+    })
+    assert.equal(step(result, 'create a Blockfrost port').detail, 'ports answered 200, but the body did not finish: ECONNRESET, wanted 200')
+  })
+
+  for (const [what, line, registerDetail] of [
+    ['no namespace', '', 'register answered 200 without DEMETER_PROJECT_NAMESPACE and DEMETER_CLAIM_URL'],
+    // A path in the Console: the delete would post to another project's settings.
+    ['a namespace that is not a DNS label', 'DEMETER_PROJECT_NAMESPACE=prj-mine/../prj-other\n', 'register answered 200 with a DEMETER_PROJECT_NAMESPACE that is not a DNS label'],
+  ] as const) {
+    it(`claims nothing when register names ${what}, as a claimed project could not be found to delete`, async () => {
+      // On the stand-in's own origin, so only the namespace keeps the browser shut.
+      const standIn = await serve((request, response) => {
+        request.resume()
+        if (request.url !== '/api/agent/register') return response.writeHead(404).end()
+        const origin = `http://${request.headers.host}`
+        response
+          .writeHead(200, { 'content-type': 'text/plain; charset=utf-8' })
+          .end(`DEMETER_PROJECT_ID=7e0b2f9c-0000-4000-8000-000000000000\n${line}DEMETER_CLAIM_URL=${origin}/claim/stand-in-token\n`)
+      })
+      try {
+        const run = new Run('j0', 'standin')
+        const url = standIn.url
+        await j0({ env: { name: 'standin', website: url, console: url, legacy: url, rpc: url, auth0: url }, run, secrets: new Secrets(), user: 'e2e@txpipe.io', password: 'x', waits: fast })
+        const result = run.finish()
+        assert.equal(step(result, 'register as agent').detail, registerDetail)
+        assert.equal(step(result, 'claim in the browser').detail, 'not run: register named no usable namespace, so a claimed project could not be found to delete')
+        assert.equal(step(result, 'after the claim').detail, 'not run: no claim was sent, so no request comes after it')
+        assert.equal(step(result, 'delete').detail, 'register answered 200 but named no usable namespace: its project cannot be found, and expires unclaimed within 7 days')
+      } finally {
+        await standIn.close()
+      }
+    })
+  }
+
+  it('fails the delete step when a 200 names no namespace, as its project cannot be found', async () => {
+    const result = await j0Against((response) =>
+      response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('DEMETER_PROJECT_ID=7e0b2f9c-0000-4000-8000-000000000000\nDEMETER_API_KEY=dmtr_apikey1qqqqqqqq\n'),
+    )
+    assert.equal(step(result, 'register as agent').detail, 'register answered 200 without DEMETER_PROJECT_NAMESPACE and DEMETER_CLAIM_URL')
+    assert.deepEqual([step(result, 'delete').ok, step(result, 'delete').detail], [false, 'register answered 200 but named no usable namespace: its project cannot be found, and expires unclaimed within 7 days'])
+  })
+})
