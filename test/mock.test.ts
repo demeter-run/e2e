@@ -82,6 +82,8 @@ describe('the mock: register', () => {
     const answer = await register(env, { name: '\u0085' })
     assert.deepEqual(codeOf(answer), [400, 'invalid_request'])
     assert.match(errorBody(answer)!.message, /^The agent identity was refused/)
+    // The Console's trim strips the U+FEFF, so fabric sees a lone U+0085.
+    assert.deepEqual(codeOf(await register(env, { name: '\uFEFF\u0085' })), [400, 'invalid_request'])
     assert.equal((await register(env, { name: '\u0085x\u0085' })).status, 200)
   })
 
