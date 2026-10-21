@@ -5,7 +5,7 @@ import { after, before, beforeEach, describe, it, mock as mocks } from 'node:tes
 import { type AgentAnswer, call, createPort, type Credentials, dotenvVars, errorBody, names, register } from '../src/agent/client.ts'
 import { type Environment, environments } from '../src/env.ts'
 import { advanceMockClock, mockCalls, mockState, resetMock, setMockState } from '../src/mock/control.ts'
-import { type Mock, startMock } from '../src/mock/server.ts'
+import { blankForFabric, type Mock, startMock } from '../src/mock/server.ts'
 
 let mock: Mock
 let env: Environment
@@ -76,6 +76,13 @@ describe('the mock: register', () => {
     assert.equal((await register(env, { name: '🦀'.repeat(64) })).status, 200)
     assert.deepEqual(codeOf(await register(env, { name: 'ok', url: `https://${'u'.repeat(250)}` })), [400, 'invalid_request'])
     assert.equal((await register(env, { name: 'ok', url: `https://${'u'.repeat(248)}` })).status, 200)
+  })
+
+  it("refuses a name of only U+0085 as fabric does, though the Console's trim keeps it", async () => {
+    const answer = await register(env, { name: '\u0085' })
+    assert.deepEqual(codeOf(answer), [400, 'invalid_request'])
+    assert.match(errorBody(answer)!.message, /^The agent identity was refused/)
+    assert.equal((await register(env, { name: '\u0085x\u0085' })).status, 200)
   })
 
   it('refuses a body that is not JSON with 400, and GET with 405', async () => {
@@ -305,6 +312,17 @@ describe('the mock: caps, kill switch and clock', () => {
     assert.equal((await from('198.51.100.0')).status, 200)
   })
 
+  it("treats as blank exactly what Rust's trim strips: Unicode White_Space, U+0085 in, U+FEFF out", () => {
+    const whiteSpace = [0x9, 0xa, 0xb, 0xc, 0xd, 0x20, 0x85, 0xa0, 0x1680, ...Array.from({ length: 11 }, (_, i) => 0x2000 + i), 0x2028, 0x2029, 0x202f, 0x205f, 0x3000]
+    for (const point of whiteSpace) assert.ok(blankForFabric(String.fromCodePoint(point)), `U+${point.toString(16)}`)
+    assert.ok(blankForFabric(''))
+    assert.ok(blankForFabric(whiteSpace.map((point) => String.fromCodePoint(point)).join('')))
+    for (const point of [0x8, 0xe, 0x1c, 0x1f, 0x84, 0x86, 0x9f, 0x180e, 0x1fff, 0x200b, 0x2027, 0x202a, 0x202e, 0x2030, 0x205e, 0x2060, 0x2fff, 0x3001, 0xfeff]) {
+      assert.ok(!blankForFabric(String.fromCodePoint(point)), `U+${point.toString(16)}`)
+    }
+    assert.ok(!blankForFabric(' x '))
+  })
+
   it("counts an X-Forwarded-For header that leaves no entry against the connection's address", async () => {
     // The explicit loopback address shares a count only with the socket's own.
     for (const header of [', ', ',,', '127.0.0.1']) assert.equal((await from(header)).status, 200)
@@ -376,6 +394,17 @@ describe('the mock: caps, kill switch and clock', () => {
     await setMockState(env, { provisional_enabled: false })
     assert.deepEqual(codeOf(await from('192.0.2.1')), [503, 'registration_disabled'])
     assert.deepEqual(codeOf(await from('192.0.2.2')), [503, 'registration_disabled'])
+  })
+
+  it("refuses a blank name or client IP after the kill switch and before the caps, where fabric's validation sits", async () => {
+    for (let i = 0; i < 3; i++) assert.equal((await from('192.0.2.1')).status, 200)
+    await setMockState(env, { limits: { global_cap: 3 } })
+    assert.deepEqual(codeOf(await from('198.51.100.0,\t,')), [400, 'invalid_request'])
+    assert.deepEqual(codeOf(await from('192.0.2.1', '\u0085')), [400, 'invalid_request'])
+    assert.deepEqual(codeOf(await from('192.0.2.2', '\u0085')), [400, 'invalid_request'])
+    await setMockState(env, { provisional_enabled: false })
+    assert.deepEqual(codeOf(await from('198.51.100.0,\t,')), [503, 'registration_disabled'])
+    assert.deepEqual(codeOf(await from('192.0.2.2', '\u0085')), [503, 'registration_disabled'])
   })
 
   it('refuses registration past the global limit of live unclaimed projects; an expired or claimed one is not live', async () => {

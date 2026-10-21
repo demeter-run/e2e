@@ -213,11 +213,13 @@ const lastForwarded = (header: string): string =>
     : header.trim()
 
 /**
- * Whether fabric's `validate()` refuses a client IP as missing: blank once
- * Rust's `str::trim` has run, which strips Unicode White_Space. That set
- * includes U+0085, which JS `\s` lacks, and excludes U+FEFF, which `\s` has.
+ * Whether fabric's `validate()` refuses an agent name or a client IP as
+ * missing: blank once Rust's `str::trim` has run, which strips Unicode
+ * White_Space. That set includes U+0085, which JS `\s` lacks, and excludes
+ * U+FEFF, which `\s` has.
  */
-const blankForFabric = (ip: string): boolean => /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/.test(ip)
+export const blankForFabric = (text: string): boolean =>
+  /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/.test(text)
 
 export interface MockOptions {
   /** Where the mock listens. Port 0 picks a free one. */
@@ -319,9 +321,10 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl, brok
     // command's validation, the client IP's window, then the global cap.
     if (!state.enabled && enforced('kill_switch')) return agentError(response, 'registration_disabled')
     const source = clientIp(request)
-    // An entry of only whitespace (`…,\t,`) passes the Console's own guard;
-    // fabric refuses it, and the Console maps that to invalid_request.
-    if (blankForFabric(source)) {
+    // A name of only U+0085, or an entry of only whitespace (`…,\t,`), passes
+    // the Console's own guard; fabric refuses it, and the Console maps that to
+    // invalid_request.
+    if (blankForFabric(name) || blankForFabric(source)) {
       return agentError(response, 'invalid_request', { message: 'The agent identity was refused; check its name, version and url.' })
     }
     const at = now()
