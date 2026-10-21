@@ -4,10 +4,11 @@ name: contracts
 # They read no product repository, and gate no other repository's pull
 # requests. Report-only: nothing here is a required status.
 #
-# - On pull requests and pushes to main: install, typecheck and unit tests in
-#   one job, then every check against production in a second, no alert. The
-#   checks fail on every run while fabric publishes no prices, so a broken
-#   unit test gets a job of its own rather than hide behind that failure.
+# - On pull requests and pushes to main: install, typecheck, unit and browser
+#   tests in one job, then every check against production in a second, no
+#   alert. The checks fail on every run while fabric publishes no prices, so a
+#   broken unit test gets a job of its own rather than hide behind that
+#   failure.
 # - Daily at 05:00 UTC and on dispatch: the same, alerting IRM on a failure.
 #   Only runs of main hold the webhook, so a dispatch on a branch logs that
 #   its alert was skipped.
@@ -24,10 +25,12 @@ name: contracts
 #       queue: max
 #
 # so no two runs use the user at once. `queue: max` keeps every waiting run:
-# without it the group holds one pending run, and a newer one cancels it
-# silently (no failure, so no alert), as happened to a ports run on PR #2.
-# No job here signs in; ports.yml's does, and the J2 journey and the agent
-# probe will.
+# without it the group holds one pending run, and a newer one cancels it. A
+# cancelled J2 or agent-probe run of main (scheduled or dispatched) posts its
+# `-cancelled` alert, but the port suite's alert is a step of the job that was
+# cancelled, and a pull request's run has no webhook, so those are lost
+# unannounced, as a ports run on PR #2 was.
+# No job here signs in; ports.yml's, j2.yml's and agent-j0-probe.yml's do.
 
 on:
   pull_request:
@@ -75,6 +78,17 @@ jobs:
         name: Unit tests
         run: pnpm test
 
+      # The browser tests (test/browser/: the masks a failed journey step
+      # paints over its screenshot, the sign-out, the sign-in form filler, and
+      # J0's claim and delete against a stand-in Console) need Chromium.
+      - id: chromium
+        name: Install Chromium
+        run: pnpm exec playwright install --with-deps --only-shell chromium
+
+      - id: browser
+        name: Browser tests
+        run: pnpm test:browser
+
       # For the setup alert below: the first step that failed, by name.
       - id: failed
         name: Name the failed step
@@ -87,6 +101,8 @@ jobs:
             install ${{ steps.install.outcome }}
             typecheck ${{ steps.typecheck.outcome }}
             unit tests ${{ steps.unit.outcome }}
+            Chromium install ${{ steps.chromium.outcome }}
+            browser tests ${{ steps.browser.outcome }}
         run: awk '$NF == "failure" { sub(/ [^ ]+$/, ""); print "step=" $0; exit }' <<<"$OUTCOMES" >> "$GITHUB_OUTPUT"
 
   checks:

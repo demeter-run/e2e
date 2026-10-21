@@ -49,6 +49,7 @@ on:
       - src/signin.ts
       - src/env.ts
       - src/report.ts
+      - src/secrets.ts
       - .nvmrc
       - package.json
       - pnpm-lock.yaml

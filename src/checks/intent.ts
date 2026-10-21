@@ -14,7 +14,7 @@ import type { Check } from './check.ts'
  */
 
 /** A sign-up CTA, by what a visitor reads on it. */
-const signupText = /\b(sign\s*up|start building|get started|start free)\b/i
+export const signupText = /\b(sign\s*up|start building|get started|start free)\b/i
 /** A sign-in link, by what a visitor reads on it. */
 const signinText = /\b(sign\s*in|log\s*in)\b/i
 

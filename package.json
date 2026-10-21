@@ -9,6 +9,8 @@
   },
   "scripts": {
     "check": "tsx src/cli/check.ts",
+    "journey": "tsx src/cli/journey.ts",
+    "j2": "tsx src/cli/journey.ts j2",
     "j0": "tsx src/cli/j0.ts",
     "contract": "tsx src/cli/contract.ts",
     "mock": "tsx src/mock/main.ts",

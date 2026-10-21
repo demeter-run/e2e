@@ -18,7 +18,7 @@ import { type Breaks, type StandIn, standIn } from './standin.ts'
  * J0 in Chromium against a stand-in Console (`standin.ts`): the claim, the
  * check that follows it and the delete, as on production, with one thing
  * broken at a time. Needs Chromium (`pnpm exec playwright install chromium`);
- * `j0-mock.yml` runs these.
+ * `j0-mock.yml` runs these, and so does `contracts.yml`'s unit job.
  */
 
 // Under node:test, a `::add-mask::` line that `Secrets` prints reaches the job
