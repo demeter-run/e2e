@@ -79,9 +79,9 @@ export interface AgentIdentity {
   url?: string
 }
 
-/** `POST /api/agent/register`. */
-export const register = (env: Environment, agent: AgentIdentity | Record<string, unknown>): Promise<AgentAnswer> =>
-  call('POST', `${env.console}/api/agent/register`, { body: JSON.stringify({ agent }) })
+/** `POST /api/agent/register`; `headers` may name the client IP the mock counts by (`X-Forwarded-For`). */
+export const register = (env: Environment, agent: AgentIdentity | Record<string, unknown>, headers: Record<string, string> = {}): Promise<AgentAnswer> =>
+  call('POST', `${env.console}/api/agent/register`, { headers, body: JSON.stringify({ agent }) })
 
 /** The headers `/api/agent/ports` reads the pre-claim credential from. */
 export interface Credentials {

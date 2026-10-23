@@ -1,17 +1,19 @@
 name: j0-mock
 
 # J0 and the whole agent contract suite against the agent-route mock
-# (src/mock/), and the tests that need a browser (test/browser/: J0's claim
-# and delete against a stand-in Console, the sign-in form filler, the masks
-# over a failed J2 step's screenshot and the sign-out), on every pull request
-# and push to main. Nothing here reaches production or signs in as the test
-# user. Report-only: nothing here is a required status.
+# (src/mock/), then J3 (expiry) and J9 (abuse), which run on the mock alone,
+# and the tests that need a browser (test/browser/: J0's claim and delete
+# against a stand-in Console, the sign-in form filler, the masks over a failed
+# J2 step's screenshot and the sign-out), on every pull request and push to
+# main. Nothing here reaches production or signs in as the test user.
+# Report-only: nothing here is a required status.
 #
 # The prod-safe contract tests also run against production in
 # agent-j0-probe.yml, so on those rules a mock that drifts from the contract
 # fails here, and a production that drifts from the mock fails there. The
 # mock-only rules (the caps, the kill switch, expiry) are held to the
-# contract alone: nothing compares them with production.
+# contract alone: nothing compares them with production. J3 and J9 drive the
+# mock's enforcement of them, its clock and its kill switch.
 
 on:
   pull_request:
@@ -23,7 +25,7 @@ permissions:
 
 jobs:
   j0:
-    name: Contract suite and J0 on the mock
+    name: Contract suite, J0, J3 and J9 on the mock
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -57,11 +59,22 @@ jobs:
         run: pnpm j0 --env mock --contract all
 
       # Redacted by the mock, and checked for credentials by the run itself.
+      # Before J3, which resets the mock.
       - name: Save the mock's call log
         if: always()
         run: |
           mkdir -p results
           curl -sf http://127.0.0.1:4010/__mock/calls > results/mock-calls.json || echo "the mock did not answer"
+
+      # Each resets the mock, moves its clock and switches, and checks its own
+      # call log for credentials; whatever J0 did, each reports.
+      - name: Run J3 (expiry) on the mock
+        if: ${{ !cancelled() }}
+        run: pnpm j3 --env mock
+
+      - name: Run J9 (abuse) on the mock
+        if: ${{ !cancelled() }}
+        run: pnpm j9 --env mock
 
       # After the run on the mock, so a browser failure leaves the mock's
       # result standing, and whatever the mock steps did, once Chromium is in.

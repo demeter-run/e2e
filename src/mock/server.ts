@@ -24,9 +24,17 @@ import * as pages from './pages.ts'
  *   | null, "retry_after_seconds"?: <int>}` makes every call to that route
  *   answer that error (any code in the contract's table), or stops it; with
  *   `{"project": <id or namespace>, "expired": true | false}` it expires a
- *   project or revives it. It answers the state after, as `GET
- *   /__mock/state` does: `{"errors": {<route>: {"error", "retry_after_seconds"?}},
- *   "expired": [<project id>]}`.
+ *   project or revives it (with a fresh 7 days when its expiry has passed, so
+ *   the next sweep leaves it); with `{"provisional_enabled": true | false}` it
+ *   turns the kill switch; with `{"limits": {"ip_cap"?, "global_cap"?,
+ *   "port_cap"?}}` it sets the caps it enforces. It answers the state after,
+ *   as `GET /__mock/state` does: `{"errors": {<route>: {"error",
+ *   "retry_after_seconds"?}}, "expired": [<project id>], "provisional_enabled",
+ *   "limits": {"ip_cap", "global_cap", "port_cap"}, "now"}`.
+ * - `POST /__mock/clock` with `{"advance_seconds": <int>}` moves the mock's
+ *   clock forward, at most 100 years ahead of this machine's in all, then sweeps: every unclaimed project whose expiry has
+ *   passed expires, as fabric's sweep does (every 10 minutes; the mock's at
+ *   each move). It answers the state after.
  * - `GET /__mock/calls`: every other call so far, `{method, path, status,
  *   headers}`, with each credential the mock issued replaced by
  *   `[redacted]` and the credential headers redacted whole.
@@ -61,9 +69,30 @@ const messages: Record<ErrorCode, string> = {
 
 export const DOCS_URL = 'https://demeter.run/auth.md'
 
-/** fabric's caps (`domain/provisional/mod.rs`): ports per unclaimed project, and days until it expires. */
-const PORT_CAP = 3
+/** The caps the mock enforces, by default fabric's (`domain/provisional/mod.rs`). */
+export interface Limits {
+  /** Registrations from one client IP in the trailing 24 hours. */
+  ip_cap: number
+  /** Unclaimed projects live at once. */
+  global_cap: number
+  /** Ports on one unclaimed project. */
+  port_cap: number
+}
+
+export const defaultLimits: Readonly<Limits> = { ip_cap: 3, global_cap: 200, port_cap: 3 }
+
+/**
+ * The rules the mock enforces, each of which a test may break
+ * (`MockOptions.broken`) to show the journey that holds it fails without it.
+ */
+export const rules = ['ip_cap', 'ip_window', 'global_cap', 'port_cap', 'kill_switch', 'expiry', 'expired_data_plane', 'expired_claim'] as const
+export type Rule = (typeof rules)[number]
+
 const TTL_DAYS = 7
+const TTL_MS = TTL_DAYS * 86_400_000
+/** How far ahead of this machine's the mock's clock may run: far past any journey, and well inside what a `Date` holds. */
+const MAX_CLOCK_AHEAD_SECONDS = 100 * 365 * 86_400
+const IP_CAP_WINDOW_MS = 86_400_000
 /** The `ip_cap` wait when none is switched on: the whole window, as when fabric reports none. */
 const IP_CAP_RETRY_AFTER_SECONDS = 86400
 
@@ -104,6 +133,9 @@ interface Project {
   owner: string | null
   name: string
   expired: boolean
+  /** When it was registered, on the mock's clock, and from which client IP. */
+  createdAt: number
+  source: string
 }
 
 interface State {
@@ -114,9 +146,23 @@ interface State {
   calls: Call[]
   /** Every credential issued since the last reset, so the call log can redact them. */
   issued: Set<string>
+  /** The kill switch: while false, registration is refused. */
+  enabled: boolean
+  limits: Limits
+  /** How far the mock's clock runs ahead of this machine's, in milliseconds. */
+  clockMs: number
 }
 
-const freshState = (): State => ({ projects: [], sessions: new Map(), errors: {}, calls: [], issued: new Set() })
+const freshState = (): State => ({
+  projects: [],
+  sessions: new Map(),
+  errors: {},
+  calls: [],
+  issued: new Set(),
+  enabled: true,
+  limits: { ...defaultLimits },
+  clockMs: 0,
+})
 
 const random = (alphabet: string, length: number): string =>
   Array.from({ length }, () => alphabet[randomInt(alphabet.length)]).join('')
@@ -150,12 +196,39 @@ async function readBody(request: IncomingMessage): Promise<string> {
 
 const dotenv = (lines: [string, string][]): string => lines.map(([name, value]) => `${name}=${value}\n`).join('')
 
+/**
+ * The last address of an `X-Forwarded-For` header as the Console's Fastify
+ * parser (`@fastify/forwarded` 3.0.0) reads it: a header with no comma is
+ * trimmed whole; otherwise each entry loses only the spaces around it, so a
+ * tab stays part of the address, and an empty entry is skipped. Empty when no
+ * entry is left.
+ */
+const lastForwarded = (header: string): string =>
+  header.includes(',')
+    ? (header
+        .split(',')
+        .map((entry) => entry.replace(/^ +| +$/g, ''))
+        .filter(Boolean)
+        .at(-1) ?? '')
+    : header.trim()
+
+/**
+ * Whether fabric's `validate()` refuses an agent name or a client IP as
+ * missing: blank once Rust's `str::trim` has run, which strips Unicode
+ * White_Space. That set includes U+0085, which JS `\s` lacks, and excludes
+ * U+FEFF, which `\s` has.
+ */
+export const blankForFabric = (text: string): boolean =>
+  /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/.test(text)
+
 export interface MockOptions {
   /** Where the mock listens. Port 0 picks a free one. */
   port?: number
   host?: string
   /** The origin the mock writes into claim URLs and port URLs; by default, where it listens. */
   baseUrl?: string
+  /** Rules the mock does not enforce, for the tests that show a journey fails without them; `pnpm mock` breaks none. */
+  broken?: readonly Rule[]
 }
 
 export interface Mock {
@@ -165,8 +238,11 @@ export interface Mock {
   close(): Promise<void>
 }
 
-export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: MockOptions = {}): Promise<Mock> {
+export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl, broken = [] }: MockOptions = {}): Promise<Mock> {
   let state = freshState()
+  const enforced = (rule: Rule) => !broken.includes(rule)
+  /** The mock's clock: this machine's, moved forward by `POST /__mock/clock`. */
+  const now = () => Date.now() + state.clockMs
   // Paths are appended to it, so a trailing slash would make them `//claim/…`.
   let base = (baseUrl ?? '').replace(/\/+$/, '')
 
@@ -241,13 +317,38 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
       })
     }
 
+    // fabric's order (`domain/provisional/command.rs`): the kill switch, the
+    // command's validation, the client IP's window, then the global cap.
+    if (!state.enabled && enforced('kill_switch')) return agentError(response, 'registration_disabled')
+    const source = clientIp(request)
+    // A name of only U+0085, or an entry of only whitespace (`…,\t,`), passes
+    // the Console's own guard; fabric refuses it, and the Console maps that to
+    // invalid_request.
+    if (blankForFabric(name) || blankForFabric(source)) {
+      return agentError(response, 'invalid_request', { message: 'The agent identity was refused; check its name, version and url.' })
+    }
+    const at = now()
+    const recent = state.projects
+      .filter((p) => p.source === source && (!enforced('ip_window') || p.createdAt >= at - IP_CAP_WINDOW_MS))
+      .map((p) => p.createdAt)
+      .sort((a, b) => a - b)
+    if (recent.length >= state.limits.ip_cap && enforced('ip_cap')) {
+      // The window slides: the source may register again once enough of its
+      // registrations age out to bring it back under the cap.
+      const freeing = recent[recent.length - state.limits.ip_cap]
+      const wait = freeing === undefined ? IP_CAP_RETRY_AFTER_SECONDS : Math.max(1, Math.ceil((freeing + IP_CAP_WINDOW_MS - at) / 1000))
+      return agentError(response, 'ip_cap', { retryAfterSeconds: wait })
+    }
+    const live = state.projects.filter((p) => p.owner === null && !p.expired).length
+    if (live >= state.limits.global_cap && enforced('global_cap')) return agentError(response, 'global_cap')
+
     const project: Project = {
       id: randomUUID(),
       namespace: `mock-project-${random('abcdefghijklmnopqrstuvwxyz0123456789', 6)}`,
       apiKey: `dmtr_apikey1${random(BECH32_ALPHABET, 58)}`,
       claimToken: randomBytes(32).toString('base64url'),
       userCode: `${random(USER_CODE_ALPHABET, 4)}-${random(USER_CODE_ALPHABET, 4)}`,
-      expiresAt: rfc3339(new Date(Date.now() + TTL_DAYS * 86_400_000)),
+      expiresAt: rfc3339(new Date(at + TTL_MS)),
       agent: {
         name,
         ...(typeof agent.version === 'string' ? { version: agent.version } : {}),
@@ -257,6 +358,8 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
       owner: null,
       name: '',
       expired: false,
+      createdAt: at,
+      source,
     }
     project.name = project.namespace
     issue(project.apiKey, project.claimToken!, project.userCode!, project.userCode!.replace('-', ''))
@@ -305,7 +408,7 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
     const project = state.projects.find((p) => p.id === projectId)
     if (!project || project.apiKey !== key) return agentError(response, 'unauthenticated')
     if (project.expired) return agentError(response, 'expired')
-    if (project.owner === null && project.ports.length >= PORT_CAP) return agentError(response, 'port_cap')
+    if (project.owner === null && project.ports.length >= state.limits.port_cap && enforced('port_cap')) return agentError(response, 'port_cap')
 
     const short = canonical.toLowerCase().replace(/port$/, '')
     const password = random(BECH32_ALPHABET, 32)
@@ -331,7 +434,7 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
   function data(request: IncomingMessage, response: ServerResponse, portId: string, rest: string) {
     const project = state.projects.find((p) => p.ports.some((port) => port.id === portId))
     const port = project?.ports.find((p) => p.id === portId)
-    if (!project || !port || project.expired || request.headers['dmtr-api-key'] !== port.key) {
+    if (!project || !port || (project.expired && enforced('expired_data_plane')) || request.headers['dmtr-api-key'] !== port.key) {
       return sendJson(response, 401, { error: 'unauthorized' })
     }
     sendJson(response, 200, { mock: true, port: port.id, kind: port.kind, network: port.network, path: rest || '/' })
@@ -369,7 +472,7 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
       if (request.method === 'POST') return redirect(response, '/login', remember(here))
       return sendHtml(response, 200, pages.signedOut(), remember(here))
     }
-    if (!project || project.expired || project.owner !== null) return sendHtml(response, 200, pages.expired(via))
+    if (!project || (project.expired && enforced('expired_claim')) || project.owner !== null) return sendHtml(response, 200, pages.expired(via))
 
     if (request.method !== 'POST') {
       return sendHtml(
@@ -409,6 +512,16 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
     return claimPage(request, response, project, 'code', `${url.pathname}${url.search}`)
   }
 
+  /**
+   * The client IP registration counts by, as the Console's Fastify takes it
+   * behind its one trusted proxy (`TRUST_PROXY_HOPS`, 1 by default): the last
+   * `X-Forwarded-For` entry, the one that proxy wrote, so an entry the client
+   * put before it is ignored; or the connection's address when the header
+   * leaves none. A run sets the header to act as several sources.
+   */
+  const clientIp = (request: IncomingMessage): string =>
+    lastForwarded(request.headers['x-forwarded-for']?.toString() ?? '') || request.socket.remoteAddress || ''
+
   /** Whether a request names the mock as its host: its base URL's name, or a loopback one. */
   const ownHost = (request: IncomingMessage) => {
     const host = `http://${request.headers.host ?? ''}`
@@ -431,13 +544,23 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
       state = freshState()
       return sendJson(response, 200, {})
     }
-    if (path !== '/__mock/state' || request.method !== 'POST') return sendJson(response, 404, { error: 'not_found' })
+    if ((path !== '/__mock/state' && path !== '/__mock/clock') || request.method !== 'POST') return sendJson(response, 404, { error: 'not_found' })
 
     let body: Record<string, unknown>
     try {
       body = JSON.parse(await readBody(request)) ?? {}
     } catch {
       return sendJson(response, 400, { error: 'the body must be JSON' })
+    }
+    if (path === '/__mock/clock') {
+      const seconds = body.advance_seconds
+      if (!Number.isInteger(seconds) || (seconds as number) < 0) return sendJson(response, 400, { error: 'send {"advance_seconds": <whole seconds, at least 0>}' })
+      if (state.clockMs / 1000 + (seconds as number) > MAX_CLOCK_AHEAD_SECONDS) {
+        return sendJson(response, 400, { error: `the mock's clock runs at most ${MAX_CLOCK_AHEAD_SECONDS} seconds (100 years) ahead; reset it to start again` })
+      }
+      state.clockMs += (seconds as number) * 1000
+      sweep()
+      return sendJson(response, 200, snapshot())
     }
     if (body.route === 'register' || body.route === 'ports') {
       if (body.error === null) delete state.errors[body.route]
@@ -452,13 +575,29 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
       const project = state.projects.find((p) => p.id === body.project || p.namespace === body.project)
       if (!project) return sendJson(response, 404, { error: 'no such project' })
       project.expired = body.expired
+      // A revived project gets a fresh 7 days if its expiry has passed, or the next sweep would expire it again.
+      if (!body.expired && Date.parse(project.expiresAt) <= now()) project.expiresAt = rfc3339(new Date(now() + TTL_MS))
+    } else if (typeof body.provisional_enabled === 'boolean') {
+      state.enabled = body.provisional_enabled
+    } else if (typeof body.limits === 'object' && body.limits !== null && !Array.isArray(body.limits)) {
+      const limits = body.limits as Record<string, unknown>
+      const unknown = Object.keys(limits).filter((name) => !Object.hasOwn(defaultLimits, name))
+      if (unknown.length) return sendJson(response, 400, { error: `limits are ${Object.keys(defaultLimits).join(', ')}, not ${unknown.join(', ')}` })
+      if (!Object.values(limits).every((n) => Number.isInteger(n) && (n as number) >= 0)) return sendJson(response, 400, { error: 'a limit is a whole number, at least 0' })
+      Object.assign(state.limits, limits)
     } else {
-      return sendJson(response, 400, { error: 'send {"route", "error"} or {"project", "expired"}' })
+      return sendJson(response, 400, { error: 'send {"route", "error"}, {"project", "expired"}, {"provisional_enabled"} or {"limits"}' })
     }
     sendJson(response, 200, snapshot())
   }
 
-  /** The error states and expired projects, in the shape `POST /__mock/state` takes them. */
+  /** fabric's sweep: every unclaimed project whose expiry has passed expires, and its ports stop answering. */
+  const sweep = () => {
+    if (!enforced('expiry')) return
+    for (const p of state.projects) if (p.owner === null && !p.expired && Date.parse(p.expiresAt) < now()) p.expired = true
+  }
+
+  /** The error states, expired projects, kill switch and caps, in the shape `POST /__mock/state` takes them, and the mock's time. */
   const snapshot = () => ({
     errors: Object.fromEntries(
       Object.entries(state.errors).map(([route, { error, retryAfterSeconds }]) => [
@@ -467,6 +606,9 @@ export async function startMock({ port = 4010, host = '127.0.0.1', baseUrl }: Mo
       ]),
     ),
     expired: state.projects.filter((p) => p.expired).map((p) => p.id),
+    provisional_enabled: state.enabled,
+    limits: { ...state.limits },
+    now: rfc3339(new Date(now())),
   })
 
   async function handle(request: IncomingMessage, response: ServerResponse) {
