@@ -9,6 +9,8 @@
   },
   "scripts": {
     "check": "tsx src/cli/check.ts",
+    "journey": "tsx src/cli/journey.ts",
+    "j2": "tsx src/cli/journey.ts j2",
     "j0": "tsx src/cli/j0.ts",
     "j3": "tsx src/cli/j3.ts",
     "j9": "tsx src/cli/j9.ts",
